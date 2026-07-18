@@ -67,6 +67,8 @@
 static volatile int g_running = 1;
 static void on_signal(int s) { (void)s; g_running = 0; }
 
+static char g_setup_reason[64];   /* set once at startup, redrawn every frame by draw_setup_screen() */
+
 static void cursor_show(void);  /* forward decl for emergency_cleanup */
 
 static void emergency_cleanup(void)
@@ -574,29 +576,6 @@ static int pop_frame(void)
 
 /* ── drawing ──────────────────────────────────────────────────────────────── */
 
-static void draw_config_error(FBDev *fb, const char *reason)
-{
-    fb_clear(fb);
-    const char *title = "MiSTerFin";
-    draw_text(fb, (fb->width - text_width(title, 2))/2, SAFE_Y, title, 2, COL_TITLE);
-
-    draw_text(fb, (fb->width - text_width(reason, 1))/2, fb->height/2 - 20, reason, 1, COL_ERR);
-
-    const char *l2 = "Create /media/fat/misterfin/jellyfin.conf with:";
-    draw_text(fb, (fb->width - text_width(l2, 1))/2, fb->height/2, l2, 1, COL_HINT);
-    const char *l3 = "server_url";
-    draw_text(fb, (fb->width - text_width(l3, 1))/2, fb->height/2 + 12, l3, 1, COL_ITEM);
-    const char *l4 = "api_key";
-    draw_text(fb, (fb->width - text_width(l4, 1))/2, fb->height/2 + 24, l4, 1, COL_ITEM);
-    const char *l5 = "username";
-    draw_text(fb, (fb->width - text_width(l5, 1))/2, fb->height/2 + 36, l5, 1, COL_ITEM);
-
-    const char *hint = "B: exit";
-    draw_text(fb, (fb->width - text_width(hint, 1))/2,
-              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
-    fb_flip(fb);
-}
-
 static const char *type_folder_icon(JfItemType t)
 {
     switch (t) {
@@ -736,6 +715,63 @@ static void draw_about_frame(FBDev *fb, int show_footer)
 }
 
 static void draw_about(FBDev *fb) { draw_about_frame(fb, 1); }
+
+/* Shown instead of the plain black config-error screen when jellyfin.conf
+ * is missing/invalid or the configured username can't be resolved — same
+ * starfield/cover-art chrome as the About screen (so it's not a jarring,
+ * differently-styled dead end), with the About screen's own description
+ * text swapped out for setup instructions. */
+static void draw_setup_screen(FBDev *fb, const char *reason)
+{
+    fb_clear(fb);
+    draw_starfield(fb);
+
+    static const char title[] = "MiSTerFin";
+
+    static uint8_t *img_px = NULL;
+    static int      img_w = 0, img_h = 0;
+    static int      img_tried = 0;
+    if (!img_tried) {
+        img_tried = 1;
+        int ch;
+        img_px = stbi_load("/media/fat/misterfin/about.png", &img_w, &img_h, &ch, 4);
+    }
+
+    const int ts = 2, s1 = 1;
+    const int tch = 8 * ts, sch = 8 * s1, img_gap = 10, lsp = 6;
+
+    int cur_y = SAFE_Y;
+    if (img_px && img_w > 0 && img_h > 0) {
+        int max_w = fb->width - 2 * SAFE_X;
+        int max_h = 110;
+        int img_h_box = max_h < img_h ? max_h : img_h;
+        int img_w_box = (int)((double)img_w / img_h * img_h_box * 5.0 / 3.0 + 0.5);
+        if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
+        blit_fit_centered(fb, img_px, img_w, img_h,
+                           fb->width / 2, cur_y + img_h_box / 2, img_w_box, img_h_box, 255);
+        cur_y += img_h_box + img_gap;
+    }
+
+    draw_text(fb, (fb->width - text_width(title, ts)) / 2, cur_y, title, ts, COL_TITLE);
+    cur_y += tch + lsp;
+    draw_text(fb, (fb->width - text_width(reason, s1)) / 2, cur_y, reason, s1, COL_ERR);
+    cur_y += sch + lsp * 2;
+
+    const char *l1 = "Create /media/fat/misterfin/jellyfin.conf with:";
+    draw_text(fb, (fb->width - text_width(l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
+    cur_y += sch + lsp;
+    static const char *fields[] = { "server_url", "api_key", "username" };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        draw_text(fb, (fb->width - text_width(fields[i], s1)) / 2, cur_y, fields[i], s1, COL_ITEM);
+        cur_y += sch + lsp;
+    }
+
+    const char *hint = "B: exit";
+    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
 
 /* NOT a literal aspect-ratio box — blit_fit_centered's 5/3 pixel-aspect
  * correction means a typical portrait poster actually wants a box WIDER
@@ -1629,10 +1665,12 @@ int main(int argc, char **argv)
     AppState state;
     if (!jf_config_load(&g_cfg)) {
         state = STATE_CONFIG_ERROR;
-        draw_config_error(&fb, "jellyfin.conf not found or incomplete");
+        snprintf(g_setup_reason, sizeof(g_setup_reason), "jellyfin.conf not found or incomplete");
+        draw_setup_screen(&fb, g_setup_reason);
     } else if (!jf_resolve_user_id(&g_cfg)) {
         state = STATE_CONFIG_ERROR;
-        draw_config_error(&fb, "Username not found on server (check spelling)");
+        snprintf(g_setup_reason, sizeof(g_setup_reason), "Username not found on server (check spelling)");
+        draw_setup_screen(&fb, g_setup_reason);
     } else {
         state = STATE_BROWSE;
         push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
@@ -1735,7 +1773,8 @@ int main(int argc, char **argv)
         switch (state) {
 
         case STATE_CONFIG_ERROR:
-            if (inp & INP_B) g_running = 0;
+            if (inp & INP_B) { g_running = 0; break; }
+            draw_setup_screen(&fb, g_setup_reason);   /* redrawn every frame for the starfield */
             break;
 
         case STATE_BROWSE: {
