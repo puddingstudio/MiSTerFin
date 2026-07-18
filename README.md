@@ -162,4 +162,4 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items), res
 
 ## Licence
 
-MIT
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, share, and modify, non-commercial only.
