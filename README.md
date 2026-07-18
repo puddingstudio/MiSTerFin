@@ -1,8 +1,8 @@
 # MiSTerFin
 
-<p align="center"><img src="docs/about.gif" width="640" alt="MiSTerFin about screen"></p>
+<p align="center"><img src="docs/about.gif" width="100%" alt="MiSTerFin about screen"></p>
 
-A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfpga.org) platform. Browse your Movies/TV library, see poster art and overview, and play back on a CRT via SCART — video is server-side transcoded and letterboxed to PAL or NTSC, with client-side subtitles and full pause/seek/resume support.
+A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfpga.org) platform. Browse your Movies/TV library, see poster art and overview, and play back on a CRT — video is server-side transcoded and letterboxed to PAL or NTSC, with client-side subtitles and full pause/seek/resume support. Works with whatever analog output your MiSTer is already set up for (SCART, composite, component, ...) — MiSTerFin just writes to the standard framebuffer, same as any other MiSTer app.
 
 ---
 
