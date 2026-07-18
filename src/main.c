@@ -1,0 +1,1903 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
+#include <linux/kd.h>
+#include <time.h>
+#include <pthread.h>
+#include "fb.h"
+
+#ifndef APP_VERSION
+#define APP_VERSION "dev"
+#endif
+#include "font8x8.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "ddr.h"
+#include "jellyfin.h"
+
+#define MPLAYER      "/media/fat/misterfin/mplayer-arm"
+#define POSTER_TMP   "/tmp/misterfin_poster.img"
+#define CRASH_LOG    "/media/fat/misterfin/crash.log"
+/* Hardcoded inside the shared mplayer-arm binary's patched vo_fbdev.c (built
+ * for MiSTerDVD, reused here unchanged) — NOT ours to rename. Its presence
+ * makes vo_fbdev wait for vblank before each frame, trading a little extra
+ * decode latency for tear-free output. */
+#define VSYNC_FLAG   "/tmp/misterdvd_vsync"
+
+#define VISIBLE      6
+#define ROW_H        30
+#define SAFE_X       24
+#define SAFE_Y       20
+#define SAFE_Y_BOT   SAFE_Y   /* match the top title margin — same overscan/visibility balance */
+#define SEEK_STEP        30.0
+#define SEEK_DEBOUNCE     0.6   /* seconds to wait for more presses before firing the seek */
+#define FLASH_DURATION_SEC 1.2  /* how long a flash_message() stays pinned on screen, see g_flash_until */
+#define PROGRESS_REPORT_INTERVAL 10.0
+/* Passed to mplayer as "-delay" (see play()). */
+#define AUDIO_DELAY_SEC 0.20
+/* Subtitles run ahead of the g_play_offset-corrected clock by a further
+ * fixed amount on top of AUDIO_DELAY_SEC — dialed in via the submenu's
+ * live LEFT/RIGHT sync adjustment (g_sub_delay_extra) on real hardware and
+ * confirmed to read spot-on at +1.4s beyond AUDIO_DELAY_SEC. Baked in here
+ * as the new default so a subtitle is in sync out of the box; the live
+ * adjustment still exists for whatever this constant doesn't fully cover
+ * (e.g. a subtitle file with its own internal timing drift). */
+#define SUBTITLE_SYNC_FUDGE_SEC 1.4
+
+/* ── colour palette ──────────────────────────────────────────────────────── */
+#define COL_TITLE   0xFF,0xE0,0x40
+#define COL_ITEM    0xCC,0xCC,0xCC
+#define COL_DIM     0x80,0x80,0x80
+#define COL_SEL_BG  0x10,0x40,0x90
+#define COL_SEL_FG  0xFF,0xFF,0xFF
+#define COL_HINT    0x80,0x80,0x80
+#define COL_WATCHED 0x40,0xCC,0x40
+#define COL_RESUME  0xFF,0xC0,0x40
+#define COL_ERR     0xFF,0x60,0x60
+
+static volatile int g_running = 1;
+static void on_signal(int s) { (void)s; g_running = 0; }
+
+static void cursor_show(void);  /* forward decl for emergency_cleanup */
+
+static void emergency_cleanup(void)
+{
+    ddr_close();
+    cursor_show();
+}
+
+static void on_fatal(int s)
+{
+    int lfd = open(CRASH_LOG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (lfd >= 0) {
+        const char *pre = "signal=";
+        write(lfd, pre, 7);
+        char d[4]; int n = 0; int sv = s;
+        if (sv >= 100) d[n++] = '0' + sv/100;
+        if (sv >= 10)  d[n++] = '0' + (sv/10)%10;
+        d[n++] = '0' + sv%10;
+        d[n++] = '\n';
+        write(lfd, d, n);
+        close(lfd);
+    }
+    emergency_cleanup();
+    signal(s, SIG_DFL);
+    raise(s);
+}
+
+/* ── update check (About screen) — same pattern as MiSTerDVD ─────────────── */
+
+typedef enum { UPD_CHECKING, UPD_OK, UPD_AVAILABLE, UPD_FAILED } UpdateState;
+
+static UpdateState     g_upd_state = UPD_CHECKING;
+static char            g_upd_latest[32] = {0};
+static pthread_mutex_t g_upd_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Checks github.com/puddingstudio/MiSTerFin's latest release tag against
+ * APP_VERSION. No-op-safe if that repo doesn't exist yet (this project is
+ * local-only for now) — the request just fails and the About screen shows
+ * no update line, same as any other network hiccup. */
+static void *update_check_thread(void *arg)
+{
+    (void)arg;
+    FILE *f = popen(
+        "curl -sfk --max-time 8 "
+        "https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest "
+        "2>/dev/null", "r");
+    if (!f) {
+        pthread_mutex_lock(&g_upd_mutex);
+        g_upd_state = UPD_FAILED;
+        pthread_mutex_unlock(&g_upd_mutex);
+        return NULL;
+    }
+    char buf[4096] = {0};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    pclose(f);
+
+    char *p = strstr(buf, "\"tag_name\"");
+    if (!p) goto fail;
+    p = strchr(p, ':'); if (!p) goto fail;
+    p++;
+    while (*p == ' ' || *p == '"') p++;
+    char tag[32] = {0};
+    int i = 0;
+    while (*p && *p != '"' && i < 31) tag[i++] = *p++;
+
+    pthread_mutex_lock(&g_upd_mutex);
+    strncpy(g_upd_latest, tag, sizeof(g_upd_latest) - 1);
+    g_upd_state = (strcmp(tag, APP_VERSION) == 0) ? UPD_OK : UPD_AVAILABLE;
+    pthread_mutex_unlock(&g_upd_mutex);
+    return NULL;
+
+fail:
+    pthread_mutex_lock(&g_upd_mutex);
+    g_upd_state = UPD_FAILED;
+    pthread_mutex_unlock(&g_upd_mutex);
+    return NULL;
+}
+
+static void cursor_hide(void)
+{
+    const char *ttys[] = { "/dev/tty0", "/dev/tty1", "/dev/tty", "/dev/console", NULL };
+    for (int i = 0; ttys[i]; i++) {
+        int fd = open(ttys[i], O_RDWR | O_NONBLOCK);
+        if (fd < 0) continue;
+        ioctl(fd, KDSETMODE, KD_GRAPHICS);
+        write(fd, "\033[?25l", 6);
+        write(fd, "\033[2J",   4);
+        close(fd);
+    }
+    int sf = open("/sys/class/graphics/fbcon/cursor_blink", O_WRONLY);
+    if (sf >= 0) { write(sf, "0", 1); close(sf); }
+}
+
+static void cursor_show(void)
+{
+    const char *ttys[] = { "/dev/tty0", "/dev/tty1", "/dev/tty", "/dev/console", NULL };
+    for (int i = 0; ttys[i]; i++) {
+        int fd = open(ttys[i], O_RDWR | O_NONBLOCK);
+        if (fd < 0) continue;
+        ioctl(fd, KDSETMODE, KD_TEXT);
+        write(fd, "\033[?25h", 6);
+        close(fd);
+    }
+    int sf = open("/sys/class/graphics/fbcon/cursor_blink", O_WRONLY);
+    if (sf >= 0) { write(sf, "1", 1); close(sf); }
+}
+
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void fmt_time(char *buf, size_t sz, double secs)
+{
+    if (secs < 0) secs = 0;
+    int s = (int)secs;
+    int h = s / 3600; s %= 3600;
+    int m = s / 60;   s %= 60;
+    if (h > 0) snprintf(buf, sz, "%d:%02d:%02d", h, m, s);
+    else       snprintf(buf, sz, "%d:%02d", m, s);
+}
+
+/* ── text rendering ──────────────────────────────────────────────────────── */
+
+static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+    if (c >= 128) c = '?';
+    const uint8_t *glyph = font8x8_basic[c];
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 8; col++) {
+            if ((bits >> col) & 1)
+                fb_fill_rect_alpha(fb, x + col*scale, y + row*scale,
+                                   scale, scale, r, g, b, 255);
+        }
+    }
+}
+
+static void draw_text(FBDev *fb, int x, int y, const char *s, int scale,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+    for (; *s; s++, x += 8*scale)
+        draw_char(fb, x, y, (unsigned char)*s, scale, r, g, b);
+}
+
+static int text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
+
+/* Truncates s in-place (with a trailing "...") so it fits within max_w
+ * pixels at the given scale — draw_text itself doesn't clip, so a long
+ * title would otherwise run into whatever's to its right. */
+static void truncate_to_width(char *s, int scale, int max_w)
+{
+    int max_chars = max_w / (8 * scale);
+    int len = (int)strlen(s);
+    if (len <= max_chars) return;
+    if (max_chars > 3) { s[max_chars - 3] = '\0'; strcat(s, "..."); }
+    else if (max_chars > 0) s[max_chars] = '\0';
+}
+
+static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
+                         int scale, int max_w, int max_lines,
+                         uint8_t r, uint8_t g, uint8_t b)
+{
+    int cols    = max_w / (8 * scale);
+    int line_h  = 8 * scale + 2;
+    char line[256] = {0};
+    int  li         = 0;
+    int  drawn      = 0;
+    const char *p   = text;
+
+    while (*p && drawn < max_lines) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *we = p;
+        while (*we && *we != ' ') we++;
+        int wlen = (int)(we - p);
+        if (li > 0 && li + 1 + wlen > cols) {
+            int is_last = (drawn == max_lines - 1);
+            if (is_last && *we) {
+                if (li > cols - 3) li = cols - 3;
+                strcpy(line + li, "...");
+            }
+            draw_text(fb, x, y + drawn * line_h, line, scale, r, g, b);
+            drawn++; li = 0; memset(line, 0, sizeof(line));
+        }
+        if (li > 0 && li < (int)sizeof(line) - 2) line[li++] = ' ';
+        if (li + wlen < (int)sizeof(line) - 1) { memcpy(line+li, p, wlen); li += wlen; }
+        p = we;
+    }
+    if (li > 0 && drawn < max_lines) {
+        draw_text(fb, x, y + drawn * line_h, line, scale, r, g, b);
+        drawn++;
+    }
+    return drawn * line_h;
+}
+
+/* ── input (evdev gamepad, same model as MiSTerDVD) ─────────────────────── */
+
+#define MAX_INPUT_FDS 8
+static int input_fds[MAX_INPUT_FDS];
+static int input_count = 0;
+
+#define INP_UP     0x01
+#define INP_DOWN   0x02
+#define INP_A      0x04
+#define INP_B      0x08
+#define INP_LEFT   0x10
+#define INP_RIGHT  0x20
+#define INP_START  0x40
+#define INP_SELECT 0x80
+#define INP_L      0x100
+#define INP_R      0x200
+
+#define EVBIT_WORDS  ((KEY_MAX) / (8 * sizeof(unsigned long)) + 1)
+#define test_evbit(arr, b) \
+    ((arr)[(b) / (8*sizeof(unsigned long))] >> ((b) % (8*sizeof(unsigned long))) & 1ul)
+
+static void input_open(void)
+{
+    DIR *d = opendir("/dev/input");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && input_count < MAX_INPUT_FDS) {
+        if (strncmp(e->d_name, "event", 5)) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/%s", e->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        unsigned long keybits[EVBIT_WORDS] = {0};
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+        int has_gamepad  = test_evbit(keybits, BTN_SOUTH) || test_evbit(keybits, BTN_EAST);
+        int has_keyboard = test_evbit(keybits, KEY_ENTER) && test_evbit(keybits, KEY_UP);
+        if (!has_gamepad && !has_keyboard) { close(fd); continue; }
+
+        input_fds[input_count++] = fd;
+    }
+    closedir(d);
+}
+
+static void input_drain(void)
+{
+    struct input_event ev;
+    for (int i = 0; i < input_count; i++)
+        while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {}
+}
+
+static void input_close(void)
+{
+    for (int i = 0; i < input_count; i++) close(input_fds[i]);
+    input_count = 0;
+}
+
+static int input_poll(void)
+{
+    struct input_event ev;
+    int mask = 0;
+    for (int i = 0; i < input_count; i++) {
+        while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1) {
+                switch (ev.code) {
+                case BTN_EAST:               mask |= INP_A;      break;
+                case BTN_SOUTH:              mask |= INP_B;      break;
+                case KEY_ENTER:              mask |= INP_A;      break;
+                case KEY_ESC:
+                case KEY_BACK:               mask |= INP_B;      break;
+                case BTN_START: case KEY_PAUSE: mask |= INP_START;  break;
+                case BTN_SELECT:             mask |= INP_SELECT; break;
+                case KEY_UP:                     mask |= INP_UP;    break;
+                case KEY_DOWN:                   mask |= INP_DOWN;  break;
+                case KEY_LEFT:                   mask |= INP_LEFT;  break;
+                case KEY_RIGHT:                  mask |= INP_RIGHT; break;
+                case BTN_TL:                     mask |= INP_L;     break;
+                case BTN_TR:                     mask |= INP_R;     break;
+                }
+            } else if (ev.type == EV_ABS) {
+                if (ev.code == ABS_HAT0Y) {
+                    if (ev.value == -1) mask |= INP_UP;
+                    if (ev.value ==  1) mask |= INP_DOWN;
+                }
+                if (ev.code == ABS_HAT0X) {
+                    if (ev.value == -1) mask |= INP_LEFT;
+                    if (ev.value ==  1) mask |= INP_RIGHT;
+                }
+            }
+        }
+    }
+    return mask;
+}
+
+/* ── app state ────────────────────────────────────────────────────────────── */
+
+typedef enum { STATE_CONFIG_ERROR, STATE_BROWSE, STATE_INFO, STATE_PLAYING } AppState;
+typedef enum { FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES } FrameKind;
+
+#define MAX_STACK 8
+
+typedef struct {
+    FrameKind kind;
+    char      title[128];
+    char      parent_id[JF_ID_LEN];  /* FRAME_ITEMS */
+    char      series_id[JF_ID_LEN];  /* FRAME_SEASONS / FRAME_EPISODES */
+    char      season_id[JF_ID_LEN];  /* FRAME_EPISODES */
+} BrowseFrame;
+
+static JfConfig   g_cfg;
+static BrowseFrame g_stack[MAX_STACK];
+static int         g_stack_depth = 0;
+
+static JfItem g_items[JF_MAX_ITEMS];
+static int    g_item_count = 0;
+static int    g_sel = 0, g_scroll = 0;
+
+static JfItem g_info_item;   /* item currently shown on the info screen */
+
+static void draw_spinner_frame(FBDev *fb, int frame_idx);   /* forward decl — defined below, used by info_assets_load */
+
+/* ── info-screen hero assets (backdrop, logo, cast photos) ───────────────── */
+
+#define CAST_DISPLAY_MAX 5
+
+static uint8_t *g_backdrop_px = NULL;
+static int      g_backdrop_w = 0, g_backdrop_h = 0;
+static uint8_t *g_logo_px = NULL;
+static int      g_logo_w = 0, g_logo_h = 0;
+static uint8_t *g_cast_px[CAST_DISPLAY_MAX];
+static int      g_cast_px_w[CAST_DISPLAY_MAX], g_cast_px_h[CAST_DISPLAY_MAX];
+
+static uint8_t *load_image_tmp(const char *tmp_path, int *w, int *h)
+{
+    int channels = 0;
+    uint8_t *px = stbi_load(tmp_path, w, h, &channels, 4);
+    unlink(tmp_path);
+    return px;
+}
+
+static void info_assets_free(void)
+{
+    if (g_backdrop_px) { stbi_image_free(g_backdrop_px); g_backdrop_px = NULL; }
+    if (g_logo_px)     { stbi_image_free(g_logo_px);     g_logo_px = NULL; }
+    for (int i = 0; i < CAST_DISPLAY_MAX; i++)
+        if (g_cast_px[i]) { stbi_image_free(g_cast_px[i]); g_cast_px[i] = NULL; }
+    g_backdrop_w = g_backdrop_h = g_logo_w = g_logo_h = 0;
+}
+
+/* Fetches full item details (overview, cast, backdrop/logo tags — omitted
+ * from browse-list rows to keep those cheap) plus the actual images, one
+ * request at a time. Advances the loading spinner between requests so the
+ * wait (several sequential downloads) has visible feedback. */
+static void info_assets_load(FBDev *fb, const JfItem *list_item, int *spinner_frame)
+{
+    info_assets_free();
+
+    if (!jf_get_item_details(&g_cfg, list_item->id, &g_info_item))
+        g_info_item = *list_item;   /* degrade gracefully: keep the shallow row copy */
+
+    draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
+    if (g_info_item.backdrop_tag[0] &&
+        jf_download_item_image(&g_cfg, g_info_item.id, "Backdrop/0",
+                                g_info_item.backdrop_tag, 640, POSTER_TMP))
+        g_backdrop_px = load_image_tmp(POSTER_TMP, &g_backdrop_w, &g_backdrop_h);
+
+    draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
+    if (g_info_item.logo_tag[0] &&
+        jf_download_item_image(&g_cfg, g_info_item.id, "Logo",
+                                g_info_item.logo_tag, 400, POSTER_TMP))
+        g_logo_px = load_image_tmp(POSTER_TMP, &g_logo_w, &g_logo_h);
+
+    int cast_n = g_info_item.cast_count;
+    if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
+    for (int i = 0; i < cast_n; i++) {
+        draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
+        JfPerson *p = &g_info_item.cast[i];
+        if (!p->image_tag[0]) continue;
+        if (jf_download_item_image(&g_cfg, p->id, "Primary", p->image_tag, 48, POSTER_TMP))
+            g_cast_px[i] = load_image_tmp(POSTER_TMP, &g_cast_px_w[i], &g_cast_px_h[i]);
+    }
+}
+
+/* ── loading spinner (animated GIF, shown while (re)connecting to the
+ * transcode stream — network stream isn't byte-range seekable, so seeking
+ * means stop+restart with a new startTimeTicks, which has a few seconds of
+ * reconnect latency worth covering with feedback) ───────────────────────── */
+
+#define SPINNER_SIZE   14
+#define SPINNER_MARGIN 10
+#define SPINNER_BLINK_MS 350
+
+/* Simple blinking square in the top-right corner — a GIF mascot animation
+ * was tried first but wasn't worth the decode/ghosting complexity for what
+ * is just a "something's loading" cue. */
+static void draw_spinner_frame(FBDev *fb, int frame_idx)
+{
+    int dx = fb->width - SPINNER_SIZE - SPINNER_MARGIN;
+    int dy = SPINNER_MARGIN;
+    fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0, 0, 0, 255);
+    if (frame_idx % 2 == 0)
+        fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0x40, 0xE0, 0x40, 255);
+}
+
+typedef struct { int x, y; } SpinnerSamplePt;
+
+/* Spread out, well clear of the spinner's own corner square. */
+static const SpinnerSamplePt SPINNER_SAMPLE_PTS[] = {
+    {60,60},{200,60},{340,60},{460,60},
+    {60,140},{200,140},{340,140},{460,140},
+    {60,220},{200,220},{340,220},{460,220},
+};
+#define SPINNER_SAMPLE_N (int)(sizeof(SPINNER_SAMPLE_PTS) / sizeof(SPINNER_SAMPLE_PTS[0]))
+
+/* Shows the blinking indicator, polling for real video underneath instead
+ * of blindly sleeping through the whole window — matters now that the wait
+ * can be as long as 50s for the slow subtitle+seek case (see play()), but
+ * most restarts are still the fast ~2s case and shouldn't be held up.
+ * mplayer writes video frames directly to fb->mem, bypassing our fb->back
+ * entirely — so fb->back can be stale (still holding whatever WE last
+ * explicitly drew, e.g. the info screen, even minutes into playback) by the
+ * time a seek calls this. Sync back from mem first so the overlay
+ * composites onto what's ACTUALLY on screen right now (the frozen last
+ * video frame), not onto stale leftover back-buffer content — confirmed on
+ * hardware: without this sync, seeking made the screen jump back to the
+ * info/cover page while "loading". */
+static void spinner_show(FBDev *fb, double seconds)
+{
+    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+
+    uint32_t ref[SPINNER_SAMPLE_N];
+    int valid[SPINNER_SAMPLE_N];
+    for (int i = 0; i < SPINNER_SAMPLE_N; i++) {
+        valid[i] = SPINNER_SAMPLE_PTS[i].x < fb->width && SPINNER_SAMPLE_PTS[i].y < fb->height;
+        ref[i] = valid[i] ? *(const uint32_t *)(fb->mem + SPINNER_SAMPLE_PTS[i].y * fb->stride
+                                                          + SPINNER_SAMPLE_PTS[i].x * 4) : 0;
+    }
+
+    double until = now_sec() + seconds;
+    int frame_idx = 0;
+    while (now_sec() < until) {
+        if (frame_idx > 0) {
+            int changed = 0;
+            for (int i = 0; i < SPINNER_SAMPLE_N && !changed; i++) {
+                if (!valid[i]) continue;
+                uint32_t cur = *(const uint32_t *)(fb->mem + SPINNER_SAMPLE_PTS[i].y * fb->stride
+                                                             + SPINNER_SAMPLE_PTS[i].x * 4);
+                if (cur != ref[i]) changed = 1;
+            }
+            /* mplayer already drawing real frames underneath — stop
+             * stomping fb->mem with our own stale overlay every cycle. */
+            if (changed) return;
+        }
+        draw_spinner_frame(fb, frame_idx);
+        fb_flip(fb);
+        usleep(SPINNER_BLINK_MS * 1000);
+        frame_idx++;
+    }
+}
+
+/* ── browse frames ────────────────────────────────────────────────────────── */
+
+static void fetch_frame(void)
+{
+    BrowseFrame *f = &g_stack[g_stack_depth - 1];
+    switch (f->kind) {
+    case FRAME_VIEWS:
+        g_item_count = jf_list_views(&g_cfg, g_items, JF_MAX_ITEMS);
+        break;
+    case FRAME_ITEMS:
+        g_item_count = jf_list_items(&g_cfg, f->parent_id, g_items, JF_MAX_ITEMS);
+        break;
+    case FRAME_SEASONS:
+        g_item_count = jf_list_seasons(&g_cfg, f->series_id, g_items, JF_MAX_ITEMS);
+        break;
+    case FRAME_EPISODES:
+        g_item_count = jf_list_episodes(&g_cfg, f->series_id, f->season_id, g_items, JF_MAX_ITEMS);
+        break;
+    }
+    g_sel = 0; g_scroll = 0;
+}
+
+static void push_frame(FrameKind kind, const char *title,
+                        const char *parent_id, const char *series_id, const char *season_id)
+{
+    if (g_stack_depth >= MAX_STACK) return;
+    BrowseFrame *f = &g_stack[g_stack_depth++];
+    memset(f, 0, sizeof(*f));
+    f->kind = kind;
+    strncpy(f->title, title, sizeof(f->title) - 1);
+    if (parent_id) strncpy(f->parent_id, parent_id, sizeof(f->parent_id) - 1);
+    if (series_id) strncpy(f->series_id, series_id, sizeof(f->series_id) - 1);
+    if (season_id) strncpy(f->season_id, season_id, sizeof(f->season_id) - 1);
+    fetch_frame();
+}
+
+/* Returns 1 if popped back into a browse frame, 0 if already at the root
+ * (caller should treat 0 as "exit app"). */
+static int pop_frame(void)
+{
+    if (g_stack_depth <= 1) return 0;
+    g_stack_depth--;
+    fetch_frame();
+    return 1;
+}
+
+/* ── drawing ──────────────────────────────────────────────────────────────── */
+
+static void draw_config_error(FBDev *fb, const char *reason)
+{
+    fb_clear(fb);
+    const char *title = "MiSTerFin";
+    draw_text(fb, (fb->width - text_width(title, 2))/2, SAFE_Y, title, 2, COL_TITLE);
+
+    draw_text(fb, (fb->width - text_width(reason, 1))/2, fb->height/2 - 20, reason, 1, COL_ERR);
+
+    const char *l2 = "Create /media/fat/misterfin/jellyfin.conf with:";
+    draw_text(fb, (fb->width - text_width(l2, 1))/2, fb->height/2, l2, 1, COL_HINT);
+    const char *l3 = "server_url";
+    draw_text(fb, (fb->width - text_width(l3, 1))/2, fb->height/2 + 12, l3, 1, COL_ITEM);
+    const char *l4 = "api_key";
+    draw_text(fb, (fb->width - text_width(l4, 1))/2, fb->height/2 + 24, l4, 1, COL_ITEM);
+    const char *l5 = "username";
+    draw_text(fb, (fb->width - text_width(l5, 1))/2, fb->height/2 + 36, l5, 1, COL_ITEM);
+
+    const char *hint = "B: exit";
+    draw_text(fb, (fb->width - text_width(hint, 1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+    fb_flip(fb);
+}
+
+static const char *type_folder_icon(JfItemType t)
+{
+    switch (t) {
+    case JF_TYPE_FOLDER: case JF_TYPE_SERIES: case JF_TYPE_SEASON: return "> ";
+    default: return "";
+    }
+}
+
+/* forward decl — defined below draw_info, reused here for the browse-list
+ * cover panel (fit-preserving: a plain stretch-to-box distorts most
+ * posters' 2:3-ish aspect ratio, confirmed visually on hardware). */
+static void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,
+                               int cx, int cy, int max_w, int max_h, uint8_t alpha);
+
+/* Simple "flying through stars" background for the About screen — each
+ * star has a depth (z) that shrinks every frame; projecting x/y by 1/z
+ * makes it appear to accelerate toward the viewer, and it respawns at max
+ * depth (from a random direction) once it passes the camera or drifts
+ * off-screen. Pure decoration, redrawn fresh every frame since draw_about()
+ * itself is already called on every loop tick while the screen is open. */
+#define STAR_COUNT 40
+typedef struct { float x, y, z; } Star;
+static Star g_stars[STAR_COUNT];
+static int  g_stars_init = 0;
+
+static float star_frand_pm1(void) { return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f; }
+
+static void star_respawn(Star *s)
+{
+    s->x = star_frand_pm1();
+    s->y = star_frand_pm1();
+    s->z = 1.0f;
+}
+
+static void draw_starfield(FBDev *fb)
+{
+    if (!g_stars_init) {
+        g_stars_init = 1;
+        for (int i = 0; i < STAR_COUNT; i++) {
+            star_respawn(&g_stars[i]);
+            g_stars[i].z = 0.05f + ((float)rand() / (float)RAND_MAX) * 0.95f;
+        }
+    }
+    for (int i = 0; i < STAR_COUNT; i++) {
+        Star *s = &g_stars[i];
+        s->z -= 0.012f;
+        if (s->z <= 0.05f) star_respawn(s);
+
+        float scale = 1.0f / s->z;
+        int sx = (int)(fb->width  / 2 + s->x * scale * (fb->width  / 4));
+        int sy = (int)(fb->height / 2 + s->y * scale * (fb->height / 4));
+        if (sx < 0 || sx >= fb->width || sy < 0 || sy >= fb->height) { star_respawn(s); continue; }
+
+        int size = scale > 2.2f ? 2 : 1;   /* stars get a touch bigger as they approach */
+        uint8_t bright = scale > 1.4f ? 255 : 150;
+        fb_fill_rect_alpha(fb, sx, sy, size, size, bright, bright, bright, 255);
+    }
+}
+
+/* show_footer=0 skips the "<version> installed"/update-available line and
+ * the "B: back" hint — used by the --capture-about tool to render a clean
+ * frame for a standalone marketing GIF (see tools/capture_about_gif.py). */
+static void draw_about_frame(FBDev *fb, int show_footer)
+{
+    fb_clear(fb);
+    draw_starfield(fb);
+
+    static const char title[] = "MiSTerFin";
+    static const char line1[] = "made over the weekends at pudding";
+    static const char line2[] = "https://pudding.studio";
+
+    static uint8_t *img_px = NULL;
+    static int      img_w = 0, img_h = 0;
+    static int      img_tried = 0;
+    if (!img_tried) {
+        img_tried = 1;
+        int ch;
+        img_px = stbi_load("/media/fat/misterfin/about.png", &img_w, &img_h, &ch, 4);
+    }
+
+    const int ts = 2, s1 = 1;
+    const int tch = 8 * ts, sch = 8 * s1, img_gap = 10, lsp = 6;
+
+    int img_h_box = 0, img_w_box = 0;
+    if (img_px && img_w > 0 && img_h > 0) {
+        int max_w = fb->width - 2 * SAFE_X;
+        int max_h = 130;
+        img_h_box = max_h < img_h ? max_h : img_h;
+        img_w_box = (int)((double)img_w / img_h * img_h_box * 5.0 / 3.0 + 0.5);
+        if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
+    }
+
+    int total_h = img_h_box + (img_h_box ? img_gap : 0) + tch + lsp + sch + lsp + sch;
+    int avail_bottom = fb->height - 8 - SAFE_Y_BOT - 14 - 6;
+    int cur_y = (avail_bottom - total_h) / 2 + 12;
+    if (cur_y < SAFE_Y) cur_y = SAFE_Y;
+
+    if (img_px && img_h_box > 0) {
+        blit_fit_centered(fb, img_px, img_w, img_h,
+                           fb->width / 2, cur_y + img_h_box / 2, img_w_box, img_h_box, 255);
+        cur_y += img_h_box + img_gap;
+    }
+
+    draw_text(fb, (fb->width - text_width(title, ts)) / 2, cur_y, title, ts, COL_TITLE);
+    cur_y += tch + lsp;
+    draw_text(fb, (fb->width - text_width(line1, s1)) / 2, cur_y, line1, s1, COL_ITEM);
+    cur_y += sch + lsp;
+    draw_text(fb, (fb->width - text_width(line2, s1)) / 2, cur_y, line2, s1, COL_RESUME);
+
+    if (show_footer) {
+        pthread_mutex_lock(&g_upd_mutex);
+        UpdateState us = g_upd_state;
+        char latest[32];
+        strncpy(latest, g_upd_latest, sizeof(latest) - 1);
+        latest[sizeof(latest) - 1] = '\0';
+        pthread_mutex_unlock(&g_upd_mutex);
+
+        /* Same bottom margin as everything else now (SAFE_Y_BOT == SAFE_Y) —
+         * not the taller margin MiSTerDVD's own about screen used. */
+        int safe_y = fb->height - 8 - SAFE_Y_BOT;
+        char installed[48];
+        snprintf(installed, sizeof(installed), "%s installed", APP_VERSION);
+        if (us == UPD_AVAILABLE) {
+            draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
+            char upd[64];
+            snprintf(upd, sizeof(upd), "%s available", latest);
+            draw_text(fb, SAFE_X, safe_y, upd, 1, COL_RESUME);
+        } else {
+            draw_text(fb, SAFE_X, safe_y, installed, 1, COL_DIM);
+        }
+
+        const char *hint = "B: back";
+        draw_text(fb, fb->width - text_width(hint, 1) - SAFE_X, safe_y, hint, 1, COL_HINT);
+    }
+
+    fb_flip(fb);
+}
+
+static void draw_about(FBDev *fb) { draw_about_frame(fb, 1); }
+
+/* NOT a literal aspect-ratio box — blit_fit_centered's 5/3 pixel-aspect
+ * correction means a typical portrait poster actually wants a box WIDER
+ * than naive square-pixel math would suggest to look right on the real
+ * screen (mirrors MiSTerDVD's own pdh=160/max_pw=200 proportions, scaled
+ * down for this smaller corner panel). */
+#define BROWSE_COVER_W 175
+#define BROWSE_COVER_H 140
+
+static uint8_t *g_browse_cover_px = NULL;
+static int      g_browse_cover_w = 0, g_browse_cover_h = 0;
+static char     g_browse_cover_item_id[JF_ID_LEN] = "";
+
+/* Loads the currently-selected row's cover into the top-right panel, only
+ * re-fetching when the selection actually changed (draw_browse redraws on
+ * every keypress, not just navigation). */
+static void browse_cover_sync(void)
+{
+    JfItem *it = (g_item_count > 0) ? &g_items[g_sel] : NULL;
+    int wants_cover = it && it->image_tag[0] &&
+        (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE ||
+         it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON);
+
+    if (!wants_cover) {
+        if (g_browse_cover_item_id[0]) {
+            if (g_browse_cover_px) { stbi_image_free(g_browse_cover_px); g_browse_cover_px = NULL; }
+            g_browse_cover_w = g_browse_cover_h = 0;
+            g_browse_cover_item_id[0] = '\0';
+        }
+        return;
+    }
+    if (!strcmp(g_browse_cover_item_id, it->id)) return;   /* already loaded */
+
+    if (g_browse_cover_px) { stbi_image_free(g_browse_cover_px); g_browse_cover_px = NULL; }
+    g_browse_cover_w = g_browse_cover_h = 0;
+    strncpy(g_browse_cover_item_id, it->id, sizeof(g_browse_cover_item_id) - 1);
+
+    if (jf_download_item_image(&g_cfg, it->id, "Primary", it->image_tag, 180, POSTER_TMP))
+        g_browse_cover_px = load_image_tmp(POSTER_TMP, &g_browse_cover_w, &g_browse_cover_h);
+}
+
+static void draw_browse(FBDev *fb)
+{
+    browse_cover_sync();
+
+    fb_clear(fb);
+
+    BrowseFrame *f = &g_stack[g_stack_depth - 1];
+    const char *title = f->title[0] ? f->title : "MiSTerFin";
+    draw_text(fb, (fb->width - text_width(title, 2))/2, SAFE_Y, title, 2, COL_TITLE);
+
+    if (g_item_count == 0) {
+        const char *msg = "Nothing here";
+        draw_text(fb, (fb->width - text_width(msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
+        fb_flip(fb);
+        return;
+    }
+
+    int cover_panel_x = fb->width - SAFE_X - BROWSE_COVER_W;
+    /* -3 lines the panel's top up with the first row's selection highlight
+     * top (that highlight starts at y-3, see the is_sel rect below) —
+     * fixed offset, the panel itself always stays put top-right regardless
+     * of which row is actually selected. */
+    int cover_panel_y = SAFE_Y + 24 - 3;
+    int has_cover = (g_browse_cover_px != NULL);
+    int row_max_w = (has_cover ? cover_panel_x - 10 : fb->width - SAFE_X) - SAFE_X;
+
+    if (has_cover) {
+        /* No placeholder background rect: a poster whose aspect doesn't
+         * exactly match the box would otherwise show as visible grey
+         * pillarbox bars. Letting the image be the only thing drawn means
+         * any leftover margin just blends into whatever's already there. */
+        int cx = cover_panel_x + BROWSE_COVER_W / 2, cy = cover_panel_y + BROWSE_COVER_H / 2;
+        blit_fit_centered(fb, g_browse_cover_px, g_browse_cover_w, g_browse_cover_h,
+                           cx, cy, BROWSE_COVER_W, BROWSE_COVER_H, 255);
+    }
+
+    int end = g_scroll + VISIBLE;
+    if (end > g_item_count) end = g_item_count;
+
+    for (int i = g_scroll; i < end; i++) {
+        int row = i - g_scroll;
+        int y   = SAFE_Y + 24 + row * ROW_H;
+        int is_sel = (i == g_sel);
+        JfItem *it = &g_items[i];
+
+        char line1[280];
+        if (it->year[0] &&
+            (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_SERIES))
+            snprintf(line1, sizeof(line1), "%s%s (%s)", type_folder_icon(it->type), it->name, it->year);
+        else
+            snprintf(line1, sizeof(line1), "%s%s", type_folder_icon(it->type), it->name);
+        truncate_to_width(line1, 1, row_max_w);
+
+        int has_line2 = (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE);
+        char line2[64] = {0};
+        uint8_t l2r = 0x58, l2g = 0x58, l2b = 0x58;
+        if (has_line2) {
+            int minutes = (int)(it->runtime_ticks / 10000000LL / 60);
+            if (it->played) {
+                snprintf(line2, sizeof(line2), "%d min - watched", minutes);
+                l2r = 0x40; l2g = 0xCC; l2b = 0x40;
+            } else if (it->resume_ticks > 0) {
+                char tbuf[16];
+                fmt_time(tbuf, sizeof(tbuf), (double)it->resume_ticks / 10000000.0);
+                snprintf(line2, sizeof(line2), "%d min - resume %s", minutes, tbuf);
+                l2r = 0xFF; l2g = 0xC0; l2b = 0x40;
+            } else if (minutes > 0) {
+                snprintf(line2, sizeof(line2), "%d min", minutes);
+            }
+        }
+        truncate_to_width(line2, 1, row_max_w);
+
+        if (is_sel) {
+            fb_fill_rect_alpha(fb, SAFE_X - 4, y - 3,
+                               row_max_w + 8, ROW_H - 2, COL_SEL_BG, 220);
+            draw_text(fb, SAFE_X, y, line1, 1, COL_SEL_FG);
+            if (line2[0]) draw_text(fb, SAFE_X, y + 11, line2, 1, l2r, l2g, l2b);
+        } else {
+            draw_text(fb, SAFE_X, y, line1, 1, COL_ITEM);
+            if (line2[0]) draw_text(fb, SAFE_X, y + 11, line2, 1, l2r, l2g, l2b);
+        }
+    }
+
+    if (g_item_count > VISIBLE) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d/%d", g_sel+1, g_item_count);
+        draw_text(fb, fb->width - text_width(buf,1) - SAFE_X,
+                  fb->height - 8 - SAFE_Y_BOT, buf, 1, COL_HINT);
+    }
+
+    const char *hint = (g_stack_depth > 1) ? "A:select  B:back" : "A:select  B:exit";
+    draw_text(fb, (fb->width - text_width(hint,1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
+#define HERO_H 150
+
+/* Blits src into a max_w x max_h box, preserving its own real-world aspect
+ * ratio and centering it (letterboxing/pillarboxing as needed — handles a
+ * landscape screen-grab used as a poster fine, same as a normal portrait
+ * one). Used for the logo and any poster/cover, which — unlike the
+ * full-bleed backdrop crop-fill — must never look distorted.
+ *
+ * The 5/3 factor is MiSTerDVD's proven correction for this platform's
+ * non-square pixels: our buffer is 640 wide feeding a 4:3 CRT through a
+ * narrower final PAL/NTSC DDR resolution, so plain w/h aspect math alone
+ * renders posters visibly too narrow ("elongated") on the real screen —
+ * confirmed by reusing MiSTerDVD's exact fix (see its main.c cover-art
+ * rendering) rather than re-deriving it. */
+static void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,
+                               int cx, int cy, int max_w, int max_h, uint8_t alpha)
+{
+    if (!src || sw <= 0 || sh <= 0) return;
+    int dh = max_h;
+    int dw = (int)((double)sw / sh * dh * 5.0 / 3.0 + 0.5);
+    if (dw > max_w) { dh = dh * max_w / dw; dw = max_w; }
+    fb_blit(fb, src, sw, sh, cx - dw / 2, cy - dh / 2, dw, dh, alpha);
+}
+
+static void draw_info(FBDev *fb)
+{
+    fb_clear(fb);
+
+    /* Backdrop: full-bleed cover-crop (crop the taller dimension so the
+     * remaining region already matches the target box's aspect ratio,
+     * then a single uniform fb_blit stretch is distortion-free) — a plain
+     * stretch-to-fill would visibly warp most 16:9-ish backdrops into our
+     * much wider 640x150 box. */
+    if (g_backdrop_px) {
+        int crop_h = g_backdrop_w * HERO_H / fb->width;
+        if (crop_h > g_backdrop_h) crop_h = g_backdrop_h;
+        int skip = (g_backdrop_h - crop_h) / 2;
+        const uint8_t *cropped = g_backdrop_px + (size_t)skip * g_backdrop_w * 4;
+        fb_blit(fb, cropped, g_backdrop_w, crop_h, 0, 0, fb->width, HERO_H, 255);
+    } else {
+        fb_fill_rect_alpha(fb, 0, 0, fb->width, HERO_H, 0x18, 0x18, 0x18, 255);
+    }
+
+    /* Legibility gradient behind the logo/title: transparent at the
+     * backdrop's midpoint, fading to near-opaque black by the bottom edge
+     * so it blends smoothly into the solid black area below the hero
+     * instead of showing a hard-edged bar. */
+    int grad_top = HERO_H / 2;
+    for (int gy = grad_top; gy < HERO_H; gy++) {
+        int a = (gy - grad_top) * 220 / (HERO_H - grad_top);
+        fb_fill_rect_alpha(fb, 0, gy, fb->width, 1, 0, 0, 0, (uint8_t)a);
+    }
+
+    if (g_logo_px) {
+        /* max_w bumped from 280: the 5/3 PAR-corrected width for a wide
+         * logo often exceeds that, which clamped height down below the
+         * intended 34px target (confirmed on hardware — logos looked
+         * smaller after the aspect fix). 480 covers essentially any real
+         * logo's aspect ratio at the full target height. */
+        blit_fit_centered(fb, g_logo_px, g_logo_w, g_logo_h,
+                           fb->width / 2, HERO_H - 24, 480, 34, 255);
+    } else {
+        char title_line[300];
+        if (g_info_item.year[0])
+            snprintf(title_line, sizeof(title_line), "%s (%s)", g_info_item.name, g_info_item.year);
+        else
+            snprintf(title_line, sizeof(title_line), "%s", g_info_item.name);
+        draw_text(fb, (fb->width - text_width(title_line, 1)) / 2, HERO_H - 28,
+                  title_line, 1, COL_SEL_FG);
+    }
+
+    int ty = HERO_H + 8;
+    int tw = fb->width - 2 * SAFE_X;
+
+    char status[64] = {0};
+    if (g_info_item.runtime_ticks > 0)
+        snprintf(status, sizeof(status), "%d min",
+                 (int)(g_info_item.runtime_ticks / 10000000LL / 60));
+    if (g_info_item.played) {
+        strncat(status, status[0] ? "  -  Watched" : "Watched", sizeof(status) - strlen(status) - 1);
+    } else if (g_info_item.resume_ticks > 0) {
+        char tbuf[16], rbuf[48];
+        fmt_time(tbuf, sizeof(tbuf), (double)g_info_item.resume_ticks / 10000000.0);
+        snprintf(rbuf, sizeof(rbuf), "%s  -  Resume %s", status[0] ? status : "", tbuf);
+        strncpy(status, rbuf, sizeof(status) - 1);
+    }
+    if (status[0]) {
+        if (g_info_item.played)                          draw_text(fb, SAFE_X, ty, status, 1, COL_WATCHED);
+        else if (g_info_item.resume_ticks > 0)            draw_text(fb, SAFE_X, ty, status, 1, COL_RESUME);
+        else                                              draw_text(fb, SAFE_X, ty, status, 1, COL_DIM);
+        ty += 12;
+    }
+
+    if (g_info_item.overview[0])
+        ty += draw_wrapped(fb, SAFE_X, ty, g_info_item.overview, 1, tw, 3, COL_ITEM);
+    ty += 4;
+
+    /* Cast row — small headshots only, no name labels: there isn't enough
+     * vertical room left at this resolution for both a photo and legible
+     * text per person. */
+    int cast_n = g_info_item.cast_count;
+    if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
+    if (cast_n > 0) {
+        int thumb = 34;
+        int slot = tw / cast_n;
+        for (int i = 0; i < cast_n; i++) {
+            int cx = SAFE_X + slot * i + slot / 2;
+            int cy = ty + thumb / 2;
+            fb_fill_rect_alpha(fb, cx - thumb/2, cy - thumb/2, thumb, thumb, 0x20, 0x20, 0x20, 255);
+            if (g_cast_px[i])
+                fb_blit(fb, g_cast_px[i], g_cast_px_w[i], g_cast_px_h[i],
+                        cx - thumb/2, cy - thumb/2, thumb, thumb, 255);
+        }
+    }
+
+    const char *hint = (g_info_item.resume_ticks > 0 && !g_info_item.played)
+        ? "A:resume  SELECT:restart  B:back"
+        : "A:play  B:back";
+    draw_text(fb, (fb->width - text_width(hint,1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
+/* Simple dashed track + a small square marker at the current position,
+ * with "current / total" underneath — only safe to draw while mplayer
+ * itself isn't actively writing frames (paused), same reasoning as the
+ * spinner overlay: during active playback this would race mplayer's own
+ * continuous frame writes and flicker. */
+static void draw_timeline(FBDev *fb, int y, double pos, double duration)
+{
+    int x0 = SAFE_X, x1 = fb->width - SAFE_X;
+    int barw = x1 - x0;
+    fb_fill_rect_alpha(fb, x0, y, barw, 2, 0x60, 0x60, 0x60, 255);
+    if (duration > 0) {
+        double frac = pos / duration;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        int mx = x0 + (int)(frac * barw);
+        fb_fill_rect_alpha(fb, mx - 3, y - 4, 6, 10, 0xFF, 0xE0, 0x40, 255);
+    }
+    char cur[16], tot[16], label[40];
+    fmt_time(cur, sizeof(cur), pos);
+    fmt_time(tot, sizeof(tot), duration);
+    snprintf(label, sizeof(label), "%s / %s", cur, tot);
+    draw_text(fb, (fb->width - text_width(label, 1)) / 2, y + 10, label, 1, COL_ITEM);
+}
+
+static void draw_paused(FBDev *fb, const char *name, double pos)
+{
+    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+
+    int cy = fb->height / 2 - 16;
+    fb_fill_rect_alpha(fb, 0, cy - 6, fb->width, 50, 0, 0, 0, 200);
+
+    const char *ps = "|| PAUSED";
+    draw_text(fb, (fb->width - text_width(ps, 2)) / 2, cy, ps, 2, 0xFF, 0xFF, 0x00);
+
+    char nbuf[64];
+    snprintf(nbuf, sizeof(nbuf), "%.60s", name);
+    draw_text(fb, (fb->width - text_width(nbuf, 1)) / 2, cy + 20, nbuf, 1, COL_ITEM);
+
+    draw_timeline(fb, fb->height - 8 - SAFE_Y_BOT - 20, pos,
+                  (double)g_info_item.runtime_ticks / 10000000.0);
+
+    const char *hint = (g_info_item.sub_count > 0)
+        ? "A:resume  B:stop  L/R:vsync  SELECT:subs"
+        : "A:resume  B:stop  L/R:vsync";
+    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
+/* ── playback (mplayer slave-mode, adapted from MiSTerDVD's non-DVD path) ── */
+
+static pid_t   g_player_pid      = -1;
+static int     g_cmd_fd          = -1;
+static double  g_play_offset     = 0.0;
+static double  g_play_start_wall = 0.0;
+static int     g_paused          = 0;
+static double  g_pause_wall      = 0.0;
+static char    g_play_session_id[64];
+static double  g_last_progress_report = 0.0;
+/* -1 = off, otherwise JfSubtitle.index of the loaded/active track. Rendered
+ * client-side by mplayer (sub_load/sub_select — see subtitle_apply()), not
+ * burned in server-side, so this does NOT require a stream restart. Reset
+ * to -1 only when starting a title fresh from the info screen — preserved
+ * across a seek-triggered restart of the same title (seeks re-download and
+ * re-load the same subtitle file after the restart, see play()). */
+static int     g_current_sub_index = -1;
+/* Seek is a full stop+restart (network stream isn't byte-range seekable —
+ * see player_seek) which takes a couple of seconds; accumulate repeated
+ * presses into one seek instead of firing a restart per press, same as
+ * MiSTerDVD's local-seek debounce pattern. */
+static double  g_seek_accum  = 0.0;
+static double  g_seek_fire_at = 0.0;   /* 0 = no pending seek */
+
+/* Requested once here so both play() and the subtitle/info overlay (which
+ * displays it alongside the source's own specs) reference the same values. */
+static const JfStreamProfile g_stream_profile = { .max_width = 480, .max_height = 270, .video_bitrate = 5000000 };
+
+static void mp_cmd(const char *cmd)
+{
+    if (g_cmd_fd >= 0) write(g_cmd_fd, cmd, strlen(cmd));
+}
+
+static double play_position(void)
+{
+    if (g_paused) return g_play_offset + (g_pause_wall - g_play_start_wall);
+    return g_play_offset + (now_sec() - g_play_start_wall);
+}
+
+static int player_running(void)
+{
+    if (g_player_pid < 0) return 0;
+    int status;
+    if (waitpid(g_player_pid, &status, WNOHANG) > 0) { g_player_pid = -1; return 0; }
+    return 1;
+}
+
+static void player_stop(void)
+{
+    if (g_cmd_fd >= 0) { mp_cmd("quit\n"); close(g_cmd_fd); g_cmd_fd = -1; }
+    if (g_player_pid > 0) {
+        usleep(150000);
+        /* mplayer's -cache implementation forks a separate cache-fill
+         * process rather than using a thread; that child is not tracked by
+         * g_player_pid and survives killing just the main pid (confirmed on
+         * hardware: repeated play/stop cycles left orphaned mplayer-arm
+         * processes running indefinitely). play() puts the whole subtree in
+         * its own process group via setpgid(), so kill the group. */
+        kill(-g_player_pid, SIGKILL);
+        waitpid(g_player_pid, NULL, 0);
+        g_player_pid = -1;
+    }
+    g_paused = 0;
+
+    /* mplayer's own vo_fbdev patch opens /dev/tty itself and restores
+     * KD_TEXT (+ the console cursor) on its own graceful shutdown path —
+     * which our "quit\n" above triggers before the SIGKILL even lands.
+     * Without reclaiming graphics mode here, the console cursor blinks
+     * through our subsequent drawing, and during a seek-restart (stop then
+     * immediately play() again) the screen can show raw console text
+     * instead of our spinner/video for a moment (confirmed on hardware). */
+    cursor_hide();
+}
+
+static void player_pause_toggle(void)
+{
+    if (g_player_pid < 0) return;
+    mp_cmd("pause\n");
+    if (g_paused) {
+        g_play_start_wall += now_sec() - g_pause_wall;
+        g_paused = 0;
+        /* Restore subtitle rendering now that our own pause-screen/submenu
+         * overlay is gone — see the sub_visibility 0 branch below for why
+         * this was hidden in the first place. Harmless if no subtitle is
+         * actually loaded (g_current_sub_index < 0). */
+        mp_cmd("sub_visibility 1\n");
+    } else {
+        g_pause_wall = now_sec();
+        g_paused = 1;
+        /* Subtitle text is drawn by mplayer's own draw_osd()/vo_draw_text()
+         * on its own internal refresh schedule, independent of pause state
+         * and independent of our own overlay draws — the two raced on the
+         * same framebuffer memory with no coordination whenever a
+         * subtitle happened to be showing at a paused position, confirmed
+         * on hardware as the pause screen / subtitle submenu visibly
+         * glitching. Hiding subs while our own overlay owns the screen
+         * removes that race entirely (paired with -osdlevel 0 in play()
+         * for the other, OSD-status half of it).
+         *
+         * pausing_keep is mandatory here: mplayer slave mode silently
+         * resumes playback on ANY command issued while paused unless it's
+         * prefixed with pausing_keep — confirmed on hardware (utime jumped
+         * from a static ~24 ticks to 51 over 2s after sending a bare
+         * sub_visibility 0 while paused). Without this prefix we were
+         * unpausing the movie the instant we tried to hide its subtitles,
+         * which is why pause silently stopped holding and why the
+         * "pause screen" was actually racing live video underneath it. */
+        mp_cmd("pausing_keep sub_visibility 0\n");
+    }
+}
+
+static void play(FBDev *fb, const char *item_id, double offset_secs);   /* forward decl — used below */
+
+/* Jellyfin's transcode stream is a plain progressive HTTP GET with
+ * "Accept-Ranges: none" (confirmed against a real server) — there is no
+ * byte offset to seek to, so mplayer's in-stream "seek" slave command is a
+ * no-op on it. The only way to seek is to stop and re-request the stream
+ * with a new startTimeTicks, same as a fresh play(). */
+static void player_seek(FBDev *fb, double delta)
+{
+    double new_offset = play_position() + delta;
+    if (new_offset < 0) new_offset = 0;
+    player_stop();
+    play(fb, g_info_item.id, new_offset);
+}
+
+#define SUB_LOCAL_PATH "/tmp/misterfin_sub.srt"
+
+/* Subtitles are rendered client-side by mplayer, not burned in server-side —
+ * an earlier version used subtitleMethod=Encode + a stream restart per
+ * change, but that meant every subtitle change was really a seek, and
+ * confirmed on a real server that seeking with burned-in subtitles forces
+ * Jellyfin to decode+discard from the true start of the file up to the seek
+ * target (a seek to 40:00 dropped exactly 40:00 worth of frames — on both
+ * mpeg2video and h264, so not a codec issue) — a multi-minute stall on a
+ * deep seek, and nothing a request parameter could avoid since it's the
+ * server's own seek strategy once a subtitle filter is in its ffmpeg graph.
+ * mplayer already has real subtitle rendering built in (sub_load/
+ * sub_select in slave mode) and Jellyfin serves the raw .srt directly
+ * (confirmed: no transcode needed for a text subtitle codec) — so we just
+ * download the chosen track and hand it to mplayer, no restart at all. */
+/* Our bitmap OSD font (same one mplayer's classic subtitle renderer falls
+ * back to without FreeType — see -subpos comment in play()) only covers the
+ * ASCII range MiSTerDVD's menus ever needed. A downloaded .srt can contain
+ * anything — checked a real subtitle file and it was otherwise completely
+ * ordinary English text except for a single "♪" (U+266A) used to mark
+ * background music with no dialogue — that one non-ASCII character has no
+ * glyph in this font and renders as garbage. Blanking any byte >= 0x80
+ * drops it (and would drop accented characters in a non-English subtitle
+ * too, which is a real loss, but showing garbage is worse and this font
+ * can't render them either way). */
+static void sanitize_srt_ascii(const char *path)
+{
+    FILE *f = fopen(path, "r+b");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    if (len <= 0 || len > 2 * 1024 * 1024) { fclose(f); return; }
+    fseek(f, 0, SEEK_SET);
+
+    char *buf = malloc((size_t)len);
+    if (!buf) { fclose(f); return; }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    for (size_t i = 0; i < got; i++)
+        if ((unsigned char)buf[i] >= 0x80) buf[i] = ' ';
+
+    fseek(f, 0, SEEK_SET);
+    fwrite(buf, 1, got, f);
+    fclose(f);
+    free(buf);
+}
+
+/* The .srt has timestamps absolute to the ORIGINAL movie (e.g. 47:32), but
+ * mplayer's own clock starts at ~0 for whatever point we asked Jellyfin to
+ * start the transcode at (startTimeTicks) — confirmed via the server's own
+ * ffmpeg command lines: a seeked stream's timestamps get reset near 0 in
+ * the output regardless of whether it's an explicit setpts filter (burn-in
+ * case) or ffmpeg's own default start_time normalization on a seeked input
+ * (plain case, which is what we always use now). The offset between the
+ * two clocks is exactly g_play_offset, so that part of the shift is exact.
+ * AUDIO_DELAY_SEC and SUBTITLE_SYNC_FUDGE_SEC (see their own comments) cover
+ * the rest of the fixed residual. g_sub_delay_extra is further live,
+ * user-tunable adjustment on top of all three (see the submenu's LEFT/RIGHT
+ * handling), for whatever a specific subtitle file's own drift still needs. */
+static double g_sub_delay_extra = 0.0;   /* seconds, LEFT/RIGHT-adjustable in the submenu */
+
+/* Both of these run while the submenu has the player paused (LEFT/RIGHT
+ * live-tune sub_delay, A-confirm applies sub_remove/sub_load/sub_select) as
+ * well as from a fresh, unpaused play() restart — pausing_keep is a no-op
+ * when already playing, so it's always safe to use here rather than
+ * threading g_paused through every call site. See player_pause_toggle()'s
+ * sub_visibility comment for why the prefix is mandatory while paused. */
+static void sub_delay_send(void)
+{
+    if (g_current_sub_index < 0) return;   /* nothing loaded yet — subtitle_apply() will send it */
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "pausing_keep sub_delay %.3f 1\n",
+             AUDIO_DELAY_SEC + SUBTITLE_SYNC_FUDGE_SEC - g_play_offset + g_sub_delay_extra);
+    mp_cmd(cmd);
+}
+
+static void subtitle_apply(int new_index)
+{
+    if (new_index < 0) {
+        mp_cmd("pausing_keep sub_remove\n");
+        g_current_sub_index = -1;
+        return;
+    }
+
+    /* Download BEFORE touching anything mplayer-side — if this fails
+     * (network hiccup), the previous subtitle (if any) stays loaded and
+     * selected instead of silently ending up with none. */
+    if (!jf_download_subtitle(&g_cfg, g_info_item.id, g_info_item.id, new_index, SUB_LOCAL_PATH))
+        return;
+    sanitize_srt_ascii(SUB_LOCAL_PATH);
+
+    mp_cmd("pausing_keep sub_remove\n");
+    char cmd[112];
+    snprintf(cmd, sizeof(cmd), "pausing_keep sub_load \"%s\"\n", SUB_LOCAL_PATH);
+    mp_cmd(cmd);
+    mp_cmd("pausing_keep sub_select 0\n");   /* sub_remove above guarantees this is the only loaded track */
+    g_current_sub_index = new_index;
+    sub_delay_send();
+}
+
+/* Cycling with an immediate apply per SELECT press caused a cascade when
+ * the old burn-in restart was still in play (each press interrupted the
+ * previous restart before it connected, showing as a freeze) — kept the
+ * menu even after switching to client-side rendering since a menu is still
+ * nicer than blind cycling, though apply is instant now either way. */
+static int    g_submenu_visible    = 0;
+static int    g_submenu_sel        = 0;   /* 0 = Off, i+1 = g_info_item.subs[i] */
+static int    g_submenu_was_paused = 0;   /* pause state before the menu opened, to restore on close */
+
+static void submenu_open(FBDev *fb)
+{
+    g_submenu_visible    = 1;
+    g_submenu_sel         = g_current_sub_index < 0 ? 0 : g_current_sub_index + 1;
+    g_submenu_was_paused  = g_paused;
+    if (!g_paused) player_pause_toggle();
+    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+}
+
+static void submenu_close(void)
+{
+    g_submenu_visible = 0;
+    if (!g_submenu_was_paused && g_paused) player_pause_toggle();
+}
+
+static void draw_submenu(FBDev *fb)
+{
+    int n_opts = g_info_item.sub_count + 1;   /* JF_MAX_SUBS+1 = 9 max */
+
+    int box_w = 280;
+    /* Must exactly match every increment below (header, n_opts rows, sync
+     * line, gap, 3 hint lines, padding) — computed directly from those same
+     * numbers instead of separately, so it can't drift out of sync with the
+     * actual content again like it did before (text drawn past the box's
+     * own bottom edge). */
+    int box_h = 10 + 15 + n_opts * 15 + 15 + 8 + 3 * 12 + 8;
+    int box_x = (fb->width - box_w) / 2, box_y = fb->height / 2 - box_h / 2;
+    fb_fill_rect_alpha(fb, box_x, box_y, box_w, box_h, 0, 0, 0, 225);
+
+    int list_x = box_x + 12, list_y = box_y + 10;
+    int label_max_w = box_w - 24;   /* box_w minus left/right margin, for truncation below */
+    draw_text(fb, list_x, list_y, "SUBTITLES", 1, COL_HINT);
+    list_y += 15;
+
+    for (int i = 0; i < n_opts; i++) {
+        int is_off  = (i == 0);
+        int active  = is_off ? (g_current_sub_index < 0) : (g_current_sub_index == i - 1);
+        const char *label = is_off ? "Off" : g_info_item.subs[i - 1].label;
+        if (!label || !label[0]) label = "Unknown";
+
+        if (i == g_submenu_sel)
+            fb_fill_rect_alpha(fb, box_x + 4, list_y - 2, box_w - 8, 14, COL_SEL_BG, 220);
+
+        char line[56];
+        snprintf(line, sizeof(line), "%s%s", active ? "> " : "  ", label);
+        /* A long DisplayTitle from the server (seen in practice: things
+         * like "Undefined - SUBRIP - External") drawn past the box's own
+         * width made the text stick out past the dark background behind
+         * it — clip it to fit instead. */
+        truncate_to_width(line, 1, label_max_w);
+        if (active) draw_text(fb, list_x, list_y, line, 1, COL_RESUME);
+        else        draw_text(fb, list_x, list_y, line, 1, COL_ITEM);
+        list_y += 15;
+    }
+
+    char syncline[32];
+    snprintf(syncline, sizeof(syncline), "Sync: %+.1fs", g_sub_delay_extra);
+    draw_text(fb, list_x, list_y, syncline, 1, COL_ITEM);
+    list_y += 15 + 8;   /* + gap before the hint block */
+
+    const char *hint1 = "UP/DOWN: select subtitle";
+    const char *hint2 = "LEFT/RIGHT: adjust subtitle offset";
+    const char *hint3 = "A: apply    B: cancel";
+    draw_text(fb, box_x + (box_w - text_width(hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
+    list_y += 12;
+    draw_text(fb, box_x + (box_w - text_width(hint2, 1)) / 2, list_y, hint2, 1, COL_HINT);
+    list_y += 12;
+    draw_text(fb, box_x + (box_w - text_width(hint3, 1)) / 2, list_y, hint3, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
+static void submenu_confirm(void)
+{
+    int new_index = g_submenu_sel == 0 ? -1 : g_info_item.subs[g_submenu_sel - 1].index;
+    submenu_close();
+    if (new_index == g_current_sub_index) return;   /* no actual change */
+    subtitle_apply(new_index);
+}
+
+/* play_position() plus whatever seek is currently accumulating but hasn't
+ * fired yet, clamped to the title's actual runtime — used both to show a
+ * live-updating target while accumulating (draw_paused/draw_timeline) and
+ * to compute the ">> Ns" flash below. Equals plain play_position() when
+ * nothing is accumulating (g_seek_accum == 0), so callers can use this
+ * unconditionally instead of branching on whether a seek is in progress. */
+static double seek_pending_target(void)
+{
+    double duration = (double)g_info_item.runtime_ticks / 10000000.0;
+    double target = play_position() + g_seek_accum;
+    if (target < 0) target = 0;
+    if (duration > 0 && target > duration) target = duration;
+    return target;
+}
+
+/* Brief on-screen message via mplayer's OWN OSD text command, not our own
+ * drawing. We tried drawing this ourselves directly into the shared
+ * framebuffer, but while actively PLAYING, mplayer's decoder is
+ * independently writing fresh video into that same buffer on its own
+ * schedule — every one of our draws was racing that and losing roughly half
+ * the time, which showed as constant flicker no matter how often we
+ * redrew (confirmed on hardware; not fixable from our side without patching
+ * mplayer's video driver, which needs a cross-compiler/Docker toolchain not
+ * available here). osd_show_text has mplayer itself composite the text into
+ * its own frame before writing it out, so there's only one writer and no
+ * race — confirmed working on hardware. Trade-off: no custom background
+ * box, just plain text over the video, since that's all mplayer's own OSD
+ * renderer draws.
+ *
+ * pausing_keep is required if this might fire while paused (VSync toggle
+ * can) — see player_pause_toggle()'s sub_visibility comment for why. */
+static void osd_flash(const char *text, int paused)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "%sosd_show_text \"%s\" %d\n",
+             paused ? "pausing_keep " : "", text, (int)(FLASH_DURATION_SEC * 1000));
+    mp_cmd(cmd);
+}
+
+/* Accumulates a pending seek and (re)starts the debounce window — the
+ * actual restart fires from the main loop once SEEK_DEBOUNCE elapses with
+ * no further presses. */
+static void seek_accumulate(double delta, double now)
+{
+    g_seek_accum  += delta;
+    g_seek_fire_at = now + SEEK_DEBOUNCE;
+    if (g_paused) return;   /* draw_paused()'s own redraw already reflects this, see seek_pending_target() */
+
+    int secs = (int)(g_seek_accum < 0 ? -g_seek_accum : g_seek_accum);
+    char cur[16], tot[16], osd[80];
+    fmt_time(cur, sizeof(cur), seek_pending_target());
+    fmt_time(tot, sizeof(tot), (double)g_info_item.runtime_ticks / 10000000.0);
+    snprintf(osd, sizeof(osd), "%s %ds  -  %s / %s",
+             g_seek_accum >= 0 ? ">>" : "<<", secs, cur, tot);
+    osd_flash(osd, 0);
+}
+
+static void play(FBDev *fb, const char *item_id, double offset_secs)
+{
+    g_seek_accum = 0.0;
+    g_seek_fire_at = 0.0;
+
+    /* Deliberately does NOT clear /dev/fb0 here — whatever's already on
+     * screen (info screen, or the last video frame before a seek-restart)
+     * should stay visible behind the loading spinner below. The -vf chain's
+     * dsize=640:288 (see execlp below) makes mplayer's own frames fill the
+     * whole framebuffer exactly once they start, so nothing needs pre-clearing. */
+
+    /* Cortex-A9 is weak and this mplayer/ffmpeg build has no NEON-accelerated
+     * YUV->BGRA colorspace conversion (confirmed on real hardware: swscale
+     * falls back to a scalar C path regardless of scaler algorithm), and
+     * A/V fell behind in real time at higher decode resolutions — so we
+     * request a small decode from the server (cheap for the CPU) and let
+     * mplayer's own -vf chain (see execlp below) scale/letterbox it back up
+     * to fill /dev/fb0 afterwards (cheap relative to decode). */
+    /* CPU wasn't saturated at 2Mbps mpeg2video (measured live on hardware:
+     * ~45% usr, 50%+ idle) — testing a bump to 5Mbps to see if there's
+     * headroom for a quality bump too. */
+    int64_t start_ticks = (int64_t)(offset_secs * 10000000.0);
+    jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
+
+    char url[600];
+    jf_stream_url(&g_cfg, item_id, &g_stream_profile, start_ticks, g_play_session_id,
+                  url, sizeof(url));
+
+    char delay_arg[16];
+    snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
+
+    g_play_offset     = offset_secs > 0.0 ? offset_secs : 0.0;
+    g_play_start_wall = now_sec();
+    g_paused          = 0;
+    g_last_progress_report = now_sec();
+    jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
+
+    int pfd[2];
+    pipe(pfd);
+
+    g_player_pid = fork();
+    if (g_player_pid == 0) {
+        setpgid(0, 0);   /* own process group, so player_stop() can kill mplayer's cache-fill child too */
+        dup2(pfd[0], 0);
+        close(pfd[0]); close(pfd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        nice(-5);
+        execlp(MPLAYER, "mplayer",
+               "-slave", "-quiet",
+               "-nojoystick", "-noconsolecontrols",
+               "-vo", "fbdev:/dev/fb0",
+               "-ao", "alsa",
+               /* osdlevel 0: mplayer's native seekbar/status OSD (shown by
+                * default on pause/seek slave commands) draws directly into
+                * the framebuffer on its own internal refresh schedule,
+                * completely independent of our own overlay draws (pause
+                * screen, subtitle submenu) — the two raced on the same
+                * memory with no coordination, confirmed on hardware as
+                * visible flicker/glitching. This kills that trigger; our
+                * own drawn UI (draw_paused, draw_timeline) replaces it
+                * entirely, see seek_accumulate(). Subtitle rendering is a
+                * separate mechanism (not gated by osdlevel) — see
+                * player_pause_toggle()'s sub_visibility toggle for that
+                * other half of the same race. */
+               "-osdlevel", "0",
+               "-font", "/media/fat/misterfin/font/font.desc",
+               "-framedrop",
+               "-autosync", "30",
+               "-cache", "8192", "-cache-min", "20",
+               /* mplayer's own native MPEG-TS demuxer sometimes misses the
+                * video PID on Jellyfin's transcoded TS output (only finds
+                * audio) — forcing the ffmpeg/libavformat demuxer instead
+                * fixes it. Confirmed against a real Jellyfin 10.11 server. */
+               "-demuxer", "lavf",
+               /* -sws 0 = fast bilinear instead of the (much costlier)
+                * default bicubic scaler — confirmed empirically to matter
+                * a lot given there's no NEON path in this build. */
+               "-sws", "0",
+               /* Decode is requested small server-side (see profile below)
+                * to keep the software H.264 decode cheap; this -vf chain
+                * scales it back up to fill /dev/fb0's native 640x288
+                * (cheap relative to decode) while preserving the source's
+                * own aspect ratio and letterboxing/pillarboxing with black
+                * bars — scale=640:-1 fits the wider dimension, expand pads
+                * the other to 640x288, and dsize=640:288 is required last:
+                * without it mplayer's own internal aspect "prescale" logic
+                * recomputes and overrides the final display size (confirmed
+                * on hardware — omitting dsize gave a distorted stretch or a
+                * wrong-sized output depending on the rest of the chain). */
+               "-vf", "scale=640:-1,expand=640:288:-1:-1:1,dsize=640:288",
+               "-lavdopts", "threads=2:fast",
+               "-af", "format=s16le",
+               /* This build has no FreeType/fontconfig (confirmed on
+                * hardware: -subfont-osd-scale/-subfont-text-scale are both
+                * "Unknown option"), so without -subfont, subtitles would
+                * render through the same classic bitmap-font path as our
+                * own OSD text — same (too large for a subtitle line) size.
+                * -subfont points at a SEPARATE, smaller font generated
+                * specifically for subtitles (tools/gen_subfont.py — same
+                * font8x8 glyphs as the OSD font, but supersampled+
+                * downsampled to ~10px with antialiased edges instead of
+                * the OSD font's hard 16px blocks) so the OSD itself stays
+                * unaffected. -subwidth caps subtitle line width to 90% of
+                * the screen so mplayer wraps instead of letting a long
+                * line run off-screen (confirmed accepted by this build,
+                * unlike the FreeType-only scale options above).
+                * -subpos sets the baseline as a % of screen height (100 =
+                * very bottom edge); lined up with our own hint-bar row
+                * (fb->height - 8 - SAFE_Y_BOT, ~90% at the 288-tall PAL
+                * output) per user request, after confirming 88 read as too
+                * high up. */
+               "-subfont", "/media/fat/misterfin/subfont/font.desc",
+               "-subwidth", "90",
+               "-subpos", "92",
+               /* Audio consistently trails video by a small fixed amount
+                * (reported by the user across titles — not load-dependent,
+                * so not the same issue fb_wait_vsync() fixed). First guess
+                * was -0.10 — confirmed on hardware to make the gap BIGGER,
+                * so the sign was backwards for this mplayer build. Flipped
+                * to positive and roughly doubled the magnitude (since the
+                * wrong-signed -0.10 visibly widened the gap by about that
+                * much) — needs live tuning against further hardware
+                * feedback, sign/magnitude both still empirical. */
+               "-delay", delay_arg,
+               url,
+               (char *)NULL);
+        _exit(1);
+    }
+
+    close(pfd[0]);
+    g_cmd_fd = pfd[1];
+
+    /* mplayer is connecting + filling its cache in the background at this
+     * point and hasn't touched /dev/fb0 yet — safe window to show the
+     * loading spinner without racing its own frame writes. */
+    spinner_show(fb, 2.0);
+
+    /* A subtitle selection survives a seek-triggered restart (see
+     * player_seek) but the fresh mplayer instance doesn't have anything
+     * loaded yet — re-download+load it the same way subtitle_apply() does
+     * for a manual change (it's a no-op restart into the same value if the
+     * subtitle is already g_current_sub_index). */
+    if (g_current_sub_index >= 0)
+        subtitle_apply(g_current_sub_index);
+}
+
+/* ── main ────────────────────────────────────────────────────────────────── */
+
+/* Hidden dev tool, not part of the shipped app UI: renders the About
+ * screen's starfield (minus the version/hint footer) to a sequence of raw
+ * BGRA framebuffer dumps under /tmp, for tools/capture_about_gif.py to turn
+ * into a marketing GIF for the repo's README. Doesn't touch the real
+ * running app state at all — just fb_open + draw + dump + repeat. */
+static int run_capture_about(int frame_count)
+{
+    srand(1);
+    FBDev fb;
+    if (fb_open(&fb, "/dev/fb0") < 0) {
+        fprintf(stderr, "Cannot open /dev/fb0\n");
+        return 1;
+    }
+    for (int i = 0; i < frame_count; i++) {
+        draw_about_frame(&fb, 0);
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/about_frame_%03d.raw", i);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(fb.mem, 1, (size_t)fb.stride * fb.height, f);
+            fclose(f);
+        }
+        usleep(40000);
+    }
+    printf("%d %d %d\n", fb.width, fb.height, fb.stride);   /* for the GIF assembler */
+    fb_close(&fb);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--capture-about") == 0)
+        return run_capture_about(argc > 2 ? atoi(argv[2]) : 60);
+
+    srand((unsigned)time(NULL));   /* for the About screen's starfield */
+
+    signal(SIGTERM,  on_signal);
+    signal(SIGINT,   on_signal);
+    signal(SIGPIPE,  SIG_IGN);
+    signal(SIGSEGV,  on_fatal);
+    signal(SIGABRT,  on_fatal);
+    signal(SIGBUS,   on_fatal);
+
+    FBDev fb;
+    if (fb_open(&fb, "/dev/fb0") < 0) {
+        fprintf(stderr, "Cannot open /dev/fb0\n");
+        return 1;
+    }
+    memcpy(fb.mem, fb.back, (size_t)fb.stride * fb.height);
+
+    cursor_hide();
+    input_open();
+    input_drain();
+
+    /* Enable vsync by default — mplayer's patched vo_fbdev checks this file
+     * each frame (see VSYNC_FLAG comment above). */
+    { int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644); if (vf >= 0) close(vf); }
+
+    AppState state;
+    if (!jf_config_load(&g_cfg)) {
+        state = STATE_CONFIG_ERROR;
+        draw_config_error(&fb, "jellyfin.conf not found or incomplete");
+    } else if (!jf_resolve_user_id(&g_cfg)) {
+        state = STATE_CONFIG_ERROR;
+        draw_config_error(&fb, "Username not found on server (check spelling)");
+    } else {
+        state = STATE_BROWSE;
+        push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+    }
+
+    /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu core
+     * (same guard MiSTerDVD uses — running the DDR copy loop against standard
+     * menu.rbf adds bus contention without benefit). */
+    {
+        struct stat mst;
+        int zaparoo_active = (stat("/media/fat/menu.rbf", &mst) == 0 &&
+                              mst.st_size == 2513448);
+        if (zaparoo_active && ddr_init() == 0)
+            ddr_set_mode(strcasecmp(g_cfg.tv_mode, "NTSC") == 0 ? 0 : 2);
+    }
+
+    /* Start GitHub release check in background — result appears on the
+     * About screen once it lands. */
+    {
+        pthread_t upd_tid;
+        pthread_attr_t upd_attr;
+        pthread_attr_init(&upd_attr);
+        pthread_attr_setdetachstate(&upd_attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&upd_tid, &upd_attr, update_check_thread, NULL);
+        pthread_attr_destroy(&upd_attr);
+    }
+
+    int playing = 0;
+    int spinner_frame_ctr = 0;
+    int about_visible = 0;
+    double last_about_press = 0.0;
+    if (state == STATE_BROWSE) draw_browse(&fb);
+
+    while (g_running) {
+        int inp = input_poll();
+        double loop_now = now_sec();
+
+        /* START toggles the About screen — only from the browser, not
+         * mid-playback (same guard MiSTerDVD uses). */
+        if (!playing && (inp & INP_START) && (loop_now - last_about_press > 0.3)) {
+            last_about_press = loop_now;
+            about_visible = !about_visible;
+            if (about_visible) draw_about(&fb);
+            else if (state == STATE_BROWSE) draw_browse(&fb);
+            input_drain();
+            continue;
+        }
+        if (about_visible) {
+            if (inp & INP_B) {
+                about_visible = 0;
+                if (state == STATE_BROWSE) draw_browse(&fb);
+            } else {
+                draw_about(&fb);   /* redraw every frame to pick up update state */
+            }
+            usleep(16000);
+            continue;
+        }
+
+        if (g_submenu_visible) {
+            static double last_nav_press = 0.0;
+            int n_opts = g_info_item.sub_count + 1;
+            if ((inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
+                loop_now - last_nav_press > 0.15) {
+                last_nav_press = loop_now;
+                if (inp & INP_UP)    { if (g_submenu_sel > 0) g_submenu_sel--; }
+                if (inp & INP_DOWN)  { if (g_submenu_sel < n_opts - 1) g_submenu_sel++; }
+                /* Live-tunable on top of the fixed baseline (AUDIO_DELAY_SEC
+                 * + SUBTITLE_SYNC_FUDGE_SEC + g_play_offset) — for whatever
+                 * that fixed default doesn't cover on a specific subtitle
+                 * file. Applies immediately if a subtitle is already
+                 * loaded. */
+                if (inp & INP_LEFT)  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
+                if (inp & INP_RIGHT) { g_sub_delay_extra += 0.1; sub_delay_send(); }
+            }
+            if (inp & INP_A) { submenu_confirm(); input_drain(); continue; }
+            /* SELECT also closes — a SELECT press while already open was a
+             * silent no-op before (it only opens from the STATE_PLAYING
+             * switch below, which this block's own `continue` never
+             * reaches while visible), so a second SELECT looked like "the
+             * menu doesn't open". B still means an explicit cancel too. */
+            if (inp & (INP_B | INP_SELECT)) { submenu_close(); input_drain(); continue; }
+            /* Redraw every single frame, unconditionally — mplayer writes
+             * video frames directly to fb->mem (bypassing our fb->back
+             * entirely) and was confirmed on hardware to still do so
+             * periodically even while "paused" for the overlay, silently
+             * erasing this box between redraws. Only redrawing on input
+             * change (an earlier version of this) meant the box could go
+             * invisible while g_submenu_visible was still 1 underneath —
+             * so LEFT/RIGHT looked like it should be seeking (this block
+             * is exactly what intercepts LEFT/RIGHT for sync instead of
+             * letting it reach the seek handler below), but the menu was
+             * still silently open. Constant redraw keeps the box visibly
+             * pinned the whole time it's actually open, so that state is
+             * never invisible. */
+            draw_submenu(&fb);
+            usleep(16000);
+            continue;
+        }
+
+        switch (state) {
+
+        case STATE_CONFIG_ERROR:
+            if (inp & INP_B) g_running = 0;
+            break;
+
+        case STATE_BROWSE: {
+            int nav = 0;
+            if (inp & INP_B) {
+                if (!pop_frame()) { g_running = 0; break; }
+                nav = 1;
+            }
+            if (inp & INP_UP && g_item_count > 0) {
+                if (g_sel > 0) g_sel--;
+                if (g_sel < g_scroll) g_scroll = g_sel;
+                nav = 1;
+            }
+            if (inp & INP_DOWN && g_item_count > 0) {
+                if (g_sel < g_item_count - 1) g_sel++;
+                if (g_sel >= g_scroll + VISIBLE) g_scroll = g_sel - VISIBLE + 1;
+                nav = 1;
+            }
+            if (inp & INP_A && g_item_count > 0) {
+                JfItem *it = &g_items[g_sel];
+                BrowseFrame *f = &g_stack[g_stack_depth - 1];
+                switch (it->type) {
+                case JF_TYPE_FOLDER:
+                    push_frame(FRAME_ITEMS, it->name, it->id, NULL, NULL);
+                    nav = 1;
+                    break;
+                case JF_TYPE_SERIES:
+                    push_frame(FRAME_SEASONS, it->name, NULL, it->id, NULL);
+                    nav = 1;
+                    break;
+                case JF_TYPE_SEASON:
+                    push_frame(FRAME_EPISODES, it->name, NULL, f->series_id, it->id);
+                    nav = 1;
+                    break;
+                case JF_TYPE_MOVIE:
+                case JF_TYPE_EPISODE:
+                    info_assets_load(&fb, it, &spinner_frame_ctr);
+                    state = STATE_INFO;
+                    draw_info(&fb);
+                    input_drain();
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (nav && state == STATE_BROWSE) draw_browse(&fb);
+            break;
+        }
+
+        case STATE_INFO:
+            if (inp & INP_B) {
+                info_assets_free();
+                state = STATE_BROWSE;
+                draw_browse(&fb);
+                input_drain();
+            } else if (inp & INP_A) {
+                double offset = (g_info_item.played) ? 0.0 :
+                    (double)g_info_item.resume_ticks / 10000000.0;
+                info_assets_free();
+                playing = 1;
+                state = STATE_PLAYING;
+                g_current_sub_index = -1;
+                play(&fb, g_info_item.id, offset);
+                input_drain();
+            } else if ((inp & INP_SELECT) && g_info_item.resume_ticks > 0 && !g_info_item.played) {
+                info_assets_free();
+                playing = 1;
+                state = STATE_PLAYING;
+                g_current_sub_index = -1;
+                play(&fb, g_info_item.id, 0.0);
+                input_drain();
+            }
+            break;
+
+        case STATE_PLAYING:
+            if (!player_running()) {
+                jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                                   (int64_t)(play_position() * 10000000.0));
+                playing = 0;
+                state = STATE_BROWSE;
+                draw_browse(&fb);
+            } else if (inp & INP_B) {
+                jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                                   (int64_t)(play_position() * 10000000.0));
+                player_stop();
+                playing = 0;
+                state = STATE_BROWSE;
+                draw_browse(&fb);
+            } else if (g_paused) {
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+                if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+                if (inp & INP_A) player_pause_toggle();
+                if (inp & INP_L) {
+                    int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                    if (vf >= 0) close(vf);
+                    osd_flash("VSync: ON", 1);
+                }
+                if (inp & INP_R) {
+                    unlink(VSYNC_FLAG);
+                    osd_flash("VSync: OFF", 1);
+                }
+                /* seek_pending_target() reflects any not-yet-fired
+                 * accumulated seek too, so this timeline moves live as the
+                 * user taps LEFT/RIGHT instead of waiting for the debounce
+                 * to actually fire the restart. */
+                draw_paused(&fb, g_info_item.name, seek_pending_target());
+            } else {
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_A) player_pause_toggle();
+                if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+                if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+                if (inp & INP_L) {
+                    int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                    if (vf >= 0) close(vf);
+                    osd_flash("VSync: ON", 0);
+                }
+                if (inp & INP_R) {
+                    unlink(VSYNC_FLAG);
+                    osd_flash("VSync: OFF", 0);
+                }
+
+                if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+                    g_last_progress_report = loop_now;
+                    jf_report_progress(&g_cfg, g_info_item.id, g_play_session_id,
+                                        (int64_t)(play_position() * 10000000.0), 0);
+                }
+            }
+            break;
+        }
+
+        if (g_seek_fire_at > 0.0 && loop_now >= g_seek_fire_at && playing) {
+            double accum = g_seek_accum;
+            g_seek_accum = 0.0;
+            g_seek_fire_at = 0.0;
+            player_seek(&fb, accum);
+        }
+
+        if (playing && ddr_ready()) {
+            /* Pace this to the real display refresh instead of a blind
+             * 16ms software timer — sampling fb->mem (written by mplayer at
+             * the source's own ~23.976fps) on an unrelated fixed tick beats
+             * unevenly against the source frame rate, showing as judder
+             * that's independent of mplayer's own vsync setting (confirmed:
+             * toggling VSync on/off in-app didn't change it — that flag
+             * only affects mplayer's write timing, not this read loop). */
+            fb_wait_vsync(&fb);
+            ddr_copy_from_fb(fb.mem, fb.stride);
+            ddr_flip(0, 0);
+        } else {
+            if (!playing && ddr_ready()) ddr_stop();
+            usleep(16000);
+        }
+    }
+
+    player_stop();
+    info_assets_free();
+    ddr_close();
+    cursor_show();
+    fb_clear(&fb);
+    fb_flip(&fb);
+    fb_close(&fb);
+    input_close();
+    return 0;
+}

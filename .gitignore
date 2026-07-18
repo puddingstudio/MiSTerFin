@@ -1,0 +1,9 @@
+misterfin
+misterfin-arm
+mplayer-arm
+jellyfin.conf
+crash.log
+__pycache__/
+*.pyc
+.DS_Store
+.claude/

@@ -1,0 +1,13 @@
+# MiSTerFin config — copy to /media/fat/misterfin/jellyfin.conf and fill in.
+# 4 lines, in order. Lines starting with # and blank lines are ignored.
+#
+# 1) Jellyfin server URL (no trailing slash)
+# 2) API key — Jellyfin admin dashboard -> Advanced -> API Keys -> +
+# 3) Your Jellyfin username (resolved to the real user id at startup —
+#    the raw id isn't easily findable in the Jellyfin UI, your username is)
+# 4) TV mode — PAL or NTSC (optional, defaults to PAL)
+
+http://192.168.2.10:8096
+your-api-key-here
+your-username-here
+PAL
