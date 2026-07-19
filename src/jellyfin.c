@@ -133,8 +133,25 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
     json_str(item_buf, "Name", it->name, sizeof(it->name));
     json_str(item_buf, "Overview", it->overview, sizeof(it->overview));
     json_str(item_buf, "Primary", it->image_tag, sizeof(it->image_tag));
-    json_str(item_buf, "Logo", it->logo_tag, sizeof(it->logo_tag));
-    json_first_array_str(item_buf, "BackdropImageTags", it->backdrop_tag, sizeof(it->backdrop_tag));
+
+    strncpy(it->backdrop_item_id, it->id, sizeof(it->backdrop_item_id) - 1);
+    strncpy(it->logo_item_id,     it->id, sizeof(it->logo_item_id) - 1);
+
+    /* Episodes/seasons normally don't carry their own Logo/BackdropImageTags —
+     * that art lives on the series, exposed via ParentLogoImageTag/
+     * ParentBackdropImageTags (+ ParentLogoItemId/ParentBackdropItemId to say
+     * which item to actually fetch it from). Confirmed on a real server: an
+     * episode's own ImageTags has no "Logo" key and BackdropImageTags is
+     * empty, which is why the info screen for any TV episode never showed a
+     * backdrop/logo before this fallback — not specific to one show. */
+    if (!json_str(item_buf, "Logo", it->logo_tag, sizeof(it->logo_tag))) {
+        if (json_str(item_buf, "ParentLogoImageTag", it->logo_tag, sizeof(it->logo_tag)))
+            json_str(item_buf, "ParentLogoItemId", it->logo_item_id, sizeof(it->logo_item_id));
+    }
+    if (!json_first_array_str(item_buf, "BackdropImageTags", it->backdrop_tag, sizeof(it->backdrop_tag))) {
+        if (json_first_array_str(item_buf, "ParentBackdropImageTags", it->backdrop_tag, sizeof(it->backdrop_tag)))
+            json_str(item_buf, "ParentBackdropItemId", it->backdrop_item_id, sizeof(it->backdrop_item_id));
+    }
 
     char type_buf[24] = {0};
     json_str(item_buf, "Type", type_buf, sizeof(type_buf));
@@ -142,9 +159,17 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
     else if (!strcmp(type_buf, "Season"))        it->type = JF_TYPE_SEASON;
     else if (!strcmp(type_buf, "Episode"))       it->type = JF_TYPE_EPISODE;
     else if (!strcmp(type_buf, "Movie"))         it->type = JF_TYPE_MOVIE;
+    else if (!strcmp(type_buf, "MusicArtist"))   it->type = JF_TYPE_ARTIST;
+    else if (!strcmp(type_buf, "MusicAlbum"))    it->type = JF_TYPE_ALBUM;
+    else if (!strcmp(type_buf, "Audio"))         it->type = JF_TYPE_TRACK;
     else if (!strcmp(type_buf, "CollectionFolder") ||
              !strcmp(type_buf, "Folder"))        it->type = JF_TYPE_FOLDER;
     else                                          it->type = JF_TYPE_OTHER;
+
+    if (it->type == JF_TYPE_TRACK) {
+        json_str(item_buf, "Album", it->album, sizeof(it->album));
+        json_str(item_buf, "AlbumArtist", it->artist, sizeof(it->artist));
+    }
 
     int64_t year = 0;
     if (json_int64(item_buf, "ProductionYear", &year))
@@ -586,6 +611,19 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
         profile->max_width, profile->max_height, profile->video_bitrate,
         (long long)(start_ticks > 0 ? start_ticks : 0),
         safe_session, cfg->api_key);
+    return 1;
+}
+
+int jf_audio_stream_url(const JfConfig *cfg, const char *item_id,
+                         const char *play_session_id, char *out, int outlen)
+{
+    char safe_id[JF_ID_LEN];
+    char safe_session[64];
+    jf_sanitize_id(item_id, safe_id, sizeof(safe_id));
+    jf_sanitize_id(play_session_id, safe_session, sizeof(safe_session));
+    snprintf(out, outlen,
+        "%s/Audio/%s/stream?static=true&playSessionId=%s&ApiKey=%s",
+        cfg->server, safe_id, safe_session, cfg->api_key);
     return 1;
 }
 

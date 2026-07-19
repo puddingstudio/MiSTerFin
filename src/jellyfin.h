@@ -22,6 +22,9 @@ typedef enum {
     JF_TYPE_SEASON,
     JF_TYPE_EPISODE,
     JF_TYPE_MOVIE,
+    JF_TYPE_ARTIST,   /* MusicArtist — drills into albums, browsed like JF_TYPE_FOLDER */
+    JF_TYPE_ALBUM,    /* MusicAlbum — drills into tracks, browsed like JF_TYPE_FOLDER */
+    JF_TYPE_TRACK,    /* Audio — playable leaf, like JF_TYPE_MOVIE but audio-only */
     JF_TYPE_OTHER
 } JfItemType;
 
@@ -42,9 +45,21 @@ typedef struct {
     char       name[JF_NAME_LEN];
     char       overview[JF_OVERVIEW_LEN];
     char       image_tag[JF_ID_LEN];    /* ImageTags.Primary, empty if none */
-    char       backdrop_tag[JF_ID_LEN]; /* BackdropImageTags[0], empty if none */
-    char       logo_tag[JF_ID_LEN];     /* ImageTags.Logo, empty if none */
+    char       backdrop_tag[JF_ID_LEN]; /* BackdropImageTags[0], falling back to
+                                          * ParentBackdropImageTags[0] for episodes/
+                                          * seasons that don't carry their own (which
+                                          * is normal — that art is series-level).
+                                          * Fetch from backdrop_item_id, not id. */
+    char       logo_tag[JF_ID_LEN];     /* ImageTags.Logo, falling back to
+                                          * ParentLogoImageTag for the same reason.
+                                          * Fetch from logo_item_id, not id. */
+    char       backdrop_item_id[JF_ID_LEN]; /* == id normally; == ParentBackdropItemId
+                                              * when backdrop_tag came from the fallback */
+    char       logo_item_id[JF_ID_LEN];     /* == id normally; == ParentLogoItemId
+                                              * when logo_tag came from the fallback */
     char       year[8];
+    char       album[JF_NAME_LEN];   /* Album — tracks only, empty otherwise */
+    char       artist[JF_NAME_LEN];  /* AlbumArtist — tracks only, empty otherwise */
     JfItemType type;
     int64_t    runtime_ticks;          /* RunTimeTicks, 0 if unknown */
     int64_t    resume_ticks;           /* UserData.PlaybackPositionTicks */
@@ -142,6 +157,16 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
                    const JfStreamProfile *profile, int64_t start_ticks,
                    const char *play_session_id,
                    char *out, int outlen);
+
+/* Builds a direct-play audio stream URL (static=true — no server transcode:
+ * confirmed against a real server that a plain FLAC/MP3 track streams back
+ * byte-identical with static=true, and this mplayer build already decodes
+ * FLAC/MP3 fine, so there's no reason to pay for a transcode like video
+ * needs). play_session_id isn't strictly required for direct play the way
+ * it is for jf_stream_url()'s transcode (no cache to go stale), but it's
+ * included anyway so progress reporting has a consistent session id. */
+int jf_audio_stream_url(const JfConfig *cfg, const char *item_id,
+                         const char *play_session_id, char *out, int outlen);
 
 /* Downloads subtitle track sub_index (JfSubtitle.index, i.e. the
  * MediaStreams[].Index) as .srt to dest_path — served directly (no

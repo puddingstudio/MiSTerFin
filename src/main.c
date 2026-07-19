@@ -27,18 +27,26 @@
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
 #define CRASH_LOG    "/media/fat/misterfin/crash.log"
+/* mplayer's -af export writes live PCM samples to this mmap'd file for the
+ * now-playing visualizer to read — confirmed supported on this build
+ * (some builds/filters aren't, see the mplayer/subfont -osdlevel comments
+ * elsewhere in this file for other examples of that). Unlinked before each
+ * track starts so a stale file from a previous track can't be misread as
+ * current audio for the first frame or two. */
+#define AF_EXPORT_PATH "/tmp/misterfin_af_export"
 /* Hardcoded inside the shared mplayer-arm binary's patched vo_fbdev.c (built
  * for MiSTerDVD, reused here unchanged) — NOT ours to rename. Its presence
  * makes vo_fbdev wait for vblank before each frame, trading a little extra
  * decode latency for tear-free output. */
 #define VSYNC_FLAG   "/tmp/misterdvd_vsync"
 
-#define VISIBLE      6
+#define VISIBLE      7   /* was 6 — list had a lot of unused space above the hint row, see draw_browse's bottom fade */
 #define ROW_H        30
 #define SAFE_X       24
 #define SAFE_Y       20
 #define SAFE_Y_BOT   SAFE_Y   /* match the top title margin — same overscan/visibility balance */
 #define SEEK_STEP        30.0
+#define AUDIO_SEEK_STEP  10.0   /* smaller than video's SEEK_STEP — tracks are short, real in-place seek (see STATE_PLAYING_AUDIO) */
 #define SEEK_DEBOUNCE     0.6   /* seconds to wait for more presses before firing the seek */
 #define FLASH_DURATION_SEC 1.2  /* how long a flash_message() stays pinned on screen, see g_flash_until */
 #define PROGRESS_REPORT_INTERVAL 10.0
@@ -219,6 +227,19 @@ static void draw_text(FBDev *fb, int x, int y, const char *s, int scale,
 
 static int text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
 
+/* Like draw_text, but skips any character whose whole glyph cell doesn't
+ * fit within [clip_x0, clip_x1) — used for the scrolling browse title
+ * marquee so it doesn't run into the clock/spinner area to its right (or
+ * off the left edge while scrolling). Character-granularity, not
+ * pixel-perfect, but fine for a continuously-moving marquee. */
+static void draw_text_clipped(FBDev *fb, int x, int y, const char *s, int scale,
+                               uint8_t r, uint8_t g, uint8_t b, int clip_x0, int clip_x1)
+{
+    for (; *s; s++, x += 8 * scale)
+        if (x >= clip_x0 && x + 8 * scale <= clip_x1)
+            draw_char(fb, x, y, (unsigned char)*s, scale, r, g, b);
+}
+
 /* Truncates s in-place (with a trailing "...") so it fits within max_w
  * pixels at the given scale — draw_text itself doesn't clip, so a long
  * title would otherwise run into whatever's to its right. */
@@ -364,7 +385,7 @@ static int input_poll(void)
 
 /* ── app state ────────────────────────────────────────────────────────────── */
 
-typedef enum { STATE_CONFIG_ERROR, STATE_BROWSE, STATE_INFO, STATE_PLAYING } AppState;
+typedef enum { STATE_CONFIG_ERROR, STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO } AppState;
 typedef enum { FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES } FrameKind;
 
 #define MAX_STACK 8
@@ -384,6 +405,8 @@ static int         g_stack_depth = 0;
 static JfItem g_items[JF_MAX_ITEMS];
 static int    g_item_count = 0;
 static int    g_sel = 0, g_scroll = 0;
+static double g_marquee_px = 0.0;         /* scroll offset for an over-long title, see draw_browse */
+static char   g_marquee_title[128] = "";  /* last title drawn — reset the offset when it changes */
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
@@ -429,16 +452,20 @@ static void info_assets_load(FBDev *fb, const JfItem *list_item, int *spinner_fr
         g_info_item = *list_item;   /* degrade gracefully: keep the shallow row copy */
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
-    if (g_info_item.backdrop_tag[0] &&
-        jf_download_item_image(&g_cfg, g_info_item.id, "Backdrop/0",
-                                g_info_item.backdrop_tag, 640, POSTER_TMP))
-        g_backdrop_px = load_image_tmp(POSTER_TMP, &g_backdrop_w, &g_backdrop_h);
+    if (g_info_item.backdrop_tag[0]) {
+        int dl_ok = jf_download_item_image(&g_cfg, g_info_item.backdrop_item_id, "Backdrop/0",
+                                            g_info_item.backdrop_tag, 640, POSTER_TMP);
+        if (dl_ok)
+            g_backdrop_px = load_image_tmp(POSTER_TMP, &g_backdrop_w, &g_backdrop_h);
+    }
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
-    if (g_info_item.logo_tag[0] &&
-        jf_download_item_image(&g_cfg, g_info_item.id, "Logo",
-                                g_info_item.logo_tag, 400, POSTER_TMP))
-        g_logo_px = load_image_tmp(POSTER_TMP, &g_logo_w, &g_logo_h);
+    if (g_info_item.logo_tag[0]) {
+        int dl_ok = jf_download_item_image(&g_cfg, g_info_item.logo_item_id, "Logo",
+                                            g_info_item.logo_tag, 400, POSTER_TMP);
+        if (dl_ok)
+            g_logo_px = load_image_tmp(POSTER_TMP, &g_logo_w, &g_logo_h);
+    }
 
     int cast_n = g_info_item.cast_count;
     if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
@@ -579,7 +606,8 @@ static int pop_frame(void)
 static const char *type_folder_icon(JfItemType t)
 {
     switch (t) {
-    case JF_TYPE_FOLDER: case JF_TYPE_SERIES: case JF_TYPE_SEASON: return "> ";
+    case JF_TYPE_FOLDER: case JF_TYPE_SERIES: case JF_TYPE_SEASON:
+    case JF_TYPE_ARTIST: case JF_TYPE_ALBUM: return "> ";
     default: return "";
     }
 }
@@ -793,7 +821,8 @@ static void browse_cover_sync(void)
     JfItem *it = (g_item_count > 0) ? &g_items[g_sel] : NULL;
     int wants_cover = it && it->image_tag[0] &&
         (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE ||
-         it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON);
+         it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON ||
+         it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM || it->type == JF_TYPE_TRACK);
 
     if (!wants_cover) {
         if (g_browse_cover_item_id[0]) {
@@ -821,7 +850,40 @@ static void draw_browse(FBDev *fb)
 
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
     const char *title = f->title[0] ? f->title : "MiSTerFin";
-    draw_text(fb, (fb->width - text_width(title, 2))/2, SAFE_Y, title, 2, COL_TITLE);
+
+    /* Clock, right-aligned but stopping short of the spinner's reserved
+     * corner (SPINNER_SIZE+SPINNER_MARGIN) so a loading spinner never
+     * overlaps it. */
+    time_t now_t = time(NULL);
+    struct tm now_tm;
+    localtime_r(&now_t, &now_tm);
+    char clock_buf[8];
+    snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
+    int clock_right = fb->width - SPINNER_SIZE - SPINNER_MARGIN - 8;
+    int clock_x = clock_right - text_width(clock_buf, 1);
+    draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, COL_HINT);
+
+    /* Title, left-aligned, using whatever width is left before the clock.
+     * Titles can get long now that Album/Season ones are "Artist / Album"
+     * combos — scroll it slowly instead of truncating when it doesn't fit,
+     * per user request. Character-clipped via draw_text_clipped so it
+     * never draws into the clock/spinner area. */
+    int title_x0 = SAFE_X;
+    int title_x1 = clock_x - 12;
+    int title_w  = text_width(title, 2);
+    if (strcmp(title, g_marquee_title) != 0) {
+        strncpy(g_marquee_title, title, sizeof(g_marquee_title) - 1);
+        g_marquee_title[sizeof(g_marquee_title) - 1] = '\0';
+        g_marquee_px = 0.0;
+    }
+    if (title_w <= title_x1 - title_x0) {
+        draw_text(fb, title_x0, SAFE_Y, title, 2, COL_TITLE);
+    } else {
+        int period = title_w + 40;   /* trailing gap before it loops back to the start */
+        int off = (int)g_marquee_px % period;
+        draw_text_clipped(fb, title_x0 - off, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
+        draw_text_clipped(fb, title_x0 - off + period, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
+    }
 
     if (g_item_count == 0) {
         const char *msg = "Nothing here";
@@ -844,7 +906,20 @@ static void draw_browse(FBDev *fb)
          * exactly match the box would otherwise show as visible grey
          * pillarbox bars. Letting the image be the only thing drawn means
          * any leftover margin just blends into whatever's already there. */
-        int cx = cover_panel_x + BROWSE_COVER_W / 2, cy = cover_panel_y + BROWSE_COVER_H / 2;
+        int cx = cover_panel_x + BROWSE_COVER_W / 2;
+        /* Top-align within the panel instead of vertically centering: a
+         * portrait movie/series poster already fills BROWSE_COVER_H almost
+         * exactly so this was never visible for those, but a square album
+         * cover ends up noticeably SHORTER than the panel after the 5/3
+         * fit-math below, and centering it left equal empty gaps top and
+         * bottom instead of sitting flush with the panel's top edge like
+         * the rest of the row layout expects. Replicate blit_fit_centered's
+         * own dh calc here so cy can be derived from the actual resulting
+         * height rather than the panel's fixed height. */
+        int dh = BROWSE_COVER_H;
+        int dw = (int)((double)g_browse_cover_w / g_browse_cover_h * dh * 5.0 / 3.0 + 0.5);
+        if (dw > BROWSE_COVER_W) dh = dh * BROWSE_COVER_W / dw;
+        int cy = cover_panel_y + dh / 2;
         blit_fit_centered(fb, g_browse_cover_px, g_browse_cover_w, g_browse_cover_h,
                            cx, cy, BROWSE_COVER_W, BROWSE_COVER_H, 255);
     }
@@ -866,7 +941,7 @@ static void draw_browse(FBDev *fb)
             snprintf(line1, sizeof(line1), "%s%s", type_folder_icon(it->type), it->name);
         truncate_to_width(line1, 1, row_max_w);
 
-        int has_line2 = (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE);
+        int has_line2 = (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE || it->type == JF_TYPE_TRACK);
         char line2[64] = {0};
         uint8_t l2r = 0x58, l2g = 0x58, l2b = 0x58;
         if (has_line2) {
@@ -1108,9 +1183,30 @@ static int     g_current_sub_index = -1;
 static double  g_seek_accum  = 0.0;
 static double  g_seek_fire_at = 0.0;   /* 0 = no pending seek */
 
+/* Audio (music) playback — index into g_items of the currently playing
+ * track, so LEFT/RIGHT/auto-advance can just walk the already-fetched
+ * album/list rather than tracking a separate queue structure. Only valid
+ * while state == STATE_PLAYING_AUDIO; g_items itself doesn't change
+ * underneath it since browsing is paused during playback. */
+static int      g_audio_queue_pos = -1;
+static uint8_t *g_nowplaying_cover_px = NULL;
+static int      g_nowplaying_cover_w = 0, g_nowplaying_cover_h = 0;
+static char     g_nowplaying_cover_item_id[JF_ID_LEN] = "";
+static double   g_vu_level_l = 0.0, g_vu_level_r = 0.0;   /* attack/decay state, see draw_vu_horizontal */
+
 /* Requested once here so both play() and the subtitle/info overlay (which
  * displays it alongside the source's own specs) reference the same values. */
-static const JfStreamProfile g_stream_profile = { .max_width = 480, .max_height = 270, .video_bitrate = 5000000 };
+/* Tried native PAL (720x576) as an experiment — confirmed on hardware it's
+ * not sustainable: A-V desync grew continuously (0.5s -> 0.65s+ within 5-6
+ * seconds of playback, still climbing) and CPU sat near saturation. This
+ * weak Cortex-A9 genuinely can't keep up at that resolution; back to the
+ * known-good profile. */
+/* Bumped from 5000000 to 8000000 — confirmed on hardware bitrate barely
+ * moves CPU usage at this resolution (2Mbps and 8Mbps both landed at
+ * ~34-35% avg utime, A-V desync stayed at 0.000 either way); resolution is
+ * what actually costs CPU (see the native-PAL note above), so there's no
+ * real reason not to spend the extra bitrate on quality here. */
+static const JfStreamProfile g_stream_profile = { .max_width = 480, .max_height = 270, .video_bitrate = 8000000 };
 
 static void mp_cmd(const char *cmd)
 {
@@ -1602,6 +1698,209 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
         subtitle_apply(g_current_sub_index);
 }
 
+/* ── music playback (audio-only, direct play — see jf_audio_stream_url) ──── */
+
+/* g_items[queue_pos] must be a JF_TYPE_TRACK; reuses player_stop()/
+ * player_pause_toggle()/play_position() unchanged (those only touch
+ * g_player_pid/g_cmd_fd/g_play_offset/g_paused, none of which are
+ * video-specific) — only the mplayer invocation and on-screen UI differ
+ * from play(). No video output at all (-novideo), so there's no fbdev race
+ * to worry about the way play()'s comments describe; the now-playing
+ * screen is entirely our own drawing, redrawn every loop tick like the
+ * paused/about screens. */
+static void play_audio(FBDev *fb, int queue_pos)
+{
+    (void)fb;
+    JfItem *it = &g_items[queue_pos];
+    g_audio_queue_pos = queue_pos;
+    g_vu_level_l = g_vu_level_r = 0.0;
+
+    unlink(AF_EXPORT_PATH);   /* don't let the visualizer read a stale previous track's data */
+
+    jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
+    char url[600];
+    jf_audio_stream_url(&g_cfg, it->id, g_play_session_id, url, sizeof(url));
+
+    g_play_offset     = 0.0;
+    g_play_start_wall = now_sec();
+    g_paused          = 0;
+    g_last_progress_report = now_sec();
+    jf_report_start(&g_cfg, it->id, g_play_session_id, 0);
+
+    int pfd[2];
+    pipe(pfd);
+
+    g_player_pid = fork();
+    if (g_player_pid == 0) {
+        setpgid(0, 0);
+        dup2(pfd[0], 0);
+        close(pfd[0]); close(pfd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        nice(-5);
+        execlp(MPLAYER, "mplayer",
+               "-slave", "-quiet",
+               "-nojoystick", "-noconsolecontrols",
+               "-novideo",
+               "-ao", "alsa",
+               /* export=...:512 gives the now-playing visualizer 512 s16le
+                * samples per channel to read from a live-updated mmap'd
+                * file — confirmed supported on this mplayer build (tested
+                * directly with a real FLAC track on hardware). */
+               "-af", "export=" AF_EXPORT_PATH ":512,format=s16le",
+               url,
+               (char *)NULL);
+        _exit(1);
+    }
+
+    close(pfd[0]);
+    g_cmd_fd = pfd[1];
+
+    if (strcmp(g_nowplaying_cover_item_id, it->id) != 0) {
+        if (g_nowplaying_cover_px) { stbi_image_free(g_nowplaying_cover_px); g_nowplaying_cover_px = NULL; }
+        g_nowplaying_cover_w = g_nowplaying_cover_h = 0;
+        strncpy(g_nowplaying_cover_item_id, it->id, sizeof(g_nowplaying_cover_item_id) - 1);
+        if (it->image_tag[0] &&
+            jf_download_item_image(&g_cfg, it->id, "Primary", it->image_tag, 300, POSTER_TMP))
+            g_nowplaying_cover_px = load_image_tmp(POSTER_TMP, &g_nowplaying_cover_w, &g_nowplaying_cover_h);
+    }
+}
+
+/* Reads mplayer's live -af export file fresh every call (it's tiny — a
+ * couple KB — cheap enough to re-read at redraw rate). hdr[0]/hdr[1]
+ * (nch/sz) don't match this build's actual export size (confirmed on
+ * hardware the file is only ~2KB total, while nch=2,sz=2048 would imply
+ * 8KB of samples alone) — rather than guess the real header semantics,
+ * just read however many int16 samples are ACTUALLY present after the
+ * header and treat them as one flat buffer. Returns sample count, 0 if
+ * the file isn't there yet (e.g. mplayer hasn't started exporting within
+ * the first frame or two of a track). */
+static int read_af_samples(int16_t *buf, int max_samples)
+{
+    FILE *f = fopen(AF_EXPORT_PATH, "rb");
+    if (!f) return 0;
+    int32_t hdr[2];
+    if (fread(hdr, sizeof(int32_t), 2, f) != 2) { fclose(f); return 0; }
+    size_t got = fread(buf, sizeof(int16_t), (size_t)max_samples, f);
+    fclose(f);
+    return (int)got;
+}
+
+/* Classic recording-console-style horizontal level meter: dim background
+ * track, filled from the left up to the current peak level, colored by
+ * ZONE along the bar's own length (green low, yellow mid, red only at the
+ * top end) — not by the level itself, so the color transition point is
+ * fixed regardless of how loud the track is, matching a real VU meter.
+ *
+ * *level is persistent smoothing state (one double per meter, owned by the
+ * caller and passed in every call) — a real VU meter's needle has ballistic
+ * damping (fast rise, slow fall, ~300ms time constant) instead of jumping
+ * to the instantaneous sample peak every redraw; reading raw peaks with no
+ * smoothing read as "unrealistically fast" jitter (user feedback on the
+ * first version of this meter) rather than a natural meter movement. */
+static void draw_vu_horizontal(FBDev *fb, const int16_t *samples, int count,
+                                int x0, int y, int w, int height, double *level)
+{
+    fb_fill_rect_alpha(fb, x0, y, w, height, 0x30, 0x30, 0x30, 255);
+    if (w <= 0) return;
+
+    /* count==0 (e.g. paused — see draw_now_playing) falls straight through
+     * with peak left at 0, so the meter decays to empty via the normal
+     * smoothing below instead of freezing on the last real reading. */
+    int peak = 0;
+    for (int i = 0; i < count; i++) {
+        int v = samples[i];
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+    }
+    double raw = peak / 32768.0;
+    if (raw > 1.0) raw = 1.0;
+    const double attack = 0.5, decay = 0.06;   /* jump up fast, settle back down slowly */
+    *level += (raw - *level) * (raw > *level ? attack : decay);
+    int filled = (int)(*level * w);
+
+    int green_w  = w * 60 / 100;
+    int yellow_w = w * 25 / 100;   /* zones: 0-60% green, 60-85% yellow, 85-100% red */
+
+    int seg = filled < green_w ? filled : green_w;
+    if (seg > 0) fb_fill_rect_alpha(fb, x0, y, seg, height, 0x30, 0xE0, 0x30, 255);
+
+    if (filled > green_w) {
+        seg = filled - green_w;
+        if (seg > yellow_w) seg = yellow_w;
+        fb_fill_rect_alpha(fb, x0 + green_w, y, seg, height, 0xE0, 0xC0, 0x20, 255);
+    }
+    if (filled > green_w + yellow_w) {
+        seg = filled - green_w - yellow_w;
+        fb_fill_rect_alpha(fb, x0 + green_w + yellow_w, y, seg, height, 0xE0, 0x30, 0x30, 255);
+    }
+}
+
+static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
+{
+    fb_clear(fb);
+    draw_starfield(fb);
+
+    if (g_paused)
+        draw_text(fb, SAFE_X, SAFE_Y, "PAUSED", 1, COL_RESUME);
+
+    const int cover_max = 165;
+    int cover_top = SAFE_Y;
+    int cy = cover_top + cover_max / 2;
+
+    if (g_nowplaying_cover_px)
+        blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
+                           fb->width / 2, cy, cover_max, cover_max, 255);
+    else
+        fb_fill_rect_alpha(fb, fb->width / 2 - cover_max / 2, cover_top, cover_max, cover_max,
+                            0x18, 0x18, 0x18, 255);
+
+    int16_t af_buf[4096];
+    /* Don't read the export file while paused — decode has stopped, so it
+     * would just keep returning the same stale pre-pause samples, reading
+     * as a frozen meter (user feedback) instead of settling to empty. */
+    int af_n = g_paused ? 0 : read_af_samples(af_buf, 4096);
+
+    int ty = cover_top + cover_max - 3;
+    draw_text(fb, (fb->width - text_width(it->name, 1)) / 2, ty, it->name, 1, COL_TITLE);
+    ty += 10;
+
+    char sub[300] = {0};
+    if (it->artist[0] && it->album[0])
+        snprintf(sub, sizeof(sub), "%s - %s", it->artist, it->album);
+    else if (it->artist[0])
+        snprintf(sub, sizeof(sub), "%s", it->artist);
+    else if (it->album[0])
+        snprintf(sub, sizeof(sub), "%s", it->album);
+    if (sub[0]) {
+        truncate_to_width(sub, 1, fb->width - 2 * SAFE_X);
+        draw_text(fb, (fb->width - text_width(sub, 1)) / 2, ty, sub, 1, COL_ITEM);
+    }
+    ty += 16;   /* clearer gap so the bar itself visibly sits between the album line and its own time label below */
+
+    draw_timeline(fb, ty, pos, (double)it->runtime_ticks / 10000000.0);
+    ty += 28;   /* centers the VU meter pair in the gap down to the hint line below, not right under the timeline */
+
+    /* Classic L/R VU meters, full width, stacked — between the seek/timeline
+     * line and the control hints below. g_vu_level_l/r are persistent
+     * attack/decay state, see draw_vu_horizontal. */
+    int vu_w = fb->width - 2 * SAFE_X;
+    int vu_h = 4, vu_gap = 4;
+    draw_vu_horizontal(fb, af_buf, af_n / 2, SAFE_X, ty, vu_w, vu_h, &g_vu_level_l);
+    ty += vu_h + vu_gap;
+    draw_vu_horizontal(fb, af_buf + af_n / 2, af_n - af_n / 2, SAFE_X, ty, vu_w, vu_h, &g_vu_level_r);
+
+    /* Hint line stays at the SAME height as every other screen's hint row
+     * (fb->height - 8 - SAFE_Y_BOT) — everything above it got tightened/
+     * moved up instead, per user feedback that this must stay consistent. */
+    const char *hint = g_paused ? "A:resume  L/R:seek  U/D:prev/next  B:stop"
+                                 : "A:pause  L/R:seek  U/D:prev/next  B:stop";
+    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 /* Hidden dev tool, not part of the shipped app UI: renders the About
@@ -1798,17 +2097,32 @@ int main(int argc, char **argv)
                 BrowseFrame *f = &g_stack[g_stack_depth - 1];
                 switch (it->type) {
                 case JF_TYPE_FOLDER:
+                case JF_TYPE_ARTIST:
                     push_frame(FRAME_ITEMS, it->name, it->id, NULL, NULL);
                     nav = 1;
                     break;
+                case JF_TYPE_ALBUM: {
+                    /* "Artist / Album" — f->title is still the artist's own
+                     * name here (that's the frame we're drilling out of),
+                     * so no extra field lookup needed. */
+                    char combined[128];
+                    snprintf(combined, sizeof(combined), "%s / %s", f->title, it->name);
+                    push_frame(FRAME_ITEMS, combined, it->id, NULL, NULL);
+                    nav = 1;
+                    break;
+                }
                 case JF_TYPE_SERIES:
                     push_frame(FRAME_SEASONS, it->name, NULL, it->id, NULL);
                     nav = 1;
                     break;
-                case JF_TYPE_SEASON:
-                    push_frame(FRAME_EPISODES, it->name, NULL, f->series_id, it->id);
+                case JF_TYPE_SEASON: {
+                    /* "Series / Season", same pattern as Artist / Album. */
+                    char combined[128];
+                    snprintf(combined, sizeof(combined), "%s / %s", f->title, it->name);
+                    push_frame(FRAME_EPISODES, combined, NULL, f->series_id, it->id);
                     nav = 1;
                     break;
+                }
                 case JF_TYPE_MOVIE:
                 case JF_TYPE_EPISODE:
                     info_assets_load(&fb, it, &spinner_frame_ctr);
@@ -1816,11 +2130,28 @@ int main(int argc, char **argv)
                     draw_info(&fb);
                     input_drain();
                     break;
+                case JF_TYPE_TRACK:
+                    play_audio(&fb, g_sel);
+                    state = STATE_PLAYING_AUDIO;
+                    draw_now_playing(&fb, &g_items[g_sel], 0.0);
+                    input_drain();
+                    break;
                 default:
                     break;
                 }
             }
             if (nav && state == STATE_BROWSE) draw_browse(&fb);
+
+            /* Keeps the top-bar clock live and the over-long-title marquee
+             * (see draw_browse) crawling even with no input at all. Cheap
+             * enough at this rate — other screens already redraw fully
+             * every ~16ms with no issue, this is a tenth of that. */
+            static double last_browse_tick = 0.0;
+            if (state == STATE_BROWSE && loop_now - last_browse_tick > 0.1) {
+                last_browse_tick = loop_now;
+                g_marquee_px += 1.5;
+                draw_browse(&fb);
+            }
             break;
         }
 
@@ -1904,6 +2235,74 @@ int main(int argc, char **argv)
                 }
             }
             break;
+
+        case STATE_PLAYING_AUDIO: {
+            JfItem *cur = &g_items[g_audio_queue_pos];
+            if (!player_running()) {
+                jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
+                                   (int64_t)(play_position() * 10000000.0));
+                if (g_audio_queue_pos + 1 < g_item_count &&
+                    g_items[g_audio_queue_pos + 1].type == JF_TYPE_TRACK) {
+                    play_audio(&fb, g_audio_queue_pos + 1);
+                } else {
+                    state = STATE_BROWSE;
+                    draw_browse(&fb);
+                    break;
+                }
+            } else if (inp & INP_B) {
+                jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
+                                   (int64_t)(play_position() * 10000000.0));
+                player_stop();
+                state = STATE_BROWSE;
+                draw_browse(&fb);
+                break;
+            } else if (inp & INP_A) {
+                player_pause_toggle();
+            } else if (inp & INP_UP) {
+                if (g_audio_queue_pos > 0 && g_items[g_audio_queue_pos - 1].type == JF_TYPE_TRACK) {
+                    jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
+                                       (int64_t)(play_position() * 10000000.0));
+                    player_stop();
+                    play_audio(&fb, g_audio_queue_pos - 1);
+                }
+            } else if (inp & INP_DOWN) {
+                if (g_audio_queue_pos + 1 < g_item_count &&
+                    g_items[g_audio_queue_pos + 1].type == JF_TYPE_TRACK) {
+                    jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
+                                       (int64_t)(play_position() * 10000000.0));
+                    player_stop();
+                    play_audio(&fb, g_audio_queue_pos + 1);
+                }
+            } else if (inp & INP_LEFT) {
+                /* True in-place seek, not a stop+restart like video needs —
+                 * confirmed on hardware that mplayer's own "seek" slave
+                 * command works fine over the network for a direct-play
+                 * (static=true) HTTP source, since that's a real seekable
+                 * byte-range request unlike video's live transcode stream. */
+                double target = play_position() - AUDIO_SEEK_STEP;
+                if (target < 0) target = 0;
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "pausing_keep seek -%.1f 0\n", AUDIO_SEEK_STEP);
+                mp_cmd(cmd);
+                g_play_offset = target;
+                g_play_start_wall = now_sec();
+            } else if (inp & INP_RIGHT) {
+                double dur = (double)cur->runtime_ticks / 10000000.0;
+                double target = play_position() + AUDIO_SEEK_STEP;
+                if (dur > 0 && target > dur) target = dur;
+                char cmd[48];
+                snprintf(cmd, sizeof(cmd), "pausing_keep seek %.1f 0\n", AUDIO_SEEK_STEP);
+                mp_cmd(cmd);
+                g_play_offset = target;
+                g_play_start_wall = now_sec();
+            } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+                g_last_progress_report = loop_now;
+                jf_report_progress(&g_cfg, cur->id, g_play_session_id,
+                                    (int64_t)(play_position() * 10000000.0), g_paused);
+            }
+            draw_now_playing(&fb, &g_items[g_audio_queue_pos], play_position());
+            break;
+        }
         }
 
         if (g_seek_fire_at > 0.0 && loop_now >= g_seek_fire_at && playing) {
