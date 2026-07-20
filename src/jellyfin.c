@@ -171,6 +171,8 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
         json_str(item_buf, "AlbumArtist", it->artist, sizeof(it->artist));
     }
 
+    json_str(item_buf, "CollectionType", it->collection_type, sizeof(it->collection_type));
+
     int64_t year = 0;
     if (json_int64(item_buf, "ProductionYear", &year))
         snprintf(it->year, sizeof(it->year), "%lld", (long long)year);
@@ -267,6 +269,7 @@ static void parse_media_streams(const char *buf, JfItem *it)
             sub->index = (int)idx;
             if (!json_str(stream_buf, "Language", sub->label, sizeof(sub->label)) || !sub->label[0])
                 json_str(stream_buf, "DisplayTitle", sub->label, sizeof(sub->label));
+            json_str(stream_buf, "Codec", sub->codec, sizeof(sub->codec));
             it->sub_count++;
         } else if (!strcmp(type_buf, "Video") && !got_video) {
             got_video = 1;
@@ -448,6 +451,27 @@ int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
     return n;
 }
 
+int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *item_type)
+{
+    char safe_parent[JF_ID_LEN];
+    jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
+
+    char path[384];
+    if (item_type && item_type[0])
+        snprintf(path, sizeof(path),
+            "/Items?userId=%s&ParentId=%s&Recursive=true&IncludeItemTypes=%s&Limit=0",
+            cfg->user_id, safe_parent, item_type);
+    else
+        snprintf(path, sizeof(path),
+            "/Items?userId=%s&ParentId=%s&Recursive=true&Limit=0",
+            cfg->user_id, safe_parent);
+
+    static char buf[JF_BUF_SIZE];
+    if (!jf_get(cfg, path, buf, sizeof(buf))) return -1;
+    int64_t count = 0;
+    return json_int64(buf, "TotalRecordCount", &count) ? count : -1;
+}
+
 int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int max)
 {
     char safe_parent[JF_ID_LEN];
@@ -459,6 +483,33 @@ int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int m
         "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
         "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
         cfg->user_id, safe_parent, max);
+
+    static char buf[JF_BUF_SIZE];
+    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    return parse_item_list(buf, out, max);
+}
+
+int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
+                             const char *item_type, JfItem *out, int max)
+{
+    char safe_parent[JF_ID_LEN];
+    jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
+
+    char path[560];
+    if (item_type && item_type[0])
+        snprintf(path, sizeof(path),
+            "/Items?userId=%s&ParentId=%s&Recursive=true&IncludeItemTypes=%s"
+            "&SortBy=SortName&SortOrder=Ascending"
+            "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+            "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
+            cfg->user_id, safe_parent, item_type, max);
+    else
+        snprintf(path, sizeof(path),
+            "/Items?userId=%s&ParentId=%s&Recursive=true"
+            "&SortBy=SortName&SortOrder=Ascending"
+            "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+            "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
+            cfg->user_id, safe_parent, max);
 
     static char buf[JF_BUF_SIZE];
     if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
@@ -572,7 +623,7 @@ int jf_download_image(const JfConfig *cfg, const JfItem *item, const char *dest_
 
 int jf_stream_url(const JfConfig *cfg, const char *item_id,
                    const JfStreamProfile *profile, int64_t start_ticks,
-                   const char *play_session_id,
+                   const char *play_session_id, int burn_in_sub_index,
                    char *out, int outlen)
 {
     char safe_id[JF_ID_LEN];
@@ -601,17 +652,40 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
      * codec — TS is the container our -demuxer lavf fix is already proven
      * against; an untested mov path isn't worth the risk.
      *
-     * No subtitle params — see jf_stream_url's header comment. */
+     * burn_in_sub_index — see jf_stream_url's header comment for why this
+     * is only ever set for image-based subtitle tracks. */
+    char sub_params[64] = "";
+    if (burn_in_sub_index >= 0)
+        snprintf(sub_params, sizeof(sub_params),
+                 "&subtitleStreamIndex=%d&subtitleMethod=Encode", burn_in_sub_index);
+
     snprintf(out, outlen,
         "%s/Videos/%s/stream?static=false&videoCodec=mpeg2video&container=ts"
         "&audioCodec=mp3&audioChannels=2"
         "&maxWidth=%d&maxHeight=%d&videoBitRate=%d"
-        "&startTimeTicks=%lld&playSessionId=%s&ApiKey=%s",
+        "&startTimeTicks=%lld&playSessionId=%s%s&ApiKey=%s",
         cfg->server, safe_id,
         profile->max_width, profile->max_height, profile->video_bitrate,
         (long long)(start_ticks > 0 ? start_ticks : 0),
-        safe_session, cfg->api_key);
+        safe_session, sub_params, cfg->api_key);
     return 1;
+}
+
+/* Codec strings per ffmpeg/Jellyfin's known text subtitle codecs — anything
+ * not in this list is treated as image-based (safer default: an unknown
+ * text codec would just fail jf_download_subtitle's fetch harmlessly via
+ * the existing "previous subtitle stays loaded" fallback in main.c, whereas
+ * treating an actual image codec as text would silently show nothing with
+ * no fallback at all). */
+int jf_subtitle_is_text(const char *codec)
+{
+    static const char *const text_codecs[] = {
+        "subrip", "srt", "ass", "ssa", "vtt", "webvtt", "mov_text",
+        "microdvd", "sami", "smi", "ttml", "stl", NULL
+    };
+    for (int i = 0; text_codecs[i]; i++)
+        if (!strcasecmp(codec, text_codecs[i])) return 1;
+    return 0;
 }
 
 int jf_audio_stream_url(const JfConfig *cfg, const char *item_id,

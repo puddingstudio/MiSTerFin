@@ -19,6 +19,7 @@
 #define APP_VERSION "dev"
 #endif
 #include "font8x8.h"
+#include "font_vcr16x16.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include "ddr.h"
@@ -203,9 +204,27 @@ static void fmt_time(char *buf, size_t sz, double secs)
 
 /* ── text rendering ──────────────────────────────────────────────────────── */
 
+/* VCR OSD Mono (see tools/rasterize_vcr_font.c) rendered natively at 16x16
+ * for scale=2 text — tried and, on user comparison against the original
+ * hand-drawn font8x8_basic (blown up 2x), the original was preferred. Kept
+ * disabled rather than deleted in case it's wanted later — flip this to 1
+ * to re-enable, no other code changes needed. */
+#define UI_USE_VCR_FONT 0
+
 static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
+    if (UI_USE_VCR_FONT && scale == 2) {
+        unsigned char cc = (c < 0x20 || c > 0x7E) ? '?' : c;
+        const uint8_t (*glyph16)[16] = font_vcr16x16[cc - 0x20];
+        for (int row = 0; row < 16; row++)
+            for (int col = 0; col < 16; col++) {
+                uint8_t a = glyph16[row][col];
+                if (a) fb_fill_rect_alpha(fb, x + col, y + row, 1, 1, r, g, b, a);
+            }
+        return;
+    }
+
     if (c >= 128) c = '?';
     const uint8_t *glyph = font8x8_basic[c];
     for (int row = 0; row < 8; row++) {
@@ -407,6 +426,22 @@ static int    g_item_count = 0;
 static int    g_sel = 0, g_scroll = 0;
 static double g_marquee_px = 0.0;         /* scroll offset for an over-long title, see draw_browse */
 static char   g_marquee_title[128] = "";  /* last title drawn — reset the offset when it changes */
+/* Per-library item counts for the root carousel (see draw_browse_carousel),
+ * parallel to g_items[] and only meaningful while the root FRAME_VIEWS frame
+ * is loaded — fetched once in fetch_frame() alongside the views themselves
+ * (3 small Limit=0 count requests for this user's library, one per view).
+ * -1 = fetch failed, caller just omits the count line for that card. */
+static int64_t g_view_counts[JF_MAX_ITEMS];
+/* Root screen (FRAME_VIEWS) rendering mode — 0 = carousel (default),
+ * 1 = classic list, toggled by SELECT (see the STATE_BROWSE input handling
+ * below). Persists for the whole app session, not just this one visit to
+ * the root, same way any other user preference toggle would. */
+static int    g_root_list_mode = 0;
+/* Last-selected root library index — restored by fetch_frame() when
+ * popping all the way back to the root screen, so it doesn't always reset
+ * to the first library. Kept up to date by the STATE_BROWSE input handling
+ * whenever g_sel changes while at the root. */
+static int    g_root_sel = 0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
@@ -557,12 +592,31 @@ static void spinner_show(FBDev *fb, double seconds)
 
 /* ── browse frames ────────────────────────────────────────────────────────── */
 
+/* The BaseItemKind that actually represents "one unit" of a library, keyed
+ * off CollectionType — used both for the carousel's "N movies/series/
+ * albums" count (jf_count_items) and its background cover grid
+ * (jf_list_items_recursive): a plain direct-children listing of a by-artist
+ * music library only finds MusicArtist folders, which often have no cover
+ * art of their own, so both need to look past the top level at the real
+ * leaf type. NULL (unrecognized collection type) means "don't filter". */
+static const char *collection_item_type(const char *collection_type)
+{
+    if (!strcmp(collection_type, "movies"))  return "Movie";
+    if (!strcmp(collection_type, "tvshows")) return "Series";
+    if (!strcmp(collection_type, "music"))   return "MusicAlbum";
+    return NULL;
+}
+
 static void fetch_frame(void)
 {
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
     switch (f->kind) {
     case FRAME_VIEWS:
         g_item_count = jf_list_views(&g_cfg, g_items, JF_MAX_ITEMS);
+        for (int i = 0; i < g_item_count; i++) {
+            const char *item_type = collection_item_type(g_items[i].collection_type);
+            g_view_counts[i] = jf_count_items(&g_cfg, g_items[i].id, item_type);
+        }
         break;
     case FRAME_ITEMS:
         g_item_count = jf_list_items(&g_cfg, f->parent_id, g_items, JF_MAX_ITEMS);
@@ -575,6 +629,18 @@ static void fetch_frame(void)
         break;
     }
     g_sel = 0; g_scroll = 0;
+    /* Returning to the root screen (B all the way back out of a library)
+     * should land on whichever library you drilled into, not always snap
+     * back to the first one — g_root_sel is kept up to date by the
+     * carousel/list navigation itself (see the STATE_BROWSE input
+     * handling), so just restore it here instead of the fresh-start 0
+     * above. Left at 0 the first time the app ever reaches the root
+     * (g_root_sel's own initializer). */
+    if (f->kind == FRAME_VIEWS && g_item_count > 0) {
+        g_sel = g_root_sel;
+        if (g_sel >= g_item_count) g_sel = g_item_count - 1;
+        if (g_sel < 0) g_sel = 0;
+    }
 }
 
 static void push_frame(FrameKind kind, const char *title,
@@ -842,18 +908,16 @@ static void browse_cover_sync(void)
         g_browse_cover_px = load_image_tmp(POSTER_TMP, &g_browse_cover_w, &g_browse_cover_h);
 }
 
-static void draw_browse(FBDev *fb)
+/* Clock (right-aligned, stopping short of the spinner's reserved corner —
+ * SPINNER_SIZE+SPINNER_MARGIN — so a loading spinner never overlaps it) +
+ * title (left-aligned, using whatever width is left before the clock).
+ * Titles can get long (Album/Season ones are "Artist / Album" combos) —
+ * scroll slowly instead of truncating when it doesn't fit, per user
+ * request. Character-clipped via draw_text_clipped so it never draws into
+ * the clock/spinner area. Shared by both the root carousel and the regular
+ * list browse — both need the same header. */
+static void draw_top_bar(FBDev *fb, const char *title)
 {
-    browse_cover_sync();
-
-    fb_clear(fb);
-
-    BrowseFrame *f = &g_stack[g_stack_depth - 1];
-    const char *title = f->title[0] ? f->title : "MiSTerFin";
-
-    /* Clock, right-aligned but stopping short of the spinner's reserved
-     * corner (SPINNER_SIZE+SPINNER_MARGIN) so a loading spinner never
-     * overlaps it. */
     time_t now_t = time(NULL);
     struct tm now_tm;
     localtime_r(&now_t, &now_tm);
@@ -863,11 +927,6 @@ static void draw_browse(FBDev *fb)
     int clock_x = clock_right - text_width(clock_buf, 1);
     draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, COL_HINT);
 
-    /* Title, left-aligned, using whatever width is left before the clock.
-     * Titles can get long now that Album/Season ones are "Artist / Album"
-     * combos — scroll it slowly instead of truncating when it doesn't fit,
-     * per user request. Character-clipped via draw_text_clipped so it
-     * never draws into the clock/spinner area. */
     int title_x0 = SAFE_X;
     int title_x1 = clock_x - 12;
     int title_w  = text_width(title, 2);
@@ -884,6 +943,198 @@ static void draw_browse(FBDev *fb)
         draw_text_clipped(fb, title_x0 - off, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
         draw_text_clipped(fb, title_x0 - off + period, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
     }
+}
+
+/* One card in the root library carousel — plain text, no icon/container per
+ * user request (an earlier version had a placeholder icon tile + bordered
+ * panel; both are gone now). All three cards (active + its two neighbors)
+ * are the same size; only color marks which one is active. */
+#define CAROUSEL_CARD_W 180   /* max text width before truncating */
+
+static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx, int cy, int active)
+{
+    char name[64];
+    strncpy(name, it->name, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    truncate_to_width(name, 2, CAROUSEL_CARD_W);
+    /* Can't ternary a multi-arg color macro straight into a call — the
+     * comma in e.g. COL_TITLE splits into extra call arguments instead of
+     * picking r/g/b together, silently mis-coloring this (caught by eye in
+     * the --preview-browse render, not by the compiler). */
+    if (active) draw_text(fb, cx - text_width(name, 2) / 2, cy - 10, name, 2, COL_TITLE);
+    else        draw_text(fb, cx - text_width(name, 2) / 2, cy - 10, name, 2, 0xFF, 0xFF, 0xFF);
+
+    if (count >= 0) {
+        const char *ct = it->collection_type;
+        char cbuf[32];
+        if (!strcmp(ct, "movies"))
+            snprintf(cbuf, sizeof(cbuf), "%lld movie%s", (long long)count, count == 1 ? "" : "s");
+        else if (!strcmp(ct, "tvshows"))
+            snprintf(cbuf, sizeof(cbuf), "%lld series", (long long)count);
+        else if (!strcmp(ct, "music"))
+            snprintf(cbuf, sizeof(cbuf), "%lld album%s", (long long)count, count == 1 ? "" : "s");
+        else
+            snprintf(cbuf, sizeof(cbuf), "%lld item%s", (long long)count, count == 1 ? "" : "s");
+        draw_text(fb, cx - text_width(cbuf, 1) / 2, cy + 12, cbuf, 1, COL_HINT);
+    }
+}
+
+/* Dimmed cover-art grid behind the carousel, tiling whatever the active
+ * library actually contains — one library's worth of covers cached at a
+ * time (not all libraries at once): a single-slot "skip if unchanged"
+ * cache, same pattern as browse_cover_sync, since only the active one is
+ * ever on screen. Uses its own JfItem buffer (grid_items in
+ * grid_covers_sync), NOT g_items — that array is the carousel's own
+ * selection list and must not be clobbered by this side listing. */
+#define GRID_FETCH_MAX 12
+#define GRID_COLS 8
+#define GRID_ROWS 4
+#define GRID_ALPHA 65   /* out of 255 — dimmed but covers should read clearly, per user feedback that 40 was too faint */
+
+static char     g_grid_view_id[JF_ID_LEN] = "";
+static uint8_t *g_grid_px[GRID_FETCH_MAX];
+static int      g_grid_w[GRID_FETCH_MAX], g_grid_h[GRID_FETCH_MAX];
+static int      g_grid_count = 0;
+/* Which cover (index into g_grid_px[]) each grid cell shows — shuffled once
+ * per grid_covers_sync() reload, NOT per draw: draw_browse_carousel redraws
+ * every ~100ms just for the clock/marquee tick even with no navigation, so
+ * reshuffling per-draw would make the background visibly jitter. */
+static int      g_grid_cell_order[GRID_COLS * GRID_ROWS];
+
+/* A plain Fisher-Yates shuffle of the (count-cycled) index list still reads
+ * as "repeating" with few unique covers spread over many cells (e.g. 4
+ * covers over this grid's 32 cells is 8 copies of each) — nothing stops the
+ * same cover landing in two vertically- or horizontally-adjacent cells,
+ * which is exactly the visible pattern a uniform shuffle doesn't avoid.
+ * Build the order cell-by-cell instead, rejecting a pick that matches the
+ * cell directly above or to the left (a few retries, not exhaustive) —
+ * cheap and enough to kill the obvious adjacent-repeat look; only gives up
+ * (accepting a repeat) when there aren't enough distinct covers to satisfy
+ * both neighbors at once. */
+static void grid_cell_order_shuffle(void)
+{
+    if (g_grid_count <= 0) {
+        for (int i = 0; i < GRID_COLS * GRID_ROWS; i++) g_grid_cell_order[i] = 0;
+        return;
+    }
+    for (int row = 0; row < GRID_ROWS; row++) {
+        for (int col = 0; col < GRID_COLS; col++) {
+            int left  = col > 0 ? g_grid_cell_order[row * GRID_COLS + col - 1] : -1;
+            int above = row > 0 ? g_grid_cell_order[(row - 1) * GRID_COLS + col] : -1;
+            int pick, tries = 0;
+            do {
+                pick = rand() % g_grid_count;
+            } while (g_grid_count > 2 && (pick == left || pick == above) && ++tries < 8);
+            g_grid_cell_order[row * GRID_COLS + col] = pick;
+        }
+    }
+}
+
+static void grid_covers_free(void)
+{
+    for (int i = 0; i < g_grid_count; i++)
+        if (g_grid_px[i]) { stbi_image_free(g_grid_px[i]); g_grid_px[i] = NULL; }
+    g_grid_count = 0;
+}
+
+/* Sequential downloads+decodes (up to GRID_FETCH_MAX), so this can take a
+ * couple of seconds the first time a library becomes active — covered by
+ * the corner spinner between steps, same as info_assets_load's own
+ * sequential image fetches. Small request width (100px) keeps each JPEG
+ * decode cheap since these only ever render at ~80x72 tile size anyway. */
+static void grid_covers_sync(FBDev *fb, const JfItem *view)
+{
+    if (!strcmp(g_grid_view_id, view->id)) return;
+
+    grid_covers_free();
+    strncpy(g_grid_view_id, view->id, sizeof(g_grid_view_id) - 1);
+    g_grid_view_id[sizeof(g_grid_view_id) - 1] = '\0';
+
+    static JfItem grid_items[GRID_FETCH_MAX];
+    const char *item_type = collection_item_type(view->collection_type);
+    int n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
+
+    int spinner_frame = 0;
+    for (int i = 0; i < n && g_grid_count < GRID_FETCH_MAX; i++) {
+        if (!grid_items[i].image_tag[0]) continue;
+        draw_spinner_frame(fb, spinner_frame++); fb_flip(fb);
+        if (jf_download_item_image(&g_cfg, grid_items[i].id, "Primary",
+                                    grid_items[i].image_tag, 100, POSTER_TMP)) {
+            uint8_t *px = load_image_tmp(POSTER_TMP, &g_grid_w[g_grid_count], &g_grid_h[g_grid_count]);
+            if (px) g_grid_px[g_grid_count++] = px;
+        }
+    }
+    grid_cell_order_shuffle();
+}
+
+static void draw_grid_background(FBDev *fb)
+{
+    if (g_grid_count == 0) return;
+    int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
+    for (int row = 0; row < GRID_ROWS; row++) {
+        for (int col = 0; col < GRID_COLS; col++) {
+            int idx = g_grid_cell_order[row * GRID_COLS + col];
+            fb_blit(fb, g_grid_px[idx], g_grid_w[idx], g_grid_h[idx],
+                    col * cell_w, row * cell_h, cell_w, cell_h, GRID_ALPHA);
+        }
+    }
+}
+
+/* Root screen (g_stack_depth == 1, FRAME_VIEWS) — a horizontal carousel of
+ * library cards instead of the regular list, since a handful of libraries
+ * (movies/TV/music, ...) reads better as a few big blocks than as rows.
+ * Only the active card plus its immediate left/right neighbors are drawn
+ * (peeking in from the screen edges) rather than all N libraries at once —
+ * scales to however many views the server has without the layout changing
+ * shape, matching MiSTerDVD-style carousels. Snap navigation, no slide
+ * animation: this chip has no headroom to spend on frame-timed easing that
+ * the rest of the UI doesn't do either (see player_seek's own instant-cut
+ * restart for the same reasoning applied elsewhere). */
+static void draw_browse_carousel(FBDev *fb)
+{
+    if (g_item_count == 0) {
+        fb_clear(fb);
+        draw_top_bar(fb, "MiSTerFin");
+        const char *msg = "No libraries found";
+        draw_text(fb, (fb->width - text_width(msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
+        fb_flip(fb);
+        return;
+    }
+
+    grid_covers_sync(fb, &g_items[g_sel]);
+
+    fb_clear(fb);
+    draw_grid_background(fb);
+    draw_top_bar(fb, "MiSTerFin");
+
+    int content_top = SAFE_Y + 24, content_bottom = fb->height - SAFE_Y_BOT - 28;
+    int cy = (content_top + content_bottom) / 2;
+    int center_cx = fb->width / 2;
+
+    if (g_sel > 0)
+        draw_library_card(fb, &g_items[g_sel - 1], g_view_counts[g_sel - 1], 90, cy, 0);
+    if (g_sel < g_item_count - 1)
+        draw_library_card(fb, &g_items[g_sel + 1], g_view_counts[g_sel + 1], fb->width - 90, cy, 0);
+    draw_library_card(fb, &g_items[g_sel], g_view_counts[g_sel], center_cx, cy, 1);
+
+    const char *hint = "LEFT/RIGHT: browse   A:select   SELECT:list view   B:exit";
+    draw_text(fb, (fb->width - text_width(hint,1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
+static void draw_browse(FBDev *fb)
+{
+    BrowseFrame *f = &g_stack[g_stack_depth - 1];
+    if (f->kind == FRAME_VIEWS && !g_root_list_mode) { draw_browse_carousel(fb); return; }
+
+    browse_cover_sync();
+
+    fb_clear(fb);
+
+    const char *title = f->title[0] ? f->title : "MiSTerFin";
+    draw_top_bar(fb, title);
 
     if (g_item_count == 0) {
         const char *msg = "Nothing here";
@@ -978,7 +1229,8 @@ static void draw_browse(FBDev *fb)
                   fb->height - 8 - SAFE_Y_BOT, buf, 1, COL_HINT);
     }
 
-    const char *hint = (g_stack_depth > 1) ? "A:select  B:back" : "A:select  B:exit";
+    const char *hint = (g_stack_depth > 1) ? "A:select  B:back" :
+                        "A:select  SELECT:cover view  B:exit";
     draw_text(fb, (fb->width - text_width(hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -1169,13 +1421,21 @@ static int     g_paused          = 0;
 static double  g_pause_wall      = 0.0;
 static char    g_play_session_id[64];
 static double  g_last_progress_report = 0.0;
-/* -1 = off, otherwise JfSubtitle.index of the loaded/active track. Rendered
- * client-side by mplayer (sub_load/sub_select — see subtitle_apply()), not
- * burned in server-side, so this does NOT require a stream restart. Reset
- * to -1 only when starting a title fresh from the info screen — preserved
- * across a seek-triggered restart of the same title (seeks re-download and
- * re-load the same subtitle file after the restart, see play()). */
+/* -1 = off, otherwise JfSubtitle.index of the loaded/active track. Text
+ * tracks are rendered client-side by mplayer (sub_load/sub_select — see
+ * subtitle_load_client()) and don't need a restart; image-based tracks
+ * (see g_burned_in_sub_index) do. Reset to -1 only when starting a title
+ * fresh from the info screen — preserved across a seek-triggered restart of
+ * the same title (seeks re-download and re-load the same subtitle file
+ * after the restart, see play()). */
 static int     g_current_sub_index = -1;
+/* -1 = none, otherwise the JfSubtitle.index currently baked into the
+ * playing stream's URL via jf_stream_url's burn_in_sub_index (see
+ * subtitle_apply()). Kept in sync with g_current_sub_index whenever the
+ * active track is image-based; read by play() on every (re)start, including
+ * seek-triggered ones, so the burn-in survives seeks the same way
+ * g_current_sub_index already does for client-rendered tracks. */
+static int     g_burned_in_sub_index = -1;
 /* Seek is a full stop+restart (network stream isn't byte-range seekable —
  * see player_seek) which takes a couple of seconds; accumulate repeated
  * presses into one seek instead of firing a restart per press, same as
@@ -1374,14 +1634,18 @@ static double g_sub_delay_extra = 0.0;   /* seconds, LEFT/RIGHT-adjustable in th
  * sub_visibility comment for why the prefix is mandatory while paused. */
 static void sub_delay_send(void)
 {
-    if (g_current_sub_index < 0) return;   /* nothing loaded yet — subtitle_apply() will send it */
+    if (g_current_sub_index < 0) return;   /* nothing loaded yet — subtitle_load_client() will send it */
     char cmd[80];
     snprintf(cmd, sizeof(cmd), "pausing_keep sub_delay %.3f 1\n",
              AUDIO_DELAY_SEC + SUBTITLE_SYNC_FUDGE_SEC - g_play_offset + g_sub_delay_extra);
     mp_cmd(cmd);
 }
 
-static void subtitle_apply(int new_index)
+/* Loads a text-based subtitle client-side (mplayer sub_load/sub_select) —
+ * no server/stream involvement, so this never needs a restart. Assumes
+ * new_index is either -1 or a track that isn't burned in (see
+ * subtitle_apply(), the only caller). */
+static void subtitle_load_client(int new_index)
 {
     if (new_index < 0) {
         mp_cmd("pausing_keep sub_remove\n");
@@ -1403,6 +1667,45 @@ static void subtitle_apply(int new_index)
     mp_cmd("pausing_keep sub_select 0\n");   /* sub_remove above guarantees this is the only loaded track */
     g_current_sub_index = new_index;
     sub_delay_send();
+}
+
+/* g_info_item.subs[] is unordered w.r.t. JfSubtitle.index (server-assigned,
+ * not necessarily contiguous from 0) — this is the only way to get from an
+ * index back to its codec. Returns NULL if index is -1 (off) or stale
+ * (title changed underneath us), both of which callers treat as "no codec
+ * info" and default to text. */
+static const JfSubtitle *find_sub(int index)
+{
+    for (int i = 0; i < g_info_item.sub_count; i++)
+        if (g_info_item.subs[i].index == index) return &g_info_item.subs[i];
+    return NULL;
+}
+
+/* Picks client-side rendering vs. server burn-in per new_index's codec (see
+ * jf_subtitle_is_text()) and restarts the stream via play() whenever that
+ * choice changes what's baked into the URL — same stop+reopen mechanism as
+ * player_seek(), since there is no in-place way to add/drop a server-side
+ * burn-in on a live, non-seekable progressive stream. Switching between two
+ * text tracks, or turning a text track off, stays restart-free exactly like
+ * before. */
+static void subtitle_apply(FBDev *fb, int new_index)
+{
+    int new_burn_in = -1;
+    if (new_index >= 0) {
+        const JfSubtitle *s = find_sub(new_index);
+        if (s && !jf_subtitle_is_text(s->codec)) new_burn_in = new_index;
+    }
+
+    if (new_burn_in != g_burned_in_sub_index) {
+        double pos = play_position();
+        g_burned_in_sub_index = new_burn_in;
+        g_current_sub_index   = new_index;
+        player_stop();
+        play(fb, g_info_item.id, pos);
+        return;
+    }
+
+    subtitle_load_client(new_index);
 }
 
 /* Cycling with an immediate apply per SELECT press caused a cascade when
@@ -1486,12 +1789,12 @@ static void draw_submenu(FBDev *fb)
     fb_flip(fb);
 }
 
-static void submenu_confirm(void)
+static void submenu_confirm(FBDev *fb)
 {
     int new_index = g_submenu_sel == 0 ? -1 : g_info_item.subs[g_submenu_sel - 1].index;
     submenu_close();
     if (new_index == g_current_sub_index) return;   /* no actual change */
-    subtitle_apply(new_index);
+    subtitle_apply(fb, new_index);
 }
 
 /* play_position() plus whatever seek is currently accumulating but hasn't
@@ -1577,7 +1880,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
 
     char url[600];
     jf_stream_url(&g_cfg, item_id, &g_stream_profile, start_ticks, g_play_session_id,
-                  url, sizeof(url));
+                  g_burned_in_sub_index, url, sizeof(url));
 
     char delay_arg[16];
     snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
@@ -1689,13 +1992,14 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
      * loading spinner without racing its own frame writes. */
     spinner_show(fb, 2.0);
 
-    /* A subtitle selection survives a seek-triggered restart (see
-     * player_seek) but the fresh mplayer instance doesn't have anything
-     * loaded yet — re-download+load it the same way subtitle_apply() does
-     * for a manual change (it's a no-op restart into the same value if the
-     * subtitle is already g_current_sub_index). */
-    if (g_current_sub_index >= 0)
-        subtitle_apply(g_current_sub_index);
+    /* A client-rendered (text) subtitle selection survives a seek-triggered
+     * restart (see player_seek) but the fresh mplayer instance doesn't have
+     * anything loaded yet — re-download+load it the same way
+     * subtitle_load_client() does for a manual change. An image-based
+     * (burned-in) selection needs no client-side action at all here: it's
+     * already baked into the url built above via g_burned_in_sub_index. */
+    if (g_current_sub_index >= 0 && g_burned_in_sub_index < 0)
+        subtitle_load_client(g_current_sub_index);
 }
 
 /* ── music playback (audio-only, direct play — see jf_audio_stream_url) ──── */
@@ -1932,10 +2236,47 @@ static int run_capture_about(int frame_count)
     return 0;
 }
 
+/* Hidden dev tool for iterating on browse-screen layout (the carousel, in
+ * particular) without a real /dev/fb0 or deploying to hardware each time —
+ * fabricates an FBDev backed by plain malloc'd buffers (fb_open needs a
+ * real fbdev ioctl, which this desktop build doesn't have) and renders one
+ * real draw_browse() frame against the live server from jellyfin.conf (or
+ * ./jellyfin.conf — see jf_config_load), then dumps the back-buffer as a
+ * raw BGRX file for tools/raw_to_png.py to turn into something viewable.
+ * Optional argv[2] pre-selects g_sel so a specific card can be previewed
+ * as the active one. */
+static int run_preview_browse(int sel, int list_mode)
+{
+    srand((unsigned)time(NULL));   /* grid_cell_order_shuffle draws on rand() */
+    FBDev fb = {0};
+    fb.width = 640; fb.height = 288; fb.stride = fb.width * 4;
+    fb.mmap_size = (size_t)fb.stride * fb.height;
+    fb.mem  = calloc(1, fb.mmap_size);
+    fb.back = calloc(1, fb.mmap_size);
+    if (!fb.mem || !fb.back) { fprintf(stderr, "alloc failed\n"); return 1; }
+
+    if (!jf_config_load(&g_cfg)) { fprintf(stderr, "jellyfin.conf not found\n"); return 1; }
+    if (!jf_resolve_user_id(&g_cfg)) { fprintf(stderr, "user resolve failed\n"); return 1; }
+
+    g_root_list_mode = list_mode;
+    push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+    if (sel >= 0 && sel < g_item_count) g_sel = sel;
+
+    draw_browse(&fb);
+
+    FILE *f = fopen("/tmp/preview.raw", "wb");
+    if (f) { fwrite(fb.mem, 1, fb.mmap_size, f); fclose(f); }
+    printf("%d %d %d\n", fb.width, fb.height, fb.stride);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--capture-about") == 0)
         return run_capture_about(argc > 2 ? atoi(argv[2]) : 60);
+    if (argc > 1 && strcmp(argv[1], "--preview-browse") == 0)
+        return run_preview_browse(argc > 2 ? atoi(argv[2]) : -1,
+                                   argc > 3 && strcmp(argv[3], "list") == 0);
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
 
@@ -2044,7 +2385,7 @@ int main(int argc, char **argv)
                 if (inp & INP_LEFT)  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
                 if (inp & INP_RIGHT) { g_sub_delay_extra += 0.1; sub_delay_send(); }
             }
-            if (inp & INP_A) { submenu_confirm(); input_drain(); continue; }
+            if (inp & INP_A) { submenu_confirm(&fb); input_drain(); continue; }
             /* SELECT also closes — a SELECT press while already open was a
              * silent no-op before (it only opens from the STATE_PLAYING
              * switch below, which this block's own `continue` never
@@ -2078,20 +2419,40 @@ int main(int argc, char **argv)
 
         case STATE_BROWSE: {
             int nav = 0;
+            int at_root      = (g_stack[g_stack_depth - 1].kind == FRAME_VIEWS);
+            int is_carousel  = at_root && !g_root_list_mode;
             if (inp & INP_B) {
                 if (!pop_frame()) { g_running = 0; break; }
                 nav = 1;
             }
-            if (inp & INP_UP && g_item_count > 0) {
-                if (g_sel > 0) g_sel--;
-                if (g_sel < g_scroll) g_scroll = g_sel;
+            /* SELECT swaps the root screen between the carousel and the
+             * classic list, per user request — only meaningful at the root
+             * (deeper frames have no second layout to switch to). */
+            if (at_root && (inp & INP_SELECT)) {
+                g_root_list_mode = !g_root_list_mode;
                 nav = 1;
             }
-            if (inp & INP_DOWN && g_item_count > 0) {
-                if (g_sel < g_item_count - 1) g_sel++;
-                if (g_sel >= g_scroll + VISIBLE) g_scroll = g_sel - VISIBLE + 1;
-                nav = 1;
+            /* Root library screen is the horizontal carousel (see
+             * draw_browse_carousel) — LEFT/RIGHT move the active card
+             * instead of the regular list's UP/DOWN. No scroll window to
+             * maintain: the carousel only ever draws g_sel and its two
+             * immediate neighbors. */
+            if (is_carousel) {
+                if (inp & INP_LEFT && g_sel > 0) { g_sel--; nav = 1; }
+                if (inp & INP_RIGHT && g_sel < g_item_count - 1) { g_sel++; nav = 1; }
+            } else {
+                if (inp & INP_UP && g_item_count > 0) {
+                    if (g_sel > 0) g_sel--;
+                    if (g_sel < g_scroll) g_scroll = g_sel;
+                    nav = 1;
+                }
+                if (inp & INP_DOWN && g_item_count > 0) {
+                    if (g_sel < g_item_count - 1) g_sel++;
+                    if (g_sel >= g_scroll + VISIBLE) g_scroll = g_sel - VISIBLE + 1;
+                    nav = 1;
+                }
             }
+            if (at_root) g_root_sel = g_sel;   /* see g_root_sel's own comment */
             if (inp & INP_A && g_item_count > 0) {
                 JfItem *it = &g_items[g_sel];
                 BrowseFrame *f = &g_stack[g_stack_depth - 1];
@@ -2168,6 +2529,7 @@ int main(int argc, char **argv)
                 playing = 1;
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
+                g_burned_in_sub_index = -1;
                 play(&fb, g_info_item.id, offset);
                 input_drain();
             } else if ((inp & INP_SELECT) && g_info_item.resume_ticks > 0 && !g_info_item.played) {
@@ -2175,6 +2537,7 @@ int main(int argc, char **argv)
                 playing = 1;
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
+                g_burned_in_sub_index = -1;
                 play(&fb, g_info_item.id, 0.0);
                 input_drain();
             }

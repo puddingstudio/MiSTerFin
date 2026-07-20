@@ -38,6 +38,8 @@ typedef struct {
 typedef struct {
     int  index;                        /* MediaStreams[].Index — pass as subtitleStreamIndex */
     char label[JF_SUB_LABEL_LEN];       /* Language if set, else DisplayTitle */
+    char codec[16];                    /* MediaStreams[].Codec, e.g. "subrip", "ass",
+                                         * "pgssub", "dvdsub" — see jf_subtitle_is_text() */
 } JfSubtitle;
 
 typedef struct {
@@ -60,6 +62,8 @@ typedef struct {
     char       year[8];
     char       album[JF_NAME_LEN];   /* Album — tracks only, empty otherwise */
     char       artist[JF_NAME_LEN];  /* AlbumArtist — tracks only, empty otherwise */
+    char       collection_type[16];  /* CollectionType — "movies"/"tvshows"/"music"/...,
+                                       * library views only (jf_list_views), empty otherwise */
     JfItemType type;
     int64_t    runtime_ticks;          /* RunTimeTicks, 0 if unknown */
     int64_t    resume_ticks;           /* UserData.PlaybackPositionTicks */
@@ -103,8 +107,29 @@ int jf_resolve_user_id(JfConfig *cfg);
 /* Top-level library views (Movies, TV Shows, ...). */
 int jf_list_views(const JfConfig *cfg, JfItem *out, int max);
 
+/* Recursive item count under parent_id, filtered to item_type if non-NULL/
+ * non-empty (a BaseItemKind string — "Movie", "Series", "MusicAlbum", ...),
+ * else an unfiltered recursive count. Limit=0 so the server only computes
+ * TotalRecordCount and serializes no items — confirmed against a real
+ * server that this is cheap even recursively. Used for the library
+ * carousel's "N movies/series/albums" line — the view's own ChildCount
+ * field (from jf_list_views) is NOT this: confirmed on a real server it
+ * counts something else entirely (e.g. read 6 for a music library whose
+ * root folder has exactly 1 direct child). Returns -1 on failure. */
+int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *item_type);
+
 /* Direct children of parent_id (a view, a folder, ...). */
 int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int max);
+
+/* Same shape as jf_list_items but recursive, and filtered to item_type if
+ * non-NULL/non-empty (a BaseItemKind string, e.g. "MusicAlbum"). Used by
+ * the carousel's background cover grid to reach real leaf-level art (movie/
+ * series/album covers) even for libraries organized in intermediate folders
+ * — a by-artist music library's direct children are MusicArtist folders,
+ * which often carry no cover art of their own; a plain non-recursive
+ * listing there found nothing to show (confirmed against a real server). */
+int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
+                             const char *item_type, JfItem *out, int max);
 
 /* TV hierarchy. */
 int jf_list_seasons(const JfConfig *cfg, const char *series_id, JfItem *out, int max);
@@ -146,16 +171,20 @@ typedef struct {
  * request instead of honoring the current profile/resolution (confirmed
  * against a real server: omitting it silently served an old 720x300 file
  * regardless of the maxWidth/maxHeight passed here).
- * No subtitle params here — subtitles are rendered client-side by mplayer
- * (see jf_download_subtitle) instead of burned in server-side. Confirmed on
- * a real server that burning subtitles into a mid-file restart forces
- * Jellyfin to decode+discard from the true start of the file up to the seek
- * target (a seek to 40:00 dropped exactly 40:00 worth of frames, on both
- * mpeg2video and h264) — a multi-minute stall for a deep seek, and nothing
- * a client request parameter can avoid. */
+ * burn_in_sub_index: -1 for none (the normal case — subtitles are rendered
+ * client-side by mplayer, see jf_download_subtitle), otherwise a
+ * JfSubtitle.index for an image-based track (pgssub/dvdsub/...) that has no
+ * text to hand back as .srt and so can only be shown by having Jellyfin
+ * burn it into the video itself. Confirmed on a real server that burning
+ * subtitles into a mid-file restart forces Jellyfin to decode+discard from
+ * the true start of the file up to the seek target (a seek to 40:00 dropped
+ * exactly 40:00 worth of frames, on both mpeg2video and h264) — a
+ * multi-minute stall for a deep seek, and nothing a client request
+ * parameter can avoid. Only worth paying for image-based tracks, which have
+ * no other way to display at all. */
 int jf_stream_url(const JfConfig *cfg, const char *item_id,
                    const JfStreamProfile *profile, int64_t start_ticks,
-                   const char *play_session_id,
+                   const char *play_session_id, int burn_in_sub_index,
                    char *out, int outlen);
 
 /* Builds a direct-play audio stream URL (static=true — no server transcode:
@@ -178,6 +207,11 @@ int jf_audio_stream_url(const JfConfig *cfg, const char *item_id,
 int jf_download_subtitle(const JfConfig *cfg, const char *item_id,
                           const char *media_source_id, int sub_index,
                           const char *dest_path);
+
+/* True for subtitle codecs Jellyfin can hand back as plain text (.srt) —
+ * false for image-based codecs (pgssub/dvdsub/dvbsub/...) that only exist as
+ * bitmaps and so need burn_in_sub_index in jf_stream_url instead. */
+int jf_subtitle_is_text(const char *codec);
 
 /* Playback progress reporting (Sessions/Playing family). play_session_id is
  * a client-generated opaque string reused across start/progress/stopped for
