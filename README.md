@@ -8,11 +8,12 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 
 ## Features
 
-- Browse menu with library list, cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season")
+- Home screen is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one
+- Browsing within a library (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season")
 - Info screen with cover art, description, year, and status
 - Server-side transcoded video playback with correct letterbox/pillarbox scaling for any source aspect ratio
 - Pause menu with a live progress bar, VSync ON/OFF toggle, resume/stop
-- Subtitles rendered client-side (instant toggle/switch, no re-buffering), with a picker menu and live sync fine-tuning
+- Subtitles rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
 - **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with cover art, a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - Resume position and watched status read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
 - About screen with a GitHub-releases update check; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
@@ -113,9 +114,11 @@ There is no on-screen setup keyboard in v1 — edit the file over SSH (using the
 ### Browser
 | Button | Action |
 |--------|--------|
-| Up / Down | Navigate |
+| Left / Right | Navigate the home screen's library carousel |
+| Up / Down | Navigate (home screen in list mode, or anywhere below it) |
+| SELECT | Home screen only: swap between the carousel and the classic list |
 | A | Open / drill in (library → series → season → episode, or library → artist → album → track) |
-| B | Back (exits the app from the top-level library list) |
+| B | Back (exits the app from the top-level library screen) |
 | START | About screen |
 
 ### Info screen (movies/episodes)
@@ -168,6 +171,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - **Letterbox/pillarbox requires `dsize` as the last `-vf` stage, or mplayer overrides your sizing.** See the `-vf` chain in `play()` if you're touching this.
 - **mplayer's `-af export` header fields (nch/sz) don't match this build's actual export file size** — the now-playing VU meter reads however many samples are actually present after the 8-byte header instead of trusting those fields. See `read_af_samples()` if you're touching the visualizer.
 - **Any mplayer slave command sent while paused silently resumes playback unless prefixed with `pausing_keep`.** This isn't Jellyfin/MiSTerFin-specific, just an mplayer slave-mode quirk — but it's the reason pause-state commands (subtitle visibility, seeking while paused) are all prefixed that way throughout `main.c`.
+- **Server-side subtitle burn-in (image-based tracks only) forces a full stream restart, and seeking with it active re-decodes from the true start of the file up to the seek target** — a multi-minute stall on a deep seek. Text-based tracks are unaffected (rendered client-side, no restart). See `jf_stream_url()`'s `burn_in_sub_index` comment.
 - **`MediaSourceId` is omitted** from stream/progress/subtitle requests rather than guessed — works for direct single-version items; multi-version items (multiple cuts/qualities of the same title) may not resolve to the version you expect.
 - **No on-screen keyboard** for server setup — `jellyfin.conf` must be edited manually (SSH or SD card).
 - Silent failure if `mplayer-arm` can't open the stream (bad URL, server down, transcode rejected) — you're dropped back to the browser with no error message.
