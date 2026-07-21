@@ -11,7 +11,7 @@ CFLAGS = -O2 -Wall -Wextra -Isrc -DAPP_VERSION=\"$(VERSION)\"
 CC_ARM     = zig cc -target arm-linux-gnueabihf.2.31 -mcpu=cortex_a9
 CFLAGS_ARM = -O2 -Isrc -DAPP_VERSION=\"$(VERSION)\" -D_FILE_OFFSET_BITS=64
 
-MISTER_HOST ?= 192.168.2.225
+MISTER_HOST ?= mister.local
 
 .PHONY: all arm clean deploy
 
