@@ -146,6 +146,11 @@ int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int m
 int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
                              const char *item_type, JfItem *out, int max);
 
+/* Random batch of Audio items anywhere under parent_id (e.g. a whole Music
+ * library) — SELECT on the artist list starts an infinite shuffle with
+ * this, refetching a fresh batch each time the current one runs out. */
+int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *out, int max);
+
 /* TV hierarchy. */
 int jf_list_seasons(const JfConfig *cfg, const char *series_id, JfItem *out, int max);
 int jf_list_episodes(const JfConfig *cfg, const char *series_id, const char *season_id,

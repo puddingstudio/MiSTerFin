@@ -536,6 +536,23 @@ int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
     return parse_item_list(buf, out, max);
 }
 
+int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *out, int max)
+{
+    char safe_parent[JF_ID_LEN];
+    jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
+
+    char path[512];
+    snprintf(path, sizeof(path),
+        "/Items?userId=%s&ParentId=%s&Recursive=true&IncludeItemTypes=Audio&SortBy=Random"
+        "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+        "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
+        cfg->user_id, safe_parent, max);
+
+    static char buf[JF_BUF_SIZE];
+    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    return parse_item_list(buf, out, max);
+}
+
 int jf_get_item_details(const JfConfig *cfg, const char *item_id, JfItem *out)
 {
     char safe_id[JF_ID_LEN];

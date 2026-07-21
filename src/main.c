@@ -317,6 +317,7 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
 #define MAX_INPUT_FDS 8
 static int input_fds[MAX_INPUT_FDS];
 static int input_swap_ab[MAX_INPUT_FDS];
+static int input_is_virtual[MAX_INPUT_FDS];
 static int input_count = 0;
 
 /* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
@@ -328,6 +329,21 @@ static int input_count = 0;
 static int device_needs_ab_swap(const char *name)
 {
     return strstr(name, "SFC30") != NULL;
+}
+
+/* MiSTer's own OSD layer echoes every physical joystick press as a
+ * synthetic keyboard event on a separate virtual device (confirmed via raw
+ * evdev capture: pressing a gamepad button also fires an unrelated KEY_*
+ * code on this device, per whatever key MiSTer's own default joystick-to-
+ * OSD table happens to assign it). Turns out the SFC30's D-pad specifically
+ * only ever arrives THROUGH this echo (as KEY_UP/DOWN/LEFT/RIGHT — it has
+ * no EV_ABS capability of its own, confirmed via /proc/bus/input/devices),
+ * so it can't just be closed outright. Instead only arrow-key codes from it
+ * are trusted (see input_poll) — action keys (Enter/Esc/Space/...) are
+ * dropped since those collide with keys we bind for real keyboards/pads. */
+static int device_is_mister_virtual(const char *name)
+{
+    return strcmp(name, "MiSTer virtual input") == 0;
 }
 
 #define INP_UP     0x01
@@ -355,7 +371,8 @@ static void input_open(void)
 
         char name[128] = "";
         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
-        input_swap_ab[input_count] = device_needs_ab_swap(name);
+        input_swap_ab[input_count]    = device_needs_ab_swap(name);
+        input_is_virtual[input_count] = device_is_mister_virtual(name);
         input_fds[input_count++] = fd;
     }
     closedir(d);
@@ -386,20 +403,37 @@ static int input_poll(void)
                     if      (code == BTN_SOUTH) code = BTN_EAST;
                     else if (code == BTN_EAST)  code = BTN_SOUTH;
                 }
+                /* MiSTer's own core process exclusively grabs directly-wired
+                 * USB joysticks for FPGA/OSD routing (confirmed via
+                 * /proc/PID/fd: the "MiSTer" process holds the wired
+                 * SFC30's event node open, and no other reader ever sees
+                 * its raw events) so the virtual echo device is the ONLY
+                 * input path for a wired pad, meaning its confirm/cancel/
+                 * nav keys must stay trusted here. Action keys we bind
+                 * ourselves for a real keyboard (Space/Tab/PageUp/PageDown)
+                 * are still dropped from it — those aren't part of MiSTer's
+                 * own OSD table and only ever showed up as an arbitrary,
+                 * colliding echo. */
+                if (input_is_virtual[i] &&
+                    code != KEY_UP && code != KEY_DOWN &&
+                    code != KEY_LEFT && code != KEY_RIGHT &&
+                    code != KEY_ENTER && code != KEY_ESC && code != KEY_BACK) {
+                    continue;
+                }
                 switch (code) {
                 case BTN_EAST:               mask |= INP_A;      break;
                 case BTN_SOUTH:              mask |= INP_B;      break;
                 case KEY_ENTER:              mask |= INP_A;      break;
                 case KEY_ESC:
                 case KEY_BACK:               mask |= INP_B;      break;
-                case BTN_START: case KEY_PAUSE: mask |= INP_START;  break;
-                case BTN_SELECT:             mask |= INP_SELECT; break;
+                case BTN_START: case KEY_PAUSE: case KEY_HOME: mask |= INP_START;  break;
+                case BTN_SELECT: case KEY_TAB:  mask |= INP_SELECT; break;
                 case KEY_UP:                     mask |= INP_UP;    break;
                 case KEY_DOWN:                   mask |= INP_DOWN;  break;
                 case KEY_LEFT:                   mask |= INP_LEFT;  break;
                 case KEY_RIGHT:                  mask |= INP_RIGHT; break;
-                case BTN_TL:                     mask |= INP_L;     break;
-                case BTN_TR:                     mask |= INP_R;     break;
+                case BTN_TL: case KEY_PAGEUP:    mask |= INP_L;     break;
+                case BTN_TR: case KEY_PAGEDOWN:  mask |= INP_R;     break;
                 }
             } else if (ev.type == EV_ABS) {
                 if (ev.code == ABS_HAT0Y) {
@@ -470,6 +504,13 @@ static int    g_root_sel = 0;
  * own exit-confirm, added so a stray B press while browsing can't silently
  * quit the app. See the STATE_BROWSE input handling and draw_confirm_exit(). */
 static int    g_confirm_exit = 0;
+/* SELECT on the music library's artist list starts an infinite shuffle
+ * instead of drilling in — reuses g_items/g_item_count/g_audio_queue_pos
+ * exactly like a normal album's track list, just refilled with a fresh
+ * random batch (see jf_list_random_tracks) whenever it runs out instead of
+ * falling back to STATE_BROWSE. Cleared on stop, which also re-fetches the
+ * artist frame since g_items was overwritten with the shuffle batch. */
+static int    g_shuffle_mode = 0;
 /* Now-playing background effect, cycled by SELECT (see the
  * STATE_PLAYING_AUDIO input handling) — 0 = starfield, 1 = rain,
  * 2 = Toasty Squadron sprites (see draw_toasty). Persists for the whole
@@ -1834,8 +1875,11 @@ static void draw_browse(FBDev *fb)
                   fb->height - 8 - SAFE_Y_BOT, buf, 1, COL_HINT);
     }
 
-    const char *hint = (g_stack_depth > 1) ? "A:select  B:back" :
-                        "A:select  SELECT:cover view  B:exit";
+    int showing_artists = g_item_count > 0 && g_items[0].type == JF_TYPE_ARTIST;
+    const char *hint =
+        (g_stack_depth > 1 && showing_artists) ? "A:select  SELECT:shuffle library  B:back" :
+        (g_stack_depth > 1)                    ? "A:select  B:back" :
+                                                  "A:select  SELECT:cover view  B:exit";
     draw_text(fb, (fb->width - text_width(hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -1986,7 +2030,7 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
      * bar) so progress reads at a glance, not just from the numeric
      * label below — same bar/function for both video and audio. */
     if (mx > x0) fb_fill_rect_alpha(fb, x0, y, mx - x0, 2, 0xB8, 0xB8, 0xB8, 255);
-    if (x1 > mx) fb_fill_rect_alpha(fb, mx, y, x1 - mx, 2, 0x60, 0x60, 0x60, 255);
+    if (x1 > mx) fb_fill_rect_alpha(fb, mx, y, x1 - mx, 2, 0x30, 0x30, 0x30, 255);
     if (duration > 0)
         fb_fill_rect_alpha(fb, mx - 3, y - 4, 6, 10, 0xFF, 0xE0, 0x40, 255);
     char cur[16], tot[16], label[40];
@@ -2892,6 +2936,20 @@ static int run_preview_browse(int sel, int list_mode)
     return 0;
 }
 
+/* Restores whatever screen was behind the About overlay once it closes —
+ * previously this only handled STATE_BROWSE, so closing About from the info
+ * screen or the now-playing screen left the last About frame frozen on
+ * screen instead of actually going back. */
+static void redraw_current_screen(FBDev *fb, AppState state)
+{
+    switch (state) {
+    case STATE_BROWSE:       draw_browse(fb); break;
+    case STATE_INFO:         draw_info(fb); break;
+    case STATE_PLAYING_AUDIO: draw_now_playing(fb, &g_items[g_audio_queue_pos], play_position()); break;
+    default: break;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--capture-about") == 0)
@@ -2985,14 +3043,14 @@ int main(int argc, char **argv)
             last_about_press = loop_now;
             about_visible = !about_visible;
             if (about_visible) draw_about(&fb);
-            else if (state == STATE_BROWSE) draw_browse(&fb);
+            else redraw_current_screen(&fb, state);
             input_drain();
             continue;
         }
         if (about_visible) {
             if (inp & INP_B) {
                 about_visible = 0;
-                if (state == STATE_BROWSE) draw_browse(&fb);
+                redraw_current_screen(&fb, state);
             } else {
                 draw_about(&fb);   /* redraw every frame to pick up update state */
             }
@@ -3075,6 +3133,21 @@ int main(int argc, char **argv)
             if (at_root && (inp & INP_SELECT)) {
                 g_root_list_mode = !g_root_list_mode;
                 nav = 1;
+            }
+            /* SELECT on the music library's artist list starts an infinite
+             * shuffle across the whole library instead of drilling in. */
+            if (!at_root && (inp & INP_SELECT) &&
+                g_item_count > 0 && g_items[0].type == JF_TYPE_ARTIST) {
+                const char *lib_id = g_stack[g_stack_depth - 1].parent_id;
+                int n = jf_list_random_tracks(&g_cfg, lib_id, g_items, JF_MAX_ITEMS);
+                if (n > 0) {
+                    g_item_count  = n;
+                    g_shuffle_mode = 1;
+                    play_audio(&fb, 0);
+                    state = STATE_PLAYING_AUDIO;
+                }
+                input_drain();
+                continue;
             }
             /* Root library screen is the horizontal carousel (see
              * draw_browse_carousel) — LEFT/RIGHT move the active card
@@ -3262,6 +3335,21 @@ int main(int argc, char **argv)
                 if (g_audio_queue_pos + 1 < g_item_count &&
                     g_items[g_audio_queue_pos + 1].type == JF_TYPE_TRACK) {
                     play_audio(&fb, g_audio_queue_pos + 1);
+                } else if (g_shuffle_mode) {
+                    /* Ran out of the current random batch — fetch a fresh
+                     * one and keep going, forever, instead of stopping. */
+                    const char *lib_id = g_stack[g_stack_depth - 1].parent_id;
+                    int n = jf_list_random_tracks(&g_cfg, lib_id, g_items, JF_MAX_ITEMS);
+                    if (n > 0) {
+                        g_item_count = n;
+                        play_audio(&fb, 0);
+                    } else {
+                        g_shuffle_mode = 0;
+                        fetch_frame();
+                        state = STATE_BROWSE;
+                        draw_browse(&fb);
+                        break;
+                    }
                 } else {
                     state = STATE_BROWSE;
                     draw_browse(&fb);
@@ -3271,6 +3359,7 @@ int main(int argc, char **argv)
                 jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
                                    (int64_t)(play_position() * 10000000.0));
                 player_stop();
+                if (g_shuffle_mode) { g_shuffle_mode = 0; fetch_frame(); }
                 state = STATE_BROWSE;
                 draw_browse(&fb);
                 break;
