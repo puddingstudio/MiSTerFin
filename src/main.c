@@ -316,7 +316,19 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
 
 #define MAX_INPUT_FDS 8
 static int input_fds[MAX_INPUT_FDS];
+static int input_swap_ab[MAX_INPUT_FDS];
 static int input_count = 0;
+
+/* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
+ * report their printed A/B buttons as BTN_SOUTH/BTN_EAST swapped relative to
+ * the usual position-based convention (printed A -> BTN_SOUTH, printed B ->
+ * BTN_EAST) — the firmware enumerates buttons in legacy SNES ordinal order
+ * rather than by physical/compass position, unlike XInput-style pads. Swap
+ * them back per-device so A is always "confirm" and B is always "back". */
+static int device_needs_ab_swap(const char *name)
+{
+    return strstr(name, "SFC30") != NULL;
+}
 
 #define INP_UP     0x01
 #define INP_DOWN   0x02
@@ -328,10 +340,6 @@ static int input_count = 0;
 #define INP_SELECT 0x80
 #define INP_L      0x100
 #define INP_R      0x200
-
-#define EVBIT_WORDS  ((KEY_MAX) / (8 * sizeof(unsigned long)) + 1)
-#define test_evbit(arr, b) \
-    ((arr)[(b) / (8*sizeof(unsigned long))] >> ((b) % (8*sizeof(unsigned long))) & 1ul)
 
 static void input_open(void)
 {
@@ -345,12 +353,9 @@ static void input_open(void)
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
 
-        unsigned long keybits[EVBIT_WORDS] = {0};
-        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
-        int has_gamepad  = test_evbit(keybits, BTN_SOUTH) || test_evbit(keybits, BTN_EAST);
-        int has_keyboard = test_evbit(keybits, KEY_ENTER) && test_evbit(keybits, KEY_UP);
-        if (!has_gamepad && !has_keyboard) { close(fd); continue; }
-
+        char name[128] = "";
+        ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+        input_swap_ab[input_count] = device_needs_ab_swap(name);
         input_fds[input_count++] = fd;
     }
     closedir(d);
@@ -376,7 +381,12 @@ static int input_poll(void)
     for (int i = 0; i < input_count; i++) {
         while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
             if (ev.type == EV_KEY && ev.value == 1) {
-                switch (ev.code) {
+                int code = ev.code;
+                if (input_swap_ab[i]) {
+                    if      (code == BTN_SOUTH) code = BTN_EAST;
+                    else if (code == BTN_EAST)  code = BTN_SOUTH;
+                }
+                switch (code) {
                 case BTN_EAST:               mask |= INP_A;      break;
                 case BTN_SOUTH:              mask |= INP_B;      break;
                 case KEY_ENTER:              mask |= INP_A;      break;
