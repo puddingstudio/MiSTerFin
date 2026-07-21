@@ -111,6 +111,15 @@ void fb_clear(FBDev *fb)
 
 void fb_flip(FBDev *fb)
 {
+    /* Wait for vsync BEFORE the copy so the write lands in the blanking
+     * interval instead of racing the scan position — same fix already
+     * proven in MiSTer-Toasty-Squadron's fb_flip(). Without this, nothing
+     * in the whole UI (browse/info/pause/carousel/...) was gated on vsync
+     * at all — only mplayer's own separately-patched vo_fbdev had its own
+     * wait — so anything drawing multiple fb_flip()s in quick succession
+     * (the carousel's slide animation, in particular) tore visibly. */
+    uint32_t dummy = 0;
+    ioctl(fb->fd, FBIO_WAITFORVSYNC, &dummy);
     memcpy(fb->mem, fb->back, (size_t)fb->stride * fb->height);
 }
 
