@@ -134,8 +134,21 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
     json_str(item_buf, "Overview", it->overview, sizeof(it->overview));
     json_str(item_buf, "Primary", it->image_tag, sizeof(it->image_tag));
 
+    strncpy(it->image_item_id,    it->id, sizeof(it->image_item_id) - 1);
     strncpy(it->backdrop_item_id, it->id, sizeof(it->backdrop_item_id) - 1);
     strncpy(it->logo_item_id,     it->id, sizeof(it->logo_item_id) - 1);
+
+    /* A track with no embedded art of its own (ImageTags.Primary empty —
+     * common, plenty of files just don't have one) still has its album's
+     * cover available directly on its own DTO as AlbumId/
+     * AlbumPrimaryImageTag — confirmed on a real server (a Daft Punk album
+     * with no per-track embedded art: tracks showed no cover client-side
+     * until this fallback, other albums whose files DO have embedded art
+     * were unaffected). Same pattern as the Logo/Backdrop fallback below. */
+    if (!it->image_tag[0]) {
+        if (json_str(item_buf, "AlbumPrimaryImageTag", it->image_tag, sizeof(it->image_tag)))
+            json_str(item_buf, "AlbumId", it->image_item_id, sizeof(it->image_item_id));
+    }
 
     /* Episodes/seasons normally don't carry their own Logo/BackdropImageTags —
      * that art lives on the series, exposed via ParentLogoImageTag/
@@ -178,6 +191,10 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
         snprintf(it->year, sizeof(it->year), "%lld", (long long)year);
 
     json_int64(item_buf, "RunTimeTicks", &it->runtime_ticks);
+
+    int64_t child_count = 0;
+    if (json_int64(item_buf, "ChildCount", &child_count))
+        it->child_count = (int)child_count;
 
     int64_t idx_num;
     if (json_int64(item_buf, "IndexNumber", &idx_num))
@@ -477,10 +494,13 @@ int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int m
     char safe_parent[JF_ID_LEN];
     jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
 
+    /* ChildCount here (unlike on a top-level library view — see
+     * jf_count_items's comment) is exactly what it sounds like for a
+     * MusicAlbum: its own track count, confirmed against a real server. */
     char path[512];
     snprintf(path, sizeof(path),
         "/Items?userId=%s&ParentId=%s&SortBy=SortName&SortOrder=Ascending"
-        "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+        "&Fields=Overview,ProductionYear,RunTimeTicks,ChildCount&EnableUserData=true"
         "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
         cfg->user_id, safe_parent, max);
 

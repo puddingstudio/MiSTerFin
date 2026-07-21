@@ -46,7 +46,14 @@ typedef struct {
     char       id[JF_ID_LEN];
     char       name[JF_NAME_LEN];
     char       overview[JF_OVERVIEW_LEN];
-    char       image_tag[JF_ID_LEN];    /* ImageTags.Primary, empty if none */
+    char       image_tag[JF_ID_LEN];    /* ImageTags.Primary, falling back to
+                                          * AlbumPrimaryImageTag for a track that
+                                          * doesn't carry its own embedded art (which
+                                          * is normal — plenty of files have none, the
+                                          * album cover is still the right thing to
+                                          * show). Fetch from image_item_id, not id. */
+    char       image_item_id[JF_ID_LEN]; /* == id normally; == AlbumId when image_tag
+                                           * came from the AlbumPrimaryImageTag fallback */
     char       backdrop_tag[JF_ID_LEN]; /* BackdropImageTags[0], falling back to
                                           * ParentBackdropImageTags[0] for episodes/
                                           * seasons that don't carry their own (which
@@ -66,6 +73,9 @@ typedef struct {
                                        * library views only (jf_list_views), empty otherwise */
     JfItemType type;
     int64_t    runtime_ticks;          /* RunTimeTicks, 0 if unknown */
+    int        child_count;            /* ChildCount — track count for a MusicAlbum
+                                         * (jf_list_items only requests this field);
+                                         * 0/unset for every other item type. */
     int64_t    resume_ticks;           /* UserData.PlaybackPositionTicks */
     int        played;                 /* UserData.Played */
     int        index_number;           /* episode/season number, -1 if n/a */

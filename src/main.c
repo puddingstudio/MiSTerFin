@@ -432,6 +432,15 @@ static char   g_marquee_title[128] = "";  /* last title drawn — reset the offs
  * (3 small Limit=0 count requests for this user's library, one per view).
  * -1 = fetch failed, caller just omits the count line for that card. */
 static int64_t g_view_counts[JF_MAX_ITEMS];
+/* Episode count per row, parallel to g_items[], only meaningful for
+ * JF_TYPE_SERIES rows in a FRAME_ITEMS listing (a TV library's series
+ * list) — fetched alongside the listing itself in fetch_frame(). Season
+ * count needs no such array: it's it->child_count, already free on the
+ * same request (confirmed on a real server that a Series' ChildCount is
+ * its season count, unlike a top-level library view's — see
+ * jf_count_items's own comment for that distinction). -1 = fetch failed or
+ * not a series, caller omits the episode part of the line. */
+static int64_t g_series_episode_counts[JF_MAX_ITEMS];
 /* Root screen (FRAME_VIEWS) rendering mode — 0 = carousel (default),
  * 1 = classic list, toggled by SELECT (see the STATE_BROWSE input handling
  * below). Persists for the whole app session, not just this one visit to
@@ -620,6 +629,9 @@ static void fetch_frame(void)
         break;
     case FRAME_ITEMS:
         g_item_count = jf_list_items(&g_cfg, f->parent_id, g_items, JF_MAX_ITEMS);
+        for (int i = 0; i < g_item_count; i++)
+            g_series_episode_counts[i] = (g_items[i].type == JF_TYPE_SERIES)
+                ? jf_count_items(&g_cfg, g_items[i].id, "Episode") : -1;
         break;
     case FRAME_SEASONS:
         g_item_count = jf_list_seasons(&g_cfg, f->series_id, g_items, JF_MAX_ITEMS);
@@ -904,7 +916,7 @@ static void browse_cover_sync(void)
     g_browse_cover_w = g_browse_cover_h = 0;
     strncpy(g_browse_cover_item_id, it->id, sizeof(g_browse_cover_item_id) - 1);
 
-    if (jf_download_item_image(&g_cfg, it->id, "Primary", it->image_tag, 180, POSTER_TMP))
+    if (jf_download_item_image(&g_cfg, it->image_item_id, "Primary", it->image_tag, 180, POSTER_TMP))
         g_browse_cover_px = load_image_tmp(POSTER_TMP, &g_browse_cover_w, &g_browse_cover_h);
 }
 
@@ -981,25 +993,39 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
 
 /* Dimmed cover-art grid behind the carousel, tiling whatever the active
  * library actually contains — one library's worth of covers cached at a
- * time (not all libraries at once): a single-slot "skip if unchanged"
- * cache, same pattern as browse_cover_sync, since only the active one is
- * ever on screen. Uses its own JfItem buffer (grid_items in
+ * time — but keeps EVERY library's grid it has ever loaded cached in its
+ * own slot for the rest of the app session (not just the current one):
+ * flipping back to a previously-visited library was re-downloading and
+ * re-decoding its covers from scratch every single time otherwise (visible
+ * as a lag spike per switch), confirmed as the cause by the user. Bounded
+ * to GRID_LIB_CACHE_MAX slots — comfortably above any realistic number of
+ * Jellyfin libraries, and each slot is only a handful of small (100px-wide)
+ * decoded images, so the memory cost of never evicting is trivial on this
+ * platform's RAM. Uses its own JfItem buffer (grid_items in
  * grid_covers_sync), NOT g_items — that array is the carousel's own
  * selection list and must not be clobbered by this side listing. */
 #define GRID_FETCH_MAX 12
 #define GRID_COLS 8
 #define GRID_ROWS 4
 #define GRID_ALPHA 65   /* out of 255 — dimmed but covers should read clearly, per user feedback that 40 was too faint */
+#define GRID_LIB_CACHE_MAX 16
 
-static char     g_grid_view_id[JF_ID_LEN] = "";
-static uint8_t *g_grid_px[GRID_FETCH_MAX];
-static int      g_grid_w[GRID_FETCH_MAX], g_grid_h[GRID_FETCH_MAX];
-static int      g_grid_count = 0;
-/* Which cover (index into g_grid_px[]) each grid cell shows — shuffled once
- * per grid_covers_sync() reload, NOT per draw: draw_browse_carousel redraws
- * every ~100ms just for the clock/marquee tick even with no navigation, so
- * reshuffling per-draw would make the background visibly jitter. */
-static int      g_grid_cell_order[GRID_COLS * GRID_ROWS];
+typedef struct {
+    char     view_id[JF_ID_LEN];
+    uint8_t *px[GRID_FETCH_MAX];
+    int      w[GRID_FETCH_MAX], h[GRID_FETCH_MAX];
+    int      count;
+    /* Which cover (index into px[]) each grid cell shows — shuffled once
+     * when this slot is first filled, NOT per draw: draw_browse_carousel
+     * redraws every ~100ms just for the clock/marquee tick even with no
+     * navigation, so reshuffling per-draw would make the background
+     * visibly jitter. */
+    int      cell_order[GRID_COLS * GRID_ROWS];
+} GridLibCache;
+
+static GridLibCache g_grid_cache[GRID_LIB_CACHE_MAX];
+static int           g_grid_cache_n  = 0;    /* slots filled so far */
+static int           g_grid_active   = -1;   /* index of the currently-shown library's slot, -1 = none */
 
 /* A plain Fisher-Yates shuffle of the (count-cycled) index list still reads
  * as "repeating" with few unique covers spread over many cells (e.g. 4
@@ -1011,85 +1037,178 @@ static int      g_grid_cell_order[GRID_COLS * GRID_ROWS];
  * cheap and enough to kill the obvious adjacent-repeat look; only gives up
  * (accepting a repeat) when there aren't enough distinct covers to satisfy
  * both neighbors at once. */
-static void grid_cell_order_shuffle(void)
+static void grid_cell_order_shuffle(GridLibCache *gc)
 {
-    if (g_grid_count <= 0) {
-        for (int i = 0; i < GRID_COLS * GRID_ROWS; i++) g_grid_cell_order[i] = 0;
+    if (gc->count <= 0) {
+        for (int i = 0; i < GRID_COLS * GRID_ROWS; i++) gc->cell_order[i] = 0;
         return;
     }
     for (int row = 0; row < GRID_ROWS; row++) {
         for (int col = 0; col < GRID_COLS; col++) {
-            int left  = col > 0 ? g_grid_cell_order[row * GRID_COLS + col - 1] : -1;
-            int above = row > 0 ? g_grid_cell_order[(row - 1) * GRID_COLS + col] : -1;
+            int left  = col > 0 ? gc->cell_order[row * GRID_COLS + col - 1] : -1;
+            int above = row > 0 ? gc->cell_order[(row - 1) * GRID_COLS + col] : -1;
             int pick, tries = 0;
             do {
-                pick = rand() % g_grid_count;
-            } while (g_grid_count > 2 && (pick == left || pick == above) && ++tries < 8);
-            g_grid_cell_order[row * GRID_COLS + col] = pick;
+                pick = rand() % gc->count;
+            } while (gc->count > 2 && (pick == left || pick == above) && ++tries < 8);
+            gc->cell_order[row * GRID_COLS + col] = pick;
         }
     }
 }
 
-static void grid_covers_free(void)
-{
-    for (int i = 0; i < g_grid_count; i++)
-        if (g_grid_px[i]) { stbi_image_free(g_grid_px[i]); g_grid_px[i] = NULL; }
-    g_grid_count = 0;
-}
-
-/* Sequential downloads+decodes (up to GRID_FETCH_MAX), so this can take a
- * couple of seconds the first time a library becomes active — covered by
- * the corner spinner between steps, same as info_assets_load's own
- * sequential image fetches. Small request width (100px) keeps each JPEG
- * decode cheap since these only ever render at ~80x72 tile size anyway. */
+/* Sequential downloads+decodes (up to GRID_FETCH_MAX) the first time a
+ * given library is seen — covered by the corner spinner between steps,
+ * same as info_assets_load's own sequential image fetches. Small request
+ * width (100px) keeps each JPEG decode cheap since these only ever render
+ * at ~80x72 tile size anyway. Already-cached libraries return immediately
+ * (just a linear scan over however many are cached, at most
+ * GRID_LIB_CACHE_MAX — trivial). */
 static void grid_covers_sync(FBDev *fb, const JfItem *view)
 {
-    if (!strcmp(g_grid_view_id, view->id)) return;
+    for (int i = 0; i < g_grid_cache_n; i++) {
+        if (!strcmp(g_grid_cache[i].view_id, view->id)) { g_grid_active = i; return; }
+    }
+    if (g_grid_cache_n >= GRID_LIB_CACHE_MAX) { g_grid_active = -1; return; }
 
-    grid_covers_free();
-    strncpy(g_grid_view_id, view->id, sizeof(g_grid_view_id) - 1);
-    g_grid_view_id[sizeof(g_grid_view_id) - 1] = '\0';
+    GridLibCache *gc = &g_grid_cache[g_grid_cache_n];
+    memset(gc, 0, sizeof(*gc));
+    strncpy(gc->view_id, view->id, sizeof(gc->view_id) - 1);
 
     static JfItem grid_items[GRID_FETCH_MAX];
     const char *item_type = collection_item_type(view->collection_type);
     int n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
 
     int spinner_frame = 0;
-    for (int i = 0; i < n && g_grid_count < GRID_FETCH_MAX; i++) {
+    for (int i = 0; i < n && gc->count < GRID_FETCH_MAX; i++) {
         if (!grid_items[i].image_tag[0]) continue;
         draw_spinner_frame(fb, spinner_frame++); fb_flip(fb);
-        if (jf_download_item_image(&g_cfg, grid_items[i].id, "Primary",
+        if (jf_download_item_image(&g_cfg, grid_items[i].image_item_id, "Primary",
                                     grid_items[i].image_tag, 100, POSTER_TMP)) {
-            uint8_t *px = load_image_tmp(POSTER_TMP, &g_grid_w[g_grid_count], &g_grid_h[g_grid_count]);
-            if (px) g_grid_px[g_grid_count++] = px;
+            uint8_t *px = load_image_tmp(POSTER_TMP, &gc->w[gc->count], &gc->h[gc->count]);
+            if (px) gc->px[gc->count++] = px;
         }
     }
-    grid_cell_order_shuffle();
+    grid_cell_order_shuffle(gc);
+    g_grid_active = g_grid_cache_n++;
 }
 
 static void draw_grid_background(FBDev *fb)
 {
-    if (g_grid_count == 0) return;
+    if (g_grid_active < 0) return;
+    GridLibCache *gc = &g_grid_cache[g_grid_active];
+    if (gc->count == 0) return;
     int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
     for (int row = 0; row < GRID_ROWS; row++) {
         for (int col = 0; col < GRID_COLS; col++) {
-            int idx = g_grid_cell_order[row * GRID_COLS + col];
-            fb_blit(fb, g_grid_px[idx], g_grid_w[idx], g_grid_h[idx],
+            int idx = gc->cell_order[row * GRID_COLS + col];
+            fb_blit(fb, gc->px[idx], gc->w[idx], gc->h[idx],
                     col * cell_w, row * cell_h, cell_w, cell_h, GRID_ALPHA);
         }
+    }
+}
+
+/* Vertical black gradient over the cover grid, under everything else (top
+ * bar, cards, hint) — transparent at the top, solid at the bottom, per
+ * user request, so the grid stays visible near the top but doesn't fight
+ * with the hint text/cards lower down. */
+static void draw_grid_gradient(FBDev *fb)
+{
+    for (int y = 0; y < fb->height; y++) {
+        uint8_t a = (uint8_t)(255 * y / (fb->height - 1));
+        fb_fill_rect_alpha(fb, 0, y, fb->width, 1, 0, 0, 0, a);
     }
 }
 
 /* Root screen (g_stack_depth == 1, FRAME_VIEWS) — a horizontal carousel of
  * library cards instead of the regular list, since a handful of libraries
  * (movies/TV/music, ...) reads better as a few big blocks than as rows.
- * Only the active card plus its immediate left/right neighbors are drawn
- * (peeking in from the screen edges) rather than all N libraries at once —
- * scales to however many views the server has without the layout changing
- * shape, matching MiSTerDVD-style carousels. Snap navigation, no slide
- * animation: this chip has no headroom to spend on frame-timed easing that
- * the rest of the UI doesn't do either (see player_seek's own instant-cut
- * restart for the same reasoning applied elsewhere). */
+ * Every library gets a slot along the strip (see draw_carousel_cards);
+ * ones that don't fit on screen simply run off the edge and get clipped. */
+
+/* Spacing between card centers along the strip. */
+#define CAROUSEL_SPACING 150
+#define CAROUSEL_SLIDE_STEPS 6     /* LEFT/RIGHT slide — see carousel_slide_animate() */
+
+static int carousel_cy(FBDev *fb)
+{
+    int content_top = SAFE_Y + 24, content_bottom = fb->height - SAFE_Y_BOT - 28;
+    return (content_top + content_bottom) / 2;
+}
+
+/* Draws every library card positioned relative to a (possibly fractional)
+ * "visual selection" — an integer visual_sel is the normal at-rest layout;
+ * a fractional one (from carousel_slide_animate) slides the whole strip
+ * smoothly between two integer selections. The card nearest visual_sel
+ * gets the active (yellow) treatment. */
+static void draw_carousel_cards(FBDev *fb, double visual_sel, int cy)
+{
+    int center_cx = fb->width / 2;
+    int active_i = (int)(visual_sel + (visual_sel >= 0 ? 0.5 : -0.5));
+    for (int i = 0; i < g_item_count; i++) {
+        double rel = i - visual_sel;
+        int cx = center_cx + (int)(rel * CAROUSEL_SPACING);
+        if (cx < -CAROUSEL_CARD_W || cx > fb->width + CAROUSEL_CARD_W) continue;
+        if (i == active_i) continue;   /* drawn last, on top, in case of any overlap at tight spacing */
+        draw_library_card(fb, &g_items[i], g_view_counts[i], cx, cy, 0);
+    }
+    if (active_i >= 0 && active_i < g_item_count) {
+        int cx = center_cx + (int)((active_i - visual_sel) * CAROUSEL_SPACING);
+        draw_library_card(fb, &g_items[active_i], g_view_counts[active_i], cx, cy, 1);
+    }
+}
+
+static void draw_carousel_hint(FBDev *fb)
+{
+    const char *hint = "LEFT/RIGHT: browse   A:select   SELECT:list view   B:exit";
+    draw_text(fb, (fb->width - text_width(hint,1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+}
+
+/* Ease-out cubic — starts fast, decelerates into the resting position,
+ * instead of the linear (constant-speed, mechanical-looking) motion the
+ * first version of this had. */
+static double carousel_ease(double t)
+{
+    double inv = 1.0 - t;
+    return 1.0 - inv * inv * inv;
+}
+
+/* LEFT/RIGHT slide between old_sel and new_sel. Cards slide (eased) across
+ * the whole animation; the background grid fades to black at the midpoint
+ * and back in — which is also exactly when the grid is switched to the new
+ * library, hidden behind full black so a slow first-time fetch for an
+ * uncached library (grid_covers_sync's own download+decode pass) can't
+ * show up as a jump-cut. A blocking loop, same as spinner_show()'s — no
+ * manual delay beyond fb_flip()'s own vsync wait, which already paces this
+ * to the display's real refresh rate (an explicit sleep on top of that
+ * just made every step slower for no benefit, once fb_flip started
+ * waiting for vsync itself). */
+static void carousel_slide_animate(FBDev *fb, int old_sel, int new_sel)
+{
+    int cy = carousel_cy(fb);
+    int switched = 0;
+    for (int s = 1; s <= CAROUSEL_SLIDE_STEPS; s++) {
+        double t = (double)s / CAROUSEL_SLIDE_STEPS;
+        double visual = old_sel + (new_sel - old_sel) * carousel_ease(t);
+        double fade_t = (t <= 0.5) ? (t / 0.5) : (1.0 - (t - 0.5) / 0.5);
+        uint8_t black_alpha = (uint8_t)(255 * fade_t);
+
+        if (!switched && t >= 0.5) {
+            grid_covers_sync(fb, &g_items[new_sel]);
+            switched = 1;
+        }
+
+        fb_clear(fb);
+        draw_grid_background(fb);
+        fb_fill_rect_alpha(fb, 0, 0, fb->width, fb->height, 0, 0, 0, black_alpha);
+        draw_grid_gradient(fb);
+        draw_top_bar(fb, "MiSTerFin");
+        draw_carousel_cards(fb, visual, cy);
+        draw_carousel_hint(fb);
+        fb_flip(fb);
+    }
+}
+
 static void draw_browse_carousel(FBDev *fb)
 {
     if (g_item_count == 0) {
@@ -1105,21 +1224,11 @@ static void draw_browse_carousel(FBDev *fb)
 
     fb_clear(fb);
     draw_grid_background(fb);
+    draw_grid_gradient(fb);
     draw_top_bar(fb, "MiSTerFin");
 
-    int content_top = SAFE_Y + 24, content_bottom = fb->height - SAFE_Y_BOT - 28;
-    int cy = (content_top + content_bottom) / 2;
-    int center_cx = fb->width / 2;
-
-    if (g_sel > 0)
-        draw_library_card(fb, &g_items[g_sel - 1], g_view_counts[g_sel - 1], 90, cy, 0);
-    if (g_sel < g_item_count - 1)
-        draw_library_card(fb, &g_items[g_sel + 1], g_view_counts[g_sel + 1], fb->width - 90, cy, 0);
-    draw_library_card(fb, &g_items[g_sel], g_view_counts[g_sel], center_cx, cy, 1);
-
-    const char *hint = "LEFT/RIGHT: browse   A:select   SELECT:list view   B:exit";
-    draw_text(fb, (fb->width - text_width(hint,1))/2,
-              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+    draw_carousel_cards(fb, (double)g_sel, carousel_cy(fb));
+    draw_carousel_hint(fb);
 
     fb_flip(fb);
 }
@@ -1192,10 +1301,44 @@ static void draw_browse(FBDev *fb)
             snprintf(line1, sizeof(line1), "%s%s", type_folder_icon(it->type), it->name);
         truncate_to_width(line1, 1, row_max_w);
 
-        int has_line2 = (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE || it->type == JF_TYPE_TRACK);
+        /* Album: year + track count instead of a runtime — there's no
+         * single "duration" for a whole album. Track: just its own
+         * duration — no watched/resume state, which doesn't make sense for
+         * an individual song the way it does for a movie/episode. Movie/
+         * episode: unchanged runtime + watched/resume, per user request to
+         * leave those as they were. */
         char line2[64] = {0};
         uint8_t l2r = 0x58, l2g = 0x58, l2b = 0x58;
-        if (has_line2) {
+        if (it->type == JF_TYPE_ALBUM) {
+            if (it->year[0] && it->child_count > 0)
+                snprintf(line2, sizeof(line2), "%s - %d track%s",
+                         it->year, it->child_count, it->child_count == 1 ? "" : "s");
+            else if (it->year[0])
+                snprintf(line2, sizeof(line2), "%s", it->year);
+            else if (it->child_count > 0)
+                snprintf(line2, sizeof(line2), "%d track%s",
+                         it->child_count, it->child_count == 1 ? "" : "s");
+        } else if (it->type == JF_TYPE_TRACK) {
+            fmt_time(line2, sizeof(line2), (double)it->runtime_ticks / 10000000.0);
+        } else if (it->type == JF_TYPE_ARTIST) {
+            if (it->child_count > 0)
+                snprintf(line2, sizeof(line2), "%d album%s",
+                         it->child_count, it->child_count == 1 ? "" : "s");
+        } else if (it->type == JF_TYPE_SERIES) {
+            /* Season count is it->child_count — free on the same request,
+             * confirmed a Series' own ChildCount means exactly this (unlike
+             * a top-level library view's, see jf_count_items's comment).
+             * Episode count needs its own recursive query per series, done
+             * once in fetch_frame() and cached in g_series_episode_counts. */
+            int64_t ep = g_series_episode_counts[i];
+            if (it->child_count > 0 && ep > 0)
+                snprintf(line2, sizeof(line2), "%d season%s - %lld episode%s",
+                         it->child_count, it->child_count == 1 ? "" : "s",
+                         (long long)ep, ep == 1 ? "" : "s");
+            else if (it->child_count > 0)
+                snprintf(line2, sizeof(line2), "%d season%s",
+                         it->child_count, it->child_count == 1 ? "" : "s");
+        } else if (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE) {
             int minutes = (int)(it->runtime_ticks / 10000000LL / 60);
             if (it->played) {
                 snprintf(line2, sizeof(line2), "%d min - watched", minutes);
@@ -2065,7 +2208,7 @@ static void play_audio(FBDev *fb, int queue_pos)
         g_nowplaying_cover_w = g_nowplaying_cover_h = 0;
         strncpy(g_nowplaying_cover_item_id, it->id, sizeof(g_nowplaying_cover_item_id) - 1);
         if (it->image_tag[0] &&
-            jf_download_item_image(&g_cfg, it->id, "Primary", it->image_tag, 300, POSTER_TMP))
+            jf_download_item_image(&g_cfg, it->image_item_id, "Primary", it->image_tag, 300, POSTER_TMP))
             g_nowplaying_cover_px = load_image_tmp(POSTER_TMP, &g_nowplaying_cover_w, &g_nowplaying_cover_h);
     }
 }
@@ -2152,12 +2295,13 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     int cover_top = SAFE_Y;
     int cy = cover_top + cover_max / 2;
 
+    /* No placeholder box when there's genuinely no cover (track has no
+     * embedded art and no album fallback either, see JfItem.image_tag) —
+     * per user request, empty space reads better than a gray rectangle
+     * that looks like a broken image. */
     if (g_nowplaying_cover_px)
         blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
                            fb->width / 2, cy, cover_max, cover_max, 255);
-    else
-        fb_fill_rect_alpha(fb, fb->width / 2 - cover_max / 2, cover_top, cover_max, cover_max,
-                            0x18, 0x18, 0x18, 255);
 
     int16_t af_buf[4096];
     /* Don't read the export file while paused — decode has stopped, so it
@@ -2434,12 +2578,23 @@ int main(int argc, char **argv)
             }
             /* Root library screen is the horizontal carousel (see
              * draw_browse_carousel) — LEFT/RIGHT move the active card
-             * instead of the regular list's UP/DOWN. No scroll window to
-             * maintain: the carousel only ever draws g_sel and its two
-             * immediate neighbors. */
+             * instead of the regular list's UP/DOWN, with a slide (see
+             * carousel_slide_animate) bridging the two positions. The
+             * ordinary draw_browse() call below (nav=1) still runs
+             * afterwards — that's what actually switches the background
+             * grid to the new library, since the slide itself deliberately
+             * leaves the old one up throughout. */
             if (is_carousel) {
-                if (inp & INP_LEFT && g_sel > 0) { g_sel--; nav = 1; }
-                if (inp & INP_RIGHT && g_sel < g_item_count - 1) { g_sel++; nav = 1; }
+                if (inp & INP_LEFT && g_sel > 0) {
+                    int old_sel = g_sel--;
+                    carousel_slide_animate(&fb, old_sel, g_sel);
+                    nav = 1;
+                }
+                if (inp & INP_RIGHT && g_sel < g_item_count - 1) {
+                    int old_sel = g_sel++;
+                    carousel_slide_animate(&fb, old_sel, g_sel);
+                    nav = 1;
+                }
             } else {
                 if (inp & INP_UP && g_item_count > 0) {
                     if (g_sel > 0) g_sel--;
