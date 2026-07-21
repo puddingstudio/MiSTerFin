@@ -8,13 +8,13 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 
 ## Features
 
-- Home screen is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one
-- Browsing within a library (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season")
+- Home screen is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. Every library gets its own slot along the strip (extras simply run off-screen rather than being hidden), and LEFT/RIGHT slides between them with the background fading through black. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one
+- Browsing within a library (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - Info screen with cover art, description, year, and status
 - Server-side transcoded video playback with correct letterbox/pillarbox scaling for any source aspect ratio
 - Pause menu with a live progress bar, VSync ON/OFF toggle, resume/stop
 - Subtitles rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
-- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with cover art, a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), seek within a track, and prev/next-track navigation that auto-advances at the end of each track
+- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - Resume position and watched status read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
 - About screen with a GitHub-releases update check; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
