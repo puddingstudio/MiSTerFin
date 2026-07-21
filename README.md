@@ -120,45 +120,45 @@ There is no on-screen setup keyboard in v1 — edit the file over SSH (using the
 | Left / Right | Left / Right | Navigate the home screen's library carousel |
 | Up / Down | Up / Down | Navigate (home screen in list mode, or anywhere below it) |
 | SELECT | Tab | Home screen only: swap between the carousel and the classic list |
-| A | Enter | Open / drill in (library → series → season → episode, or library → artist → album → track) |
-| B | Esc / Backspace | Back (opens an exit-confirm dialog from the top-level library screen — B cancels, A confirms) |
+| A | Enter / X | Open / drill in (library → series → season → episode, or library → artist → album → track) |
+| B | Esc / Backspace / Z | Back (opens an exit-confirm dialog from the top-level library screen — B cancels, A confirms) |
 | START | Pause / Home | About screen |
 
 ### Info screen (movies/episodes)
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter | Play (resumes automatically if a resume position exists) |
+| A | Enter / X | Play (resumes automatically if a resume position exists) |
 | SELECT | Tab | Restart from the beginning (only shown if a resume position exists) |
-| B | Esc / Backspace | Back to browser |
+| B | Esc / Backspace / Z | Back to browser |
 
 ### During video playback
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter | Pause / resume |
+| A | Enter / X | Pause / resume |
 | Left / Right | Left / Right | Seek back/forward 30s (or adjust subtitle sync, in the subtitle menu) |
 | SELECT | Tab | Open the subtitle menu |
 | L | PageUp | VSync ON |
 | R | PageDown | VSync OFF |
-| B | Esc / Backspace | Stop, back to browser |
+| B | Esc / Backspace / Z | Stop, back to browser |
 
 ### Subtitle menu (SELECT during video playback)
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | Up / Down | Up / Down | Select subtitle track (or off) |
 | Left / Right | Left / Right | Adjust subtitle sync offset |
-| A | Enter | Apply |
-| B / SELECT | Esc / Backspace / Tab | Cancel |
+| A | Enter / X | Apply |
+| B / SELECT | Esc / Backspace / Z / Tab | Cancel |
 
 VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom.
 
 ### Now playing (music) — selecting a track plays it immediately, no separate info screen
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter | Pause / resume |
+| A | Enter / X | Pause / resume |
 | Left / Right | Left / Right | Seek back/forward 10s within the track |
 | Up / Down | Up / Down | Previous / next track in the current album/list |
 | SELECT | Tab | Cycle the background effect (starfield / rain / Toasty Squadron sprites) |
-| B | Esc / Backspace | Stop, back to browser |
+| B | Esc / Backspace / Z | Stop, back to browser |
 
 Reaching the end of a track auto-advances to the next one in the same list, same as any normal music player. Audio is direct-played, so seeking is a real in-place seek (no stop/restart the way video's seek needs).
 

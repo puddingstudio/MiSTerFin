@@ -423,9 +423,16 @@ static int input_poll(void)
                 switch (code) {
                 case BTN_EAST:               mask |= INP_A;      break;
                 case BTN_SOUTH:              mask |= INP_B;      break;
-                case KEY_ENTER:              mask |= INP_A;      break;
+                /* Enter/Esc are the intuitive confirm/cancel pair; X/Z are
+                 * the de facto SNES-emulator standard (RetroArch/SNES9x
+                 * default keyboard mapping) matching the SNES pad's A
+                 * (right) / B (bottom) positions — both work. */
+                case KEY_ENTER:
+                case KEY_X:                  mask |= INP_A;      break;
                 case KEY_ESC:
-                case KEY_BACK:               mask |= INP_B;      break;
+                case KEY_BACK:
+                case KEY_BACKSPACE:
+                case KEY_Z:                  mask |= INP_B;      break;
                 case BTN_START: case KEY_PAUSE: case KEY_HOME: mask |= INP_START;  break;
                 case BTN_SELECT: case KEY_TAB:  mask |= INP_SELECT; break;
                 case KEY_UP:                     mask |= INP_UP;    break;
