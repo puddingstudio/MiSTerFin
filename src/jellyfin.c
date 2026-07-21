@@ -425,10 +425,10 @@ int jf_config_load(JfConfig *cfg)
 int jf_resolve_user_id(JfConfig *cfg)
 {
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, "/Users", buf, sizeof(buf))) return 0;
+    if (!jf_get(cfg, "/Users", buf, sizeof(buf))) return -1;
 
     const char *p = strchr(buf, '[');
-    if (!p) return 0;
+    if (!p) return -1;
     p++;
 
     while (1) {

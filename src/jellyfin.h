@@ -110,8 +110,13 @@ int jf_config_load(JfConfig *cfg);
  * Jellyfin user id (a GUID) is not something a user can easily find in the
  * Jellyfin web UI (it only shows up in a dashboard URL) — a plain username
  * is what everyone actually knows, so the client resolves it instead of
- * asking for the id directly. Returns 1 on success (username found), 0
- * otherwise (typo, or user genuinely doesn't exist). */
+ * asking for the id directly.
+ * Returns 1 on success, 0 if the server answered but no user matched
+ * cfg->username (typo, or the user genuinely doesn't exist), or -1 if the
+ * request itself failed (server unreachable — wrong URL, server down,
+ * network issue) — distinct from 0 so the setup screen can tell "can't
+ * reach your server" apart from "server's fine, but check your config"
+ * instead of always blaming the config either way. */
 int jf_resolve_user_id(JfConfig *cfg);
 
 /* Top-level library views (Movies, TV Shows, ...). */

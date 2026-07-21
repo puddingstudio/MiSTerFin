@@ -1965,14 +1965,20 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
 {
     int x0 = SAFE_X, x1 = fb->width - SAFE_X;
     int barw = x1 - x0;
-    fb_fill_rect_alpha(fb, x0, y, barw, 2, 0x60, 0x60, 0x60, 255);
+    int mx = x0;
     if (duration > 0) {
         double frac = pos / duration;
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;
-        int mx = x0 + (int)(frac * barw);
-        fb_fill_rect_alpha(fb, mx - 3, y - 4, 6, 10, 0xFF, 0xE0, 0x40, 255);
+        mx = x0 + (int)(frac * barw);
     }
+    /* Elapsed side brighter than the remaining side (was one flat gray
+     * bar) so progress reads at a glance, not just from the numeric
+     * label below — same bar/function for both video and audio. */
+    if (mx > x0) fb_fill_rect_alpha(fb, x0, y, mx - x0, 2, 0xB8, 0xB8, 0xB8, 255);
+    if (x1 > mx) fb_fill_rect_alpha(fb, mx, y, x1 - mx, 2, 0x60, 0x60, 0x60, 255);
+    if (duration > 0)
+        fb_fill_rect_alpha(fb, mx - 3, y - 4, 6, 10, 0xFF, 0xE0, 0x40, 255);
     char cur[16], tot[16], label[40];
     fmt_time(cur, sizeof(cur), pos);
     fmt_time(tot, sizeof(tot), duration);
@@ -2862,7 +2868,7 @@ static int run_preview_browse(int sel, int list_mode)
     if (!fb.mem || !fb.back) { fprintf(stderr, "alloc failed\n"); return 1; }
 
     if (!jf_config_load(&g_cfg)) { fprintf(stderr, "jellyfin.conf not found\n"); return 1; }
-    if (!jf_resolve_user_id(&g_cfg)) { fprintf(stderr, "user resolve failed\n"); return 1; }
+    if (jf_resolve_user_id(&g_cfg) != 1) { fprintf(stderr, "user resolve failed\n"); return 1; }
 
     g_root_list_mode = list_mode;
     push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
@@ -2913,13 +2919,22 @@ int main(int argc, char **argv)
         state = STATE_CONFIG_ERROR;
         snprintf(g_setup_reason, sizeof(g_setup_reason), "jellyfin.conf not found or incomplete");
         draw_setup_screen(&fb, g_setup_reason);
-    } else if (!jf_resolve_user_id(&g_cfg)) {
-        state = STATE_CONFIG_ERROR;
-        snprintf(g_setup_reason, sizeof(g_setup_reason), "Username not found on server (check spelling)");
-        draw_setup_screen(&fb, g_setup_reason);
     } else {
-        state = STATE_BROWSE;
-        push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+        int resolved = jf_resolve_user_id(&g_cfg);
+        if (resolved == 1) {
+            state = STATE_BROWSE;
+            push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+        } else {
+            state = STATE_CONFIG_ERROR;
+            /* -1 = the request itself failed (server unreachable) — don't
+             * blame the config for that, it might be perfectly correct and
+             * the server's just down/wrong URL. 0 = server answered but no
+             * user matched, which really is a config problem. */
+            snprintf(g_setup_reason, sizeof(g_setup_reason),
+                     resolved == -1 ? "Can't connect to server (check server URL)"
+                                    : "Username not found on server (check spelling)");
+            draw_setup_screen(&fb, g_setup_reason);
+        }
     }
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu core
