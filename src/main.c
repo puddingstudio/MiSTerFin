@@ -13,6 +13,10 @@
 #include <linux/kd.h>
 #include <time.h>
 #include <pthread.h>
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include "fb.h"
 
 #ifndef APP_VERSION
@@ -456,6 +460,17 @@ static int    g_root_sel = 0;
  * own exit-confirm, added so a stray B press while browsing can't silently
  * quit the app. See the STATE_BROWSE input handling and draw_confirm_exit(). */
 static int    g_confirm_exit = 0;
+/* Now-playing background effect, cycled by SELECT (see the
+ * STATE_PLAYING_AUDIO input handling) — 0 = starfield, 1 = rain,
+ * 2 = Toasty Squadron sprites (see draw_toasty). Persists for the whole
+ * app session, same as g_root_list_mode. */
+#define NOW_PLAYING_BG_COUNT 3
+static int    g_now_playing_bg = 0;
+static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Toasty Squadron" };
+/* Label shows briefly on change then disappears, rather than sitting on
+ * screen permanently — set to now_sec()+1.5 wherever g_now_playing_bg
+ * changes (see the STATE_PLAYING_AUDIO SELECT handling), 0 = not shown. */
+static double g_now_playing_bg_shown_until = 0.0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
@@ -746,6 +761,412 @@ static void draw_starfield(FBDev *fb)
     }
 }
 
+/* Now-playing background effect #2 — simple falling rain/matrix-style
+ * drops, same cost class as the starfield above (one small struct array,
+ * a handful of fb_fill_rect_alpha calls per particle, no per-pixel loops).
+ * Each drop is a short 3-pixel streak (brightest at the leading/bottom
+ * edge, fading upward) rather than a single pixel, so it actually reads as
+ * "falling" instead of just scattered static dots. */
+#define RAIN_COUNT 60
+typedef struct { float x, y, speed; uint8_t bright; } RainDrop;
+static RainDrop g_rain[RAIN_COUNT];
+static int      g_rain_init = 0;
+
+static void rain_respawn(RainDrop *d, FBDev *fb, int initial)
+{
+    d->x     = (float)(rand() % fb->width);
+    d->y     = initial ? (float)(rand() % fb->height) : -4.0f;
+    d->speed = 1.5f + ((float)rand() / (float)RAND_MAX) * 2.5f;
+    d->bright = (uint8_t)(120 + rand() % 136);
+}
+
+static void draw_rain(FBDev *fb)
+{
+    if (!g_rain_init) {
+        g_rain_init = 1;
+        for (int i = 0; i < RAIN_COUNT; i++) rain_respawn(&g_rain[i], fb, 1);
+    }
+    for (int i = 0; i < RAIN_COUNT; i++) {
+        RainDrop *d = &g_rain[i];
+        d->y += d->speed;
+        if (d->y >= fb->height) rain_respawn(d, fb, 0);
+
+        int sx = (int)d->x, sy = (int)d->y;
+        uint8_t b = d->bright;
+        /* Soft blue-white tint (vs. the starfield's plain white) so the two
+         * effects read as distinct at a glance. */
+        fb_fill_rect_alpha(fb, sx, sy,     1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 255);
+        fb_fill_rect_alpha(fb, sx, sy - 2, 1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 140);
+        fb_fill_rect_alpha(fb, sx, sy - 4, 1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 70);
+    }
+}
+
+/* Now-playing background effect #3 — MiSTer-Toasty-Squadron's own flying
+ * toasters + moon, ported to match that project's actual screensaver
+ * behavior (fixed diagonal down-left flight, varied sizes, a floating
+ * sine-wave bob, a slow-drifting moon) rather than the generic random-
+ * direction drift this had at first — confirmed against that project's own
+ * sprite.c/anim.c/render.c/config.h for the exact movement math. Not a
+ * full port of its Scene/SpriteInst pool (no spawn-rate ramping, no
+ * mega-sprite overlap avoidance — this only ever runs a handful of
+ * sprites, so neither matters here), but the same flight path/size tiers.
+ * Lazily loads its frames on first use (same pattern as
+ * grid_covers_sync/browse_cover_sync), covered by the corner spinner while
+ * decoding since ~75 small PNGs + the moon takes a moment on this
+ * hardware. */
+#define TOASTY_SPEC_COUNT 15
+#define TOASTY_FRAMES_MAX 43
+static const struct { const char *dir; int frames; } TOASTY_SPECS[TOASTY_SPEC_COUNT] = {
+    { "asset1",  21 },
+    { "asset2",  32 },
+    { "asset3",  11 },
+    { "asset4",  32 },
+    { "asset5",   1 },
+    { "asset6",  43 },
+    { "asset7",  32 },
+    { "asset8",  23 },
+    { "asset9",  39 },
+    { "asset10", 33 },
+    { "asset11", 39 },
+    { "asset12", 39 },
+    { "asset13", 42 },
+    { "asset14", 18 },
+    { "asset15", 42 },
+};
+
+static uint8_t *g_toasty_px[TOASTY_SPEC_COUNT][TOASTY_FRAMES_MAX];
+static int      g_toasty_w[TOASTY_SPEC_COUNT][TOASTY_FRAMES_MAX];
+static int      g_toasty_h[TOASTY_SPEC_COUNT][TOASTY_FRAMES_MAX];
+static uint8_t *g_toasty_moon_px = NULL;
+static int      g_toasty_moon_w = 0, g_toasty_moon_h = 0;
+static int      g_toasty_loaded = 0;
+
+static void toasty_load(FBDev *fb)
+{
+    if (g_toasty_loaded) return;
+    g_toasty_loaded = 1;
+    int spinner_frame = 0;
+    for (int s = 0; s < TOASTY_SPEC_COUNT; s++) {
+        for (int i = 0; i < TOASTY_SPECS[s].frames; i++) {
+            char path[160];
+            snprintf(path, sizeof(path), "/media/fat/misterfin/toasty/%s/%s_%d.png",
+                      TOASTY_SPECS[s].dir, TOASTY_SPECS[s].dir, i + 1);
+            int ch;
+            g_toasty_px[s][i] = stbi_load(path, &g_toasty_w[s][i], &g_toasty_h[s][i], &ch, 4);
+            if ((i & 3) == 0) { draw_spinner_frame(fb, spinner_frame++); fb_flip(fb); }
+        }
+    }
+    int ch;
+    g_toasty_moon_px = stbi_load("/media/fat/misterfin/toasty/moon.png",
+                                  &g_toasty_moon_w, &g_toasty_moon_h, &ch, 4);
+}
+
+/* Toasty's own LAYER_CFG (config.h) — size in px, base flight speed and
+ * per-spawn variance in px/sec, and render alpha. Picked with the same
+ * weighting as that project's pick_layer(): small/far ones common, the
+ * biggest "mega" tier rare. */
+#define TOASTY_LAYER_COUNT 5
+static const struct { int size; float base_speed, speed_var, alpha; } TOASTY_LAYERS[TOASTY_LAYER_COUNT] = {
+    {  12, 10.0f,  2.0f, 0.20f },
+    {  22, 18.0f,  4.0f, 0.60f },
+    {  44, 28.0f,  6.0f, 1.00f },
+    {  72, 44.0f,  8.0f, 1.00f },
+    { 160, 72.0f, 14.0f, 1.00f },
+};
+
+static int toasty_pick_layer(void)
+{
+    float r = ((float)rand() / (float)RAND_MAX) * 100.0f;
+    if (r < 23.0f) return 0;
+    if (r < 45.0f) return 1;
+    if (r < 63.0f) return 2;
+    if (r < 88.0f) return 3;
+    return 4;
+}
+
+/* MAX_SPRITES/SPAWN_RAMP_TIME/SPAWN_MAX/SPAWN_MIN — Toasty's own config.h
+ * constants, verbatim. The pool starts empty and fills in at a rate that
+ * ramps from one spawn every SPAWN_MAX seconds up to one every SPAWN_MIN
+ * seconds over the first SPAWN_RAMP_TIME seconds (ease_inout_cubic,
+ * matching anim.c's update_spawn()), reaching all 70 well before that
+ * window closes. Everything here runs on real elapsed time (now_sec()
+ * deltas), NOT a fixed per-call tick — a first version of this guessed at
+ * a fixed tick-to-seconds scale and got the speed wrong; Toasty's own
+ * speeds are already calibrated in real px/sec, so real dt is the only
+ * way to actually match it exactly. */
+#define TOASTY_MAX_SPRITES 70
+#define TOASTY_SPAWN_RAMP_TIME 15.0
+#define TOASTY_SPAWN_MAX 0.25
+#define TOASTY_SPAWN_MIN 0.03
+#define TOASTY_FRAME_DURATION (1.0 / 12.0)   /* config.h's FRAME_DURATION */
+
+#define TOASTY_FLOAT_AMP_MIN 2.0f
+#define TOASTY_FLOAT_AMP_MAX 5.0f
+
+typedef struct {
+    int   spec, layer;
+    float x, y, vx, vy;
+    int   frame;
+    float frame_timer;
+    float float_phase, float_speed, float_amp;
+} ToastySprite;
+static ToastySprite g_toasty_sprites[TOASTY_MAX_SPRITES];
+static int          g_toasty_pool_size = 0;
+static double       g_toasty_anim_start = 0.0;
+static double       g_toasty_last_spawn = 0.0;
+static double       g_toasty_last_tick  = 0.0;
+static int          g_toasty_started = 0;
+
+/* deck_shuffle()/deck_pick(), verbatim — one shuffled deck of all
+ * TOASTY_SPEC_COUNT specs per layer, drawn from in order and reshuffled
+ * once exhausted, so every sprite type shows up before any repeats
+ * instead of a plain rand()%N occasionally clumping the same few. */
+static int g_toasty_deck[TOASTY_LAYER_COUNT][TOASTY_SPEC_COUNT];
+static int g_toasty_deck_idx[TOASTY_LAYER_COUNT];
+
+static void toasty_deck_shuffle(int layer)
+{
+    for (int i = 0; i < TOASTY_SPEC_COUNT; i++) g_toasty_deck[layer][i] = i;
+    for (int i = TOASTY_SPEC_COUNT - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = g_toasty_deck[layer][i];
+        g_toasty_deck[layer][i] = g_toasty_deck[layer][j];
+        g_toasty_deck[layer][j] = tmp;
+    }
+    g_toasty_deck_idx[layer] = 0;
+}
+
+static int toasty_deck_pick(int layer)
+{
+    if (g_toasty_deck_idx[layer] >= TOASTY_SPEC_COUNT) toasty_deck_shuffle(layer);
+    return g_toasty_deck[layer][g_toasty_deck_idx[layer]++];
+}
+
+/* At most one mega-tier sprite active at a time — with the full 70-sprite
+ * pool and a plain 12% per-spawn chance, 2-3 could otherwise end up
+ * flying at once and fill the screen (confirmed by the user on hardware).
+ * Toasty's own scene tolerates that at full density; this effect is meant
+ * to stay a background decoration behind the cover/title/timeline, so a
+ * spawn that rolls mega while one's already out gets bumped down to a
+ * random non-mega tier instead of respecting that roll. */
+static int toasty_mega_active(const ToastySprite *exclude)
+{
+    int mega_layer = TOASTY_LAYER_COUNT - 1;
+    for (int i = 0; i < g_toasty_pool_size; i++) {
+        if (&g_toasty_sprites[i] == exclude) continue;
+        if (g_toasty_sprites[i].layer == mega_layer) return 1;
+    }
+    return 0;
+}
+
+static void toasty_sprite_spawn(ToastySprite *t, FBDev *fb)
+{
+    t->layer = toasty_pick_layer();
+    if (t->layer == TOASTY_LAYER_COUNT - 1 && toasty_mega_active(t))
+        t->layer = rand() % (TOASTY_LAYER_COUNT - 1);
+    t->spec = toasty_deck_pick(t->layer);
+    int size = TOASTY_LAYERS[t->layer].size;
+
+    /* Always enters from the top edge or the right edge, off-screen —
+     * matches sprite_spawn()'s fromTop/fromRight split (simplified to a
+     * flat 60/40 rather than porting its full per-layer probability table
+     * and mega-overlap-avoidance retry loop, which exist there to keep a
+     * ~70-sprite scene from stacking same-layer mega sprites — a cosmetic
+     * refinement, not the actual flight path/speed this was about). */
+    float margin = (float)size;
+    if (((float)rand() / (float)RAND_MAX) < 0.6f) {
+        t->y = -margin - (float)(rand() % 60);
+        t->x = -margin + ((float)rand() / (float)RAND_MAX) * (fb->width + 2.0f * margin);
+    } else {
+        t->x = (float)fb->width + margin + (float)(rand() % 60);
+        t->y = -margin + ((float)rand() / (float)RAND_MAX) * (fb->height + 2.0f * margin);
+    }
+
+    /* Fixed ~45° down-left diagonal ± a few degrees of jitter, real px/sec
+     * — confirmed against sprite_spawn()'s own angle = pi/4 ± 3°, vx
+     * always negative, vy always positive, speed = LAYER_CFG's
+     * baseSpeed ± speedVar with NO additional scaling. */
+    float speed = TOASTY_LAYERS[t->layer].base_speed +
+                   (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f) * TOASTY_LAYERS[t->layer].speed_var;
+    float angle = (float)M_PI / 4.0f +
+                  (((float)rand() / (float)RAND_MAX) * 7.0f - 3.0f) * (float)M_PI / 180.0f;
+    t->vx = -fabsf(speed * cosf(angle));
+    t->vy =  fabsf(speed * sinf(angle));
+
+    t->frame = rand() % TOASTY_SPECS[t->spec].frames;
+    t->frame_timer = 0.0f;
+    t->float_phase = ((float)rand() / (float)RAND_MAX) * 360.0f;
+    t->float_speed = 20.0f + ((float)rand() / (float)RAND_MAX) * 40.0f;   /* deg/sec */
+    t->float_amp   = TOASTY_FLOAT_AMP_MIN +
+                      ((float)rand() / (float)RAND_MAX) * (TOASTY_FLOAT_AMP_MAX - TOASTY_FLOAT_AMP_MIN);
+}
+
+static float toasty_ease_inout_cubic(float t)
+{
+    if (t < 0.5f) return 4.0f * t * t * t;
+    float f = 2.0f * t - 2.0f;
+    return f * f * f * 0.5f + 1.0f;
+}
+
+/* update_spawn(), verbatim ramp math. */
+static void toasty_update_spawn(FBDev *fb, double now)
+{
+    if (g_toasty_pool_size >= TOASTY_MAX_SPRITES) return;
+    float progress = (float)((now - g_toasty_anim_start) / TOASTY_SPAWN_RAMP_TIME);
+    if (progress > 1.0f) progress = 1.0f;
+    float eased = toasty_ease_inout_cubic(progress);
+    double spawn_interval = TOASTY_SPAWN_MAX - eased * (TOASTY_SPAWN_MAX - TOASTY_SPAWN_MIN);
+    if ((now - g_toasty_last_spawn) >= spawn_interval) {
+        toasty_sprite_spawn(&g_toasty_sprites[g_toasty_pool_size], fb);
+        g_toasty_pool_size++;
+        g_toasty_last_spawn = now;
+    }
+}
+
+/* Single moon instance, drifting left-to-right (the one thing NOT flying
+ * down-left with the toasters) across a fixed 20%-60%-height band over
+ * MOON_DURATION real seconds one-way — verbatim update_moon(). */
+#define TOASTY_MOON_W 120
+#define TOASTY_MOON_H 72
+#define TOASTY_MOON_DURATION 120.0
+static float  g_toasty_moon_x = 0, g_toasty_moon_y = 0;
+static double g_toasty_moon_start = 0.0;
+static int    g_toasty_moon_pending_y = 1;
+static int    g_toasty_moon_on_screen = 0;
+
+static void toasty_update_moon(FBDev *fb, double now)
+{
+    if (!g_toasty_moon_px) return;
+    double elapsed = now - g_toasty_moon_start;
+    if (elapsed >= TOASTY_MOON_DURATION) {
+        g_toasty_moon_start = now;
+        g_toasty_moon_x = -(float)TOASTY_MOON_W;
+        g_toasty_moon_pending_y = 1;
+        g_toasty_moon_on_screen = 0;
+        elapsed = 0.0;
+    }
+    float progress = (float)(elapsed / TOASTY_MOON_DURATION);
+    float start_x = -(float)TOASTY_MOON_W, end_x = (float)fb->width;
+    g_toasty_moon_x = start_x + (end_x - start_x) * progress;
+
+    if (g_toasty_moon_pending_y) {
+        float min_y = fb->height * 0.20f, max_y = fb->height * 0.60f;
+        g_toasty_moon_y = min_y + ((float)rand() / (float)RAND_MAX) * (max_y - min_y);
+        g_toasty_moon_pending_y = 0;
+    }
+    g_toasty_moon_on_screen = (g_toasty_moon_x > -(float)TOASTY_MOON_W) && (g_toasty_moon_x < (float)fb->width);
+}
+
+static void toasty_sprite_draw(FBDev *fb, ToastySprite *t)
+{
+    uint8_t *px = g_toasty_px[t->spec][t->frame];
+    if (!px) return;
+    int size = TOASTY_LAYERS[t->layer].size;
+    int dw = size;
+    int dh = (int)(size * 0.6f);   /* PAL pixel-aspect correction, same factor
+                                     * as Toasty's own PIXEL_ASPECT_R */
+    int draw_y = (int)(t->y + sinf(t->float_phase * (float)M_PI / 180.0f) * t->float_amp);
+    uint8_t layer_alpha = (uint8_t)(TOASTY_LAYERS[t->layer].alpha * 255.0f);
+    fb_blit(fb, px, g_toasty_w[t->spec][t->frame], g_toasty_h[t->spec][t->frame],
+            (int)t->x, draw_y, dw, dh, layer_alpha);
+}
+
+/* Background pass: advances EVERY active sprite (all layers, including the
+ * mega tier — see draw_toasty_fg) and draws layers 0..TOASTY_LAYER_COUNT-2,
+ * plus the moon. Called before the rest of the now-playing screen's own
+ * UI. Smallest/farthest first so bigger "closer" sprites draw on top when
+ * paths cross, same visual ordering as Toasty's own per-layer
+ * render_bg() passes. */
+static void draw_toasty_bg(FBDev *fb)
+{
+    /* Loading (447+1 PNGs) is triggered explicitly from the SELECT handler
+     * that switches to this effect, not lazily here — doing it here meant
+     * the multi-second decode's own spinner-flip loop was the first thing
+     * to touch the framebuffer this tick, before the cover/title/timeline/
+     * VU meters/hint below got a chance to draw, i.e. a blank screen with
+     * just a spinner instead of the normal player UI staying up. Skipping
+     * rendering while not yet loaded just leaves the plain black
+     * fb_clear() background in place, which is exactly what was asked
+     * for. */
+    if (!g_toasty_loaded) return;
+    double now = now_sec();
+    if (!g_toasty_started) {
+        g_toasty_started = 1;
+        g_toasty_anim_start = now;
+        g_toasty_last_spawn = now;
+        g_toasty_last_tick  = now;
+        g_toasty_moon_start = now;
+        for (int l = 0; l < TOASTY_LAYER_COUNT; l++) toasty_deck_shuffle(l);
+    }
+    double dt = now - g_toasty_last_tick;
+    g_toasty_last_tick = now;
+    if (dt < 0.0 || dt > 0.25) dt = 0.0;   /* clamp a long pause/clock jump, not a real frame gap */
+
+    toasty_update_spawn(fb, now);
+    toasty_update_moon(fb, now);
+    if (g_toasty_moon_on_screen)
+        fb_blit(fb, g_toasty_moon_px, g_toasty_moon_w, g_toasty_moon_h,
+                (int)g_toasty_moon_x, (int)g_toasty_moon_y, TOASTY_MOON_W, TOASTY_MOON_H, 255);
+
+    for (int layer = 0; layer < TOASTY_LAYER_COUNT; layer++) {
+        for (int i = 0; i < g_toasty_pool_size; i++) {
+            ToastySprite *t = &g_toasty_sprites[i];
+            if (t->layer != layer) continue;
+
+            if (dt > 0.0) {
+                t->x += t->vx * (float)dt;
+                t->y += t->vy * (float)dt;
+                t->frame_timer += (float)dt;
+                if (t->frame_timer >= (float)TOASTY_FRAME_DURATION) {
+                    t->frame_timer -= (float)TOASTY_FRAME_DURATION;
+                    t->frame = (t->frame + 1) % TOASTY_SPECS[t->spec].frames;
+                }
+                t->float_phase += t->float_speed * (float)dt;
+                if (t->float_phase >= 360.0f) t->float_phase -= 360.0f;
+            }
+
+            int size = TOASTY_LAYERS[t->layer].size;
+            if (t->x < -(float)size || t->y > (float)fb->height + size)
+                toasty_sprite_spawn(t, fb);
+
+            /* Mega tier (last layer) flies OVER the cover/title/timeline/VU
+             * meters, same as Toasty's own render_fg() drawing layer 4 over
+             * its OSD — drawn separately by draw_toasty_fg(), after this
+             * screen's own UI, using the state just advanced above. */
+            if (layer == TOASTY_LAYER_COUNT - 1) continue;
+            toasty_sprite_draw(fb, t);
+        }
+    }
+}
+
+/* Foreground pass: draws only the mega-tier sprites, on top of whatever
+ * this screen has already drawn (cover art, title, timeline, VU meters,
+ * hint text) — call this right before fb_flip(). Does NOT re-advance
+ * position/frame/float state; draw_toasty_bg() already did that this
+ * tick for every layer. */
+static void draw_toasty_fg(FBDev *fb)
+{
+    int layer = TOASTY_LAYER_COUNT - 1;
+    for (int i = 0; i < g_toasty_pool_size; i++) {
+        ToastySprite *t = &g_toasty_sprites[i];
+        if (t->layer == layer) toasty_sprite_draw(fb, t);
+    }
+}
+
+/* Dims the now-playing screen from transparent at the top to solid black
+ * at the very bottom — sits between the background effect and this
+ * screen's own UI so a busy effect (Toasty's sprites, in particular)
+ * doesn't fight with the timeline/VU meters/hint text for contrast. Only
+ * used for that effect (see draw_now_playing) — starfield/rain are calm
+ * enough already without it. */
+static void draw_now_playing_gradient(FBDev *fb)
+{
+    for (int y = 0; y < fb->height; y++) {
+        uint8_t a = (uint8_t)(255 * y / (fb->height - 1));
+        fb_fill_rect_alpha(fb, 0, y, fb->width, 1, 0, 0, 0, a);
+    }
+}
+
 /* show_footer=0 skips the "<version> installed"/update-available line and
  * the "B: back" hint — used by the --capture-about tool to render a clean
  * frame for a standalone marketing GIF (see tools/capture_about_gif.py). */
@@ -933,7 +1354,11 @@ static void browse_cover_sync(void)
  * request. Character-clipped via draw_text_clipped so it never draws into
  * the clock/spinner area. Shared by both the root carousel and the regular
  * list browse — both need the same header. */
-static void draw_top_bar(FBDev *fb, const char *title)
+/* Right-aligned, stopping short of the spinner's reserved corner
+ * (SPINNER_SIZE+SPINNER_MARGIN) so a loading spinner never overlaps it.
+ * Returns the clock's own left edge x, so callers that also draw a title
+ * (draw_top_bar) know where they need to stop. */
+static int draw_clock(FBDev *fb)
 {
     time_t now_t = time(NULL);
     struct tm now_tm;
@@ -943,6 +1368,12 @@ static void draw_top_bar(FBDev *fb, const char *title)
     int clock_right = fb->width - SPINNER_SIZE - SPINNER_MARGIN - 8;
     int clock_x = clock_right - text_width(clock_buf, 1);
     draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, COL_HINT);
+    return clock_x;
+}
+
+static void draw_top_bar(FBDev *fb, const char *title)
+{
+    int clock_x = draw_clock(fb);
 
     int title_x0 = SAFE_X;
     int title_x1 = clock_x - 12;
@@ -2307,10 +2738,16 @@ static void draw_vu_horizontal(FBDev *fb, const int16_t *samples, int count,
 static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 {
     fb_clear(fb);
-    draw_starfield(fb);
+    if      (g_now_playing_bg == 1) draw_rain(fb);
+    else if (g_now_playing_bg == 2) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
+    else                            draw_starfield(fb);
 
+    draw_clock(fb);
+
+    if (now_sec() < g_now_playing_bg_shown_until)
+        draw_text(fb, SAFE_X, SAFE_Y, NOW_PLAYING_BG_NAMES[g_now_playing_bg], 1, COL_HINT);
     if (g_paused)
-        draw_text(fb, SAFE_X, SAFE_Y, "PAUSED", 1, COL_RESUME);
+        draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
 
     const int cover_max = 165;
     int cover_top = SAFE_Y;
@@ -2362,10 +2799,14 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     /* Hint line stays at the SAME height as every other screen's hint row
      * (fb->height - 8 - SAFE_Y_BOT) — everything above it got tightened/
      * moved up instead, per user feedback that this must stay consistent. */
-    const char *hint = g_paused ? "A:resume  L/R:seek  U/D:prev/next  B:stop"
-                                 : "A:pause  L/R:seek  U/D:prev/next  B:stop";
+    const char *hint = g_paused ? "A:resume  L/R:seek  U/D:prev/next  SELECT:bg  B:stop"
+                                 : "A:pause  L/R:seek  U/D:prev/next  SELECT:bg  B:stop";
     draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    /* Mega-tier Toasty sprites fly over everything above — see
+     * draw_toasty_fg()'s own comment. */
+    if (g_now_playing_bg == 2) draw_toasty_fg(fb);
 
     fb_flip(fb);
 }
@@ -2847,6 +3288,19 @@ int main(int argc, char **argv)
                 mp_cmd(cmd);
                 g_play_offset = target;
                 g_play_start_wall = now_sec();
+            } else if (inp & INP_SELECT) {
+                g_now_playing_bg = (g_now_playing_bg + 1) % NOW_PLAYING_BG_COUNT;
+                g_now_playing_bg_shown_until = now_sec() + 1.5;
+                if (g_now_playing_bg == 2 && !g_toasty_loaded) {
+                    /* Draw one full frame first — cover/title/timeline/VU/
+                     * hint all render normally, background stays plain
+                     * black since draw_toasty_bg() no-ops until loaded —
+                     * then toasty_load()'s own spinner-flip loop overlays
+                     * on top of that same frame while it decodes, instead
+                     * of the load being the first thing drawn this tick. */
+                    draw_now_playing(&fb, cur, play_position());
+                    toasty_load(&fb);
+                }
             } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
                 g_last_progress_report = loop_now;
                 jf_report_progress(&g_cfg, cur->id, g_play_session_id,

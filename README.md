@@ -8,15 +8,15 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 
 ## Features
 
-- Home screen is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. Every library gets its own slot along the strip (extras simply run off-screen rather than being hidden), and LEFT/RIGHT slides between them with the background fading through black. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one
-- Browsing within a library (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
-- Info screen with cover art, description, year, and status
-- Server-side transcoded video playback with correct letterbox/pillarbox scaling for any source aspect ratio
-- Pause menu with a live progress bar, VSync ON/OFF toggle, resume/stop
-- Subtitles rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
-- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), seek within a track, and prev/next-track navigation that auto-advances at the end of each track
-- Resume position and watched status read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
-- About screen with a GitHub-releases update check; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
+- **Home screen** is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. Every library gets its own slot along the strip (extras simply run off-screen rather than being hidden), and LEFT/RIGHT slides between them with the background fading through black. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one. B opens an exit-confirm dialog instead of quitting immediately, so a stray press can't silently close the app
+- **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
+- **Info screen** with cover art, description, year, and status
+- **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
+- **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
+- **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
+- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art) — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
+- **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
+- **About screen** with a GitHub-releases update check; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
 ## Scope (v1)
 
@@ -58,7 +58,7 @@ make arm
 make deploy
 ```
 
-`make deploy` copies `misterfin-arm`, `mplayer-arm`, `assets/font/`, `assets/subfont/`, `assets/about.png`, and the launcher script to the right places on the MiSTer — see the `deploy` target in `Makefile` if you want to do it manually instead.
+`make deploy` copies `misterfin-arm`, `mplayer-arm`, `assets/font/`, `assets/subfont/`, `assets/toasty/`, `assets/about.png`, and the launcher script to the right places on the MiSTer — see the `deploy` target in `Makefile` if you want to do it manually instead.
 
 `make deploy` targets `mister.local` by default. This works as-is if your MiSTer is visible under that hostname on your network (its stock image advertises itself via mDNS) and you haven't changed the default `root` login. If `mister.local` doesn't resolve for you, override it with your MiSTer's IP instead: `make deploy MISTER_HOST=192.168.x.x`.
 
@@ -75,6 +75,7 @@ If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enab
    mplayer-arm
    font/
    subfont/
+   toasty/
    about.png
    jellyfin.conf      (see below)
    ```
@@ -120,7 +121,7 @@ There is no on-screen setup keyboard in v1 — edit the file over SSH (using the
 | Up / Down | Navigate (home screen in list mode, or anywhere below it) |
 | SELECT | Home screen only: swap between the carousel and the classic list |
 | A | Open / drill in (library → series → season → episode, or library → artist → album → track) |
-| B | Back (exits the app from the top-level library screen) |
+| B | Back (opens an exit-confirm dialog from the top-level library screen — B cancels, A confirms) |
 | START | About screen |
 
 ### Info screen (movies/episodes)
@@ -156,6 +157,7 @@ VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing
 | A | Pause / resume |
 | Left / Right | Seek back/forward 10s within the track |
 | Up / Down | Previous / next track in the current album/list |
+| SELECT | Cycle the background effect (starfield / rain / Toasty Squadron sprites) |
 | B | Stop, back to browser |
 
 Reaching the end of a track auto-advances to the next one in the same list, same as any normal music player. Audio is direct-played, so seeking is a real in-place seek (no stop/restart the way video's seek needs).

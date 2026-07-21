@@ -49,6 +49,13 @@ deploy: arm
 			root@$(MISTER_HOST):/media/fat/misterfin/subfont/; \
 		echo "subfont deployed"; \
 	fi
+	@if [ -d assets/toasty ]; then \
+		sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
+			"mkdir -p /media/fat/misterfin/toasty"; \
+		sshpass -p "1" scp -r -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
+			assets/toasty/. root@$(MISTER_HOST):/media/fat/misterfin/toasty/; \
+		echo "toasty sprites deployed"; \
+	fi
 	@if [ -f assets/about.png ]; then \
 		sshpass -p "1" scp -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
 			assets/about.png root@$(MISTER_HOST):/media/fat/misterfin/about.png; \
