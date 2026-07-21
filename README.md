@@ -185,4 +185,4 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 | <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio |
-|:---:|:---:|
+|:---:|:---|
