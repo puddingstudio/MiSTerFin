@@ -181,3 +181,8 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ## Licence
 
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, share, and modify, non-commercial only.
+
+---
+
+| <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio | <a href="https://grujicic.com"><img src=".github/images/nenad.png" width="100"></a> |
+|:---:|:---:|:---:|
