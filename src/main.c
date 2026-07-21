@@ -451,6 +451,11 @@ static int    g_root_list_mode = 0;
  * to the first library. Kept up to date by the STATE_BROWSE input handling
  * whenever g_sel changes while at the root. */
 static int    g_root_sel = 0;
+/* B at the root browse screen opens this instead of exiting immediately —
+ * same "B opens, B cancels, A confirms" behavior as MiSTer-Toasty-Squadron's
+ * own exit-confirm, added so a stray B press while browsing can't silently
+ * quit the app. See the STATE_BROWSE input handling and draw_confirm_exit(). */
+static int    g_confirm_exit = 0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
@@ -955,6 +960,22 @@ static void draw_top_bar(FBDev *fb, const char *title)
         draw_text_clipped(fb, title_x0 - off, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
         draw_text_clipped(fb, title_x0 - off + period, SAFE_Y, title, 2, COL_TITLE, title_x0, title_x1);
     }
+}
+
+/* Drawn on top of whatever's already on screen (see the STATE_BROWSE input
+ * handling) — doesn't clear or redraw the browse screen underneath itself,
+ * same layering as the subtitle submenu's own overlay. */
+static void draw_confirm_exit(FBDev *fb)
+{
+    const char *msg = "Exit? [A: yes  B: no]";
+    int scale = 2;
+    int tw = text_width(msg, scale);
+    int th = 8 * scale;
+    int cx = (fb->width - tw) / 2;
+    int cy = (fb->height - th) / 2;
+    fb_fill_rect_alpha(fb, cx - 12, cy - 12, tw + 24, th + 24, 0, 0, 0, 210);
+    draw_text(fb, cx, cy, msg, scale, COL_TITLE);
+    fb_flip(fb);
 }
 
 /* One card in the root library carousel — plain text, no icon/container per
@@ -2565,8 +2586,21 @@ int main(int argc, char **argv)
             int nav = 0;
             int at_root      = (g_stack[g_stack_depth - 1].kind == FRAME_VIEWS);
             int is_carousel  = at_root && !g_root_list_mode;
+
+            if (g_confirm_exit) {
+                /* Dialog eats all other input while open. */
+                if (inp & INP_A) { g_running = 0; break; }
+                if (inp & INP_B) { g_confirm_exit = 0; draw_browse(&fb); input_drain(); }
+                break;
+            }
             if (inp & INP_B) {
-                if (!pop_frame()) { g_running = 0; break; }
+                if (!pop_frame()) {
+                    g_confirm_exit = 1;
+                    draw_browse(&fb);
+                    draw_confirm_exit(&fb);
+                    input_drain();
+                    break;
+                }
                 nav = 1;
             }
             /* SELECT swaps the root screen between the carousel and the
