@@ -4,6 +4,7 @@ FROM debian:bullseye
 RUN dpkg --add-architecture armhf
 
 RUN apt-get update && apt-get install -y \
+    build-essential \
     gcc-arm-linux-gnueabihf \
     libc6-dev-armhf-cross \
     binutils-arm-linux-gnueabihf \
