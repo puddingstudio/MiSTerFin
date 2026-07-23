@@ -97,7 +97,7 @@ If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enab
 Create `/media/fat/misterfin/jellyfin.conf` — 4 lines (see `jellyfin.conf.example`):
 
 ```
-http://192.168.2.10:8096
+http://<your-jellyfin-ip>:8096
 your-api-key-here
 your-username-here
 PAL
