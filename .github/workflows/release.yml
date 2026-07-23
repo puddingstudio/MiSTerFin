@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> $GITHUB_PATH
+
+      - name: Build ARM binary
+        run: make arm VERSION=${{ github.ref_name }}
+
+      - name: Build mplayer-arm (Docker)
+        run: |
+          cd docker
+          docker build -t misterfin-mplayer .
+          docker run --name misterfin-mplayer-build misterfin-mplayer
+          docker cp misterfin-mplayer-build:/build/mplayer-arm ../mplayer-arm
+          docker rm misterfin-mplayer-build
+
+      - name: Package release
+        run: |
+          mkdir -p release/misterfin
+          cp misterfin-arm release/misterfin/
+          cp mplayer-arm release/misterfin/
+          cp tools/MiSTerFin.sh release/misterfin/
+          cp jellyfin.conf.example release/misterfin/
+          cp -r assets/font release/misterfin/font
+          cp -r assets/subfont release/misterfin/subfont
+          cp -r assets/toasty release/misterfin/toasty
+          cp assets/about.png release/misterfin/
+          chmod +x release/misterfin/misterfin-arm
+          chmod +x release/misterfin/mplayer-arm
+          chmod +x release/misterfin/MiSTerFin.sh
+          cd release
+          zip -r ../misterfin-${{ github.ref_name }}.zip misterfin/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: misterfin-${{ github.ref_name }}.zip

@@ -16,7 +16,7 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
 - **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art) — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
-- **About screen** with a GitHub-releases update check; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
+- **About screen** with a GitHub-releases update check and one-button in-app update (A installs, applied on next launch); the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
 ## Scope (v1)
 
@@ -32,7 +32,7 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 - A reachable Jellyfin server + an API key
 - `curl` on the MiSTer (included in the standard MiSTer Linux image)
 
-There is no prebuilt release yet — see **Building from Source** below. Everything needed to run MiSTerFin (including its own `mplayer-arm`) is built from this repo; you don't need a separate mplayer install or any other MiSTer app already set up.
+Grab the latest release zip from the [Releases](../../releases) page and skip straight to **Installation** below, or build from source if you'd rather. Everything needed to run MiSTerFin (including its own `mplayer-arm`) is built from this repo either way; you don't need a separate mplayer install or any other MiSTer app already set up.
 
 Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbdev:/dev/fb0`) and works on any menu core.
 
@@ -40,7 +40,7 @@ Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbd
 
 ## Building from Source
 
-Requires [Zig](https://ziglang.org) (for ARM cross-compilation of the app itself) and [Docker](https://www.docker.com) (only for building `mplayer-arm`, MiSTerFin's own fbdev-patched mplayer — a one-time step, not needed again unless you want to rebuild it).
+Requires [Zig](https://ziglang.org) (for ARM cross-compilation of the app itself), [Docker](https://www.docker.com) (only for building `mplayer-arm`, MiSTerFin's own fbdev-patched mplayer — a one-time step, not needed again unless you want to rebuild it), and `sshpass` (only for `make deploy`, which copies everything over SSH — skip it and copy files manually if you don't want it installed).
 
 ```bash
 # 1. Build mplayer-arm (one-time; needs Docker)
@@ -68,7 +68,7 @@ If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enab
 
 ## Installation
 
-1. Copy these files to `/media/fat/misterfin/` on your MiSTer:
+1. Copy these files (from a downloaded release zip, or your own build) to `/media/fat/misterfin/` on your MiSTer:
 
    ```
    misterfin-arm
@@ -123,6 +123,12 @@ There is no on-screen setup keyboard in v1 — edit the file over SSH (using the
 | A | Enter / X | Open / drill in (library → series → season → episode, or library → artist → album → track) |
 | B | Esc / Backspace / Z | Back (opens an exit-confirm dialog from the top-level library screen — B cancels, A confirms) |
 | START | Pause / Home | About screen |
+
+### About screen (START)
+| Button | Keyboard | Action |
+|--------|----------|--------|
+| A | Enter / X | Install the update, if one's available (applied on next launch) |
+| B | Esc / Backspace / Z | Back |
 
 ### Info screen (movies/episodes)
 | Button | Keyboard | Action |

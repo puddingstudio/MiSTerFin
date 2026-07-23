@@ -23,7 +23,6 @@
 #define APP_VERSION "dev"
 #endif
 #include "font8x8.h"
-#include "font_vcr16x16.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include "ddr.h"
@@ -160,6 +159,78 @@ fail:
     return NULL;
 }
 
+/* ── Install ──────────────────────────────────────────────────────────────── */
+
+typedef enum { INST_IDLE, INST_DOWNLOADING, INST_DONE, INST_FAILED } InstallState;
+
+static InstallState    g_inst_state = INST_IDLE;
+static pthread_mutex_t g_inst_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void set_inst(InstallState s)
+{
+    pthread_mutex_lock(&g_inst_mutex);
+    g_inst_state = s;
+    pthread_mutex_unlock(&g_inst_mutex);
+}
+
+/* Downloads the tagged release zip, copies assets in place immediately
+ * (safe while running), and writes an apply-update script for
+ * MiSTerFin.sh to run on the NEXT launch — the running binary/mplayer-arm
+ * can't safely overwrite themselves (ETXTBSY) while still executing. */
+static void *install_thread(void *arg)
+{
+    (void)arg;
+
+    pthread_mutex_lock(&g_upd_mutex);
+    char tag[32];
+    strncpy(tag, g_upd_latest, sizeof(tag) - 1);
+    tag[sizeof(tag) - 1] = '\0';
+    pthread_mutex_unlock(&g_upd_mutex);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "curl -Lsk --max-time 120 "
+        "https://github.com/puddingstudio/MiSTerFin/releases/download/%s/misterfin-%s.zip "
+        "-o /tmp/misterfin-update.zip 2>/dev/null",
+        tag, tag);
+    if (system(cmd) != 0) { set_inst(INST_FAILED); return NULL; }
+
+    system("rm -rf /tmp/misterfin-update/");
+    if (system("unzip -q -o /tmp/misterfin-update.zip -d /tmp/misterfin-update/ 2>/dev/null") != 0)
+        { set_inst(INST_FAILED); return NULL; }
+
+    system("cp -r /tmp/misterfin-update/misterfin/font/.    /media/fat/misterfin/font/    2>/dev/null");
+    system("cp -r /tmp/misterfin-update/misterfin/subfont/. /media/fat/misterfin/subfont/ 2>/dev/null");
+    system("cp -r /tmp/misterfin-update/misterfin/toasty/.  /media/fat/misterfin/toasty/  2>/dev/null");
+    system("cp    /tmp/misterfin-update/misterfin/about.png /media/fat/misterfin/about.png 2>/dev/null");
+
+    FILE *f = fopen("/tmp/misterfin_apply_update.sh", "w");
+    if (f) {
+        fprintf(f, "#!/bin/bash\n");
+        fprintf(f, "cp /tmp/misterfin-update/misterfin/misterfin-arm /media/fat/misterfin/misterfin-arm\n");
+        fprintf(f, "cp /tmp/misterfin-update/misterfin/mplayer-arm   /media/fat/misterfin/mplayer-arm\n");
+        fprintf(f, "chmod +x /media/fat/misterfin/misterfin-arm /media/fat/misterfin/mplayer-arm\n");
+        fprintf(f, "rm -rf /tmp/misterfin-update/ /tmp/misterfin-update.zip\n");
+        fclose(f);
+        chmod("/tmp/misterfin_apply_update.sh", 0755);
+    }
+
+    set_inst(INST_DONE);
+    return NULL;
+}
+
+static void about_start_install(void)
+{
+    pthread_mutex_lock(&g_inst_mutex);
+    if (g_inst_state != INST_IDLE) { pthread_mutex_unlock(&g_inst_mutex); return; }
+    g_inst_state = INST_DOWNLOADING;
+    pthread_mutex_unlock(&g_inst_mutex);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, install_thread, NULL);
+    pthread_detach(tid);
+}
+
 static void cursor_hide(void)
 {
     const char *ttys[] = { "/dev/tty0", "/dev/tty1", "/dev/tty", "/dev/console", NULL };
@@ -208,27 +279,9 @@ static void fmt_time(char *buf, size_t sz, double secs)
 
 /* ── text rendering ──────────────────────────────────────────────────────── */
 
-/* VCR OSD Mono (see tools/rasterize_vcr_font.c) rendered natively at 16x16
- * for scale=2 text — tried and, on user comparison against the original
- * hand-drawn font8x8_basic (blown up 2x), the original was preferred. Kept
- * disabled rather than deleted in case it's wanted later — flip this to 1
- * to re-enable, no other code changes needed. */
-#define UI_USE_VCR_FONT 0
-
 static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
-    if (UI_USE_VCR_FONT && scale == 2) {
-        unsigned char cc = (c < 0x20 || c > 0x7E) ? '?' : c;
-        const uint8_t (*glyph16)[16] = font_vcr16x16[cc - 0x20];
-        for (int row = 0; row < 16; row++)
-            for (int col = 0; col < 16; col++) {
-                uint8_t a = glyph16[row][col];
-                if (a) fb_fill_rect_alpha(fb, x + col, y + row, 1, 1, r, g, b, a);
-            }
-        return;
-    }
-
     if (c >= 128) c = '?';
     const uint8_t *glyph = font8x8_basic[c];
     for (int row = 0; row < 8; row++) {
@@ -315,10 +368,11 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
 /* ── input (evdev gamepad, same model as MiSTerDVD) ─────────────────────── */
 
 #define MAX_INPUT_FDS 8
-static int input_fds[MAX_INPUT_FDS];
-static int input_swap_ab[MAX_INPUT_FDS];
-static int input_is_virtual[MAX_INPUT_FDS];
-static int input_count = 0;
+static int  input_fds[MAX_INPUT_FDS];
+static int  input_swap_ab[MAX_INPUT_FDS];
+static int  input_is_virtual[MAX_INPUT_FDS];
+static char input_names[MAX_INPUT_FDS][32];   /* e.g. "event0" — see input_open() */
+static int  input_count = 0;
 
 /* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
  * report their printed A/B buttons as BTN_SOUTH/BTN_EAST swapped relative to
@@ -357,6 +411,10 @@ static int device_is_mister_virtual(const char *name)
 #define INP_L      0x100
 #define INP_R      0x200
 
+/* Safe to call repeatedly (see the periodic re-scan in the main loop) —
+ * skips any /dev/input/eventN already tracked, only opening ones that are
+ * new since the last call (a reconnected wireless pad, for example, can
+ * come back as a fresh node with a different number). */
 static void input_open(void)
 {
     DIR *d = opendir("/dev/input");
@@ -364,6 +422,12 @@ static void input_open(void)
     struct dirent *e;
     while ((e = readdir(d)) && input_count < MAX_INPUT_FDS) {
         if (strncmp(e->d_name, "event", 5)) continue;
+
+        int already = 0;
+        for (int i = 0; i < input_count; i++)
+            if (!strcmp(input_names[i], e->d_name)) { already = 1; break; }
+        if (already) continue;
+
         char path[64];
         snprintf(path, sizeof(path), "/dev/input/%s", e->d_name);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
@@ -373,6 +437,7 @@ static void input_open(void)
         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
         input_swap_ab[input_count]    = device_needs_ab_swap(name);
         input_is_virtual[input_count] = device_is_mister_virtual(name);
+        strncpy(input_names[input_count], e->d_name, sizeof(input_names[0]) - 1);
         input_fds[input_count++] = fd;
     }
     closedir(d);
@@ -1283,16 +1348,35 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         latest[sizeof(latest) - 1] = '\0';
         pthread_mutex_unlock(&g_upd_mutex);
 
+        pthread_mutex_lock(&g_inst_mutex);
+        InstallState is = g_inst_state;
+        pthread_mutex_unlock(&g_inst_mutex);
+
         /* Same bottom margin as everything else now (SAFE_Y_BOT == SAFE_Y) —
          * not the taller margin MiSTerDVD's own about screen used. */
         int safe_y = fb->height - 8 - SAFE_Y_BOT;
         char installed[48];
         snprintf(installed, sizeof(installed), "%s installed", APP_VERSION);
-        if (us == UPD_AVAILABLE) {
+
+        if (is == INST_DOWNLOADING) {
+            static int dot_frame = 0;
+            dot_frame++;
+            const char *dots = (dot_frame / 20 % 3 == 0) ? "." : (dot_frame / 20 % 3 == 1) ? ".." : "...";
+            char dl[48];
+            snprintf(dl, sizeof(dl), "downloading %s", dots);
+            draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
+            draw_text(fb, SAFE_X, safe_y, dl, 1, 80, 180, 80);
+        } else if (is == INST_DONE) {
+            draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
+            draw_text(fb, SAFE_X, safe_y, "update installed   restart app to apply", 1, 80, 180, 80);
+        } else if (is == INST_FAILED) {
+            draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
+            draw_text(fb, SAFE_X, safe_y, "download failed", 1, 200, 60, 60);
+        } else if (us == UPD_AVAILABLE) {
             draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
             char upd[64];
-            snprintf(upd, sizeof(upd), "%s available", latest);
-            draw_text(fb, SAFE_X, safe_y, upd, 1, COL_RESUME);
+            snprintf(upd, sizeof(upd), "%s available   A: install", latest);
+            draw_text(fb, SAFE_X, safe_y, upd, 1, 220, 150, 40);
         } else {
             draw_text(fb, SAFE_X, safe_y, installed, 1, COL_DIM);
         }
@@ -3040,9 +3124,22 @@ int main(int argc, char **argv)
     double last_about_press = 0.0;
     if (state == STATE_BROWSE) draw_browse(&fb);
 
+    double last_input_rescan = 0.0;
     while (g_running) {
         int inp = input_poll();
         double loop_now = now_sec();
+
+        /* Re-scan /dev/input every few seconds — a wireless pad that idles
+         * out and reconnects (confirmed behavior for some 8BitDo/Bluetooth
+         * pads) can come back as a brand new event node; without this,
+         * whichever fd we opened at startup just goes dead silently and
+         * that controller's Start/Select (or any input) stops responding
+         * with no visible cause. input_open() only adds devices not
+         * already tracked, so this is a cheap no-op when nothing changed. */
+        if (loop_now - last_input_rescan > 3.0) {
+            last_input_rescan = loop_now;
+            input_open();
+        }
 
         /* START toggles the About screen — only from the browser, not
          * mid-playback (same guard MiSTerDVD uses). */
@@ -3059,6 +3156,7 @@ int main(int argc, char **argv)
                 about_visible = 0;
                 redraw_current_screen(&fb, state);
             } else {
+                if (inp & INP_A) about_start_install();
                 draw_about(&fb);   /* redraw every frame to pick up update state */
             }
             usleep(16000);
