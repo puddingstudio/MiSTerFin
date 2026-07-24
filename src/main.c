@@ -44,7 +44,11 @@
  * decode latency for tear-free output. */
 #define VSYNC_FLAG   "/tmp/misterdvd_vsync"
 
-#define VISIBLE      7   /* was 6 — list had a lot of unused space above the hint row, see draw_browse's bottom fade */
+/* VISIBLE row count is now derived from the live framebuffer height —
+ * see visible_rows() below — instead of this fixed constant, so the list
+ * fits without overlap at any active-line count (was hardcoded 7, tuned
+ * only for PAL's 288 lines; NTSC's 240 needs fewer rows to avoid the last
+ * row colliding with the bottom hint bar). */
 #define ROW_H        30
 #define SAFE_X       24
 #define SAFE_Y       20
@@ -839,6 +843,28 @@ static const char *type_folder_icon(JfItemType t)
 static void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,
                                int cx, int cy, int max_w, int max_h, uint8_t alpha);
 
+/* Pixel-aspect-ratio correction: our framebuffer's pixels aren't square on
+ * a 4:3 CRT/component display, so a source image's width needs stretching
+ * relative to naive (sw/sh)*dh math to look right. Derived from the live
+ * framebuffer size rather than hardcoded, so it's automatically correct at
+ * any active-line count (PAL 288, NTSC 240, ...) instead of only the one
+ * resolution it happened to be tuned against. At fb->height=288 this comes
+ * out to exactly 5/3 — MiSTerDVD's original proven PAL correction factor
+ * (confirmed unchanged: was hardcoded 5.0/3.0 before this generalization). */
+static double par_correction(FBDev *fb)
+{
+    return (3.0 * fb->width) / (4.0 * fb->height);
+}
+
+/* How many list rows fit between the list's top (SAFE_Y + 24, see
+ * draw_browse) and the bottom hint bar (fb->height - 28) without overlap.
+ * At fb->height=288 this floors to exactly 7 — the old hardcoded VISIBLE,
+ * unchanged. At fb->height=240 (NTSC) it comes out to 5. */
+static int visible_rows(FBDev *fb)
+{
+    return (fb->height - 28 - (SAFE_Y + 24)) / ROW_H;
+}
+
 /* Simple "flying through stars" background for the About screen — each
  * star has a depth (z) that shrinks every frame; projecting x/y by 1/z
  * makes it appear to accelerate toward the viewer, and it respawns at max
@@ -1319,7 +1345,7 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         int max_w = fb->width - 2 * SAFE_X;
         int max_h = 130;
         img_h_box = max_h < img_h ? max_h : img_h;
-        img_w_box = (int)((double)img_w / img_h * img_h_box * 5.0 / 3.0 + 0.5);
+        img_w_box = (int)((double)img_w / img_h * img_h_box * par_correction(fb) + 0.5);
         if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
     }
 
@@ -1419,7 +1445,7 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
         int max_w = fb->width - 2 * SAFE_X;
         int max_h = 110;
         int img_h_box = max_h < img_h ? max_h : img_h;
-        int img_w_box = (int)((double)img_w / img_h * img_h_box * 5.0 / 3.0 + 0.5);
+        int img_w_box = (int)((double)img_w / img_h * img_h_box * par_correction(fb) + 0.5);
         if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
         blit_fit_centered(fb, img_px, img_w, img_h,
                            fb->width / 2, cur_y + img_h_box / 2, img_w_box, img_h_box, 255);
@@ -1871,14 +1897,15 @@ static void draw_browse(FBDev *fb)
          * own dh calc here so cy can be derived from the actual resulting
          * height rather than the panel's fixed height. */
         int dh = BROWSE_COVER_H;
-        int dw = (int)((double)g_browse_cover_w / g_browse_cover_h * dh * 5.0 / 3.0 + 0.5);
+        int dw = (int)((double)g_browse_cover_w / g_browse_cover_h * dh * par_correction(fb) + 0.5);
         if (dw > BROWSE_COVER_W) dh = dh * BROWSE_COVER_W / dw;
         int cy = cover_panel_y + dh / 2;
         blit_fit_centered(fb, g_browse_cover_px, g_browse_cover_w, g_browse_cover_h,
                            cx, cy, BROWSE_COVER_W, BROWSE_COVER_H, 255);
     }
 
-    int end = g_scroll + VISIBLE;
+    int visible = visible_rows(fb);
+    int end = g_scroll + visible;
     if (end > g_item_count) end = g_item_count;
 
     for (int i = g_scroll; i < end; i++) {
@@ -1959,7 +1986,7 @@ static void draw_browse(FBDev *fb)
         }
     }
 
-    if (g_item_count > VISIBLE) {
+    if (g_item_count > visible) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d/%d", g_sel+1, g_item_count);
         draw_text(fb, fb->width - text_width(buf,1) - SAFE_X,
@@ -1977,26 +2004,25 @@ static void draw_browse(FBDev *fb)
     fb_flip(fb);
 }
 
-#define HERO_H 150
-
 /* Blits src into a max_w x max_h box, preserving its own real-world aspect
  * ratio and centering it (letterboxing/pillarboxing as needed — handles a
  * landscape screen-grab used as a poster fine, same as a normal portrait
  * one). Used for the logo and any poster/cover, which — unlike the
  * full-bleed backdrop crop-fill — must never look distorted.
  *
- * The 5/3 factor is MiSTerDVD's proven correction for this platform's
- * non-square pixels: our buffer is 640 wide feeding a 4:3 CRT through a
- * narrower final PAL/NTSC DDR resolution, so plain w/h aspect math alone
- * renders posters visibly too narrow ("elongated") on the real screen —
- * confirmed by reusing MiSTerDVD's exact fix (see its main.c cover-art
- * rendering) rather than re-deriving it. */
+ * par_correction() is MiSTerDVD's proven correction for this platform's
+ * non-square pixels, generalized to the live framebuffer size: our buffer
+ * is 640 wide feeding a 4:3 CRT through a narrower final PAL/NTSC DDR
+ * resolution, so plain w/h aspect math alone renders posters visibly too
+ * narrow ("elongated") on the real screen — was hardcoded to 5/3 (correct
+ * only at 288 active lines), now derived so it's also correct at NTSC's
+ * 240. */
 static void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,
                                int cx, int cy, int max_w, int max_h, uint8_t alpha)
 {
     if (!src || sw <= 0 || sh <= 0) return;
     int dh = max_h;
-    int dw = (int)((double)sw / sh * dh * 5.0 / 3.0 + 0.5);
+    int dw = (int)((double)sw / sh * dh * par_correction(fb) + 0.5);
     if (dw > max_w) { dh = dh * max_w / dw; dw = max_w; }
     fb_blit(fb, src, sw, sh, cx - dw / 2, cy - dh / 2, dw, dh, alpha);
 }
@@ -2005,28 +2031,39 @@ static void draw_info(FBDev *fb)
 {
     fb_clear(fb);
 
+    /* cast_thumb/overview_lines are the fixed-size elements below the
+     * banner (font row height and photo size don't shrink with
+     * resolution) — hero_h is solved from whatever's left so the cast row
+     * never gets clipped/pushed under the hint bar, then capped at 150 (the
+     * original PAL-tuned size) so this is a no-op at 288 active lines. */
+    const int cast_thumb = 34;
+    const int overview_lines = 3;
+    int hero_h = fb->height - 58 - overview_lines * 10 - cast_thumb;
+    if (hero_h > 150) hero_h = 150;
+    if (hero_h < 80) hero_h = 80;
+
     /* Backdrop: full-bleed cover-crop (crop the taller dimension so the
      * remaining region already matches the target box's aspect ratio,
      * then a single uniform fb_blit stretch is distortion-free) — a plain
      * stretch-to-fill would visibly warp most 16:9-ish backdrops into our
-     * much wider 640x150 box. */
+     * much wider 640-wide box. */
     if (g_backdrop_px) {
-        int crop_h = g_backdrop_w * HERO_H / fb->width;
+        int crop_h = g_backdrop_w * hero_h / fb->width;
         if (crop_h > g_backdrop_h) crop_h = g_backdrop_h;
         int skip = (g_backdrop_h - crop_h) / 2;
         const uint8_t *cropped = g_backdrop_px + (size_t)skip * g_backdrop_w * 4;
-        fb_blit(fb, cropped, g_backdrop_w, crop_h, 0, 0, fb->width, HERO_H, 255);
+        fb_blit(fb, cropped, g_backdrop_w, crop_h, 0, 0, fb->width, hero_h, 255);
     } else {
-        fb_fill_rect_alpha(fb, 0, 0, fb->width, HERO_H, 0x18, 0x18, 0x18, 255);
+        fb_fill_rect_alpha(fb, 0, 0, fb->width, hero_h, 0x18, 0x18, 0x18, 255);
     }
 
     /* Legibility gradient behind the logo/title: transparent at the
      * backdrop's midpoint, fading to near-opaque black by the bottom edge
      * so it blends smoothly into the solid black area below the hero
      * instead of showing a hard-edged bar. */
-    int grad_top = HERO_H / 2;
-    for (int gy = grad_top; gy < HERO_H; gy++) {
-        int a = (gy - grad_top) * 220 / (HERO_H - grad_top);
+    int grad_top = hero_h / 2;
+    for (int gy = grad_top; gy < hero_h; gy++) {
+        int a = (gy - grad_top) * 220 / (hero_h - grad_top);
         fb_fill_rect_alpha(fb, 0, gy, fb->width, 1, 0, 0, 0, (uint8_t)a);
     }
 
@@ -2037,18 +2074,18 @@ static void draw_info(FBDev *fb)
          * smaller after the aspect fix). 480 covers essentially any real
          * logo's aspect ratio at the full target height. */
         blit_fit_centered(fb, g_logo_px, g_logo_w, g_logo_h,
-                           fb->width / 2, HERO_H - 24, 480, 34, 255);
+                           fb->width / 2, hero_h - 24, 480, 34, 255);
     } else {
         char title_line[300];
         if (g_info_item.year[0])
             snprintf(title_line, sizeof(title_line), "%s (%s)", g_info_item.name, g_info_item.year);
         else
             snprintf(title_line, sizeof(title_line), "%s", g_info_item.name);
-        draw_text(fb, (fb->width - text_width(title_line, 1)) / 2, HERO_H - 28,
+        draw_text(fb, (fb->width - text_width(title_line, 1)) / 2, hero_h - 28,
                   title_line, 1, COL_SEL_FG);
     }
 
-    int ty = HERO_H + 8;
+    int ty = hero_h + 8;
     int tw = fb->width - 2 * SAFE_X;
 
     char status[64] = {0};
@@ -2071,7 +2108,7 @@ static void draw_info(FBDev *fb)
     }
 
     if (g_info_item.overview[0])
-        ty += draw_wrapped(fb, SAFE_X, ty, g_info_item.overview, 1, tw, 3, COL_ITEM);
+        ty += draw_wrapped(fb, SAFE_X, ty, g_info_item.overview, 1, tw, overview_lines, COL_ITEM);
     ty += 4;
 
     /* Cast row — small headshots only, no name labels: there isn't enough
@@ -2080,7 +2117,7 @@ static void draw_info(FBDev *fb)
     int cast_n = g_info_item.cast_count;
     if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
     if (cast_n > 0) {
-        int thumb = 34;
+        int thumb = cast_thumb;
         int slot = tw / cast_n;
         for (int i = 0; i < cast_n; i++) {
             int cx = SAFE_X + slot * i + slot / 2;
@@ -2608,7 +2645,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     /* Deliberately does NOT clear /dev/fb0 here — whatever's already on
      * screen (info screen, or the last video frame before a seek-restart)
      * should stay visible behind the loading spinner below. The -vf chain's
-     * dsize=640:288 (see execlp below) makes mplayer's own frames fill the
+     * dsize=<fb dims> (see execlp below) makes mplayer's own frames fill the
      * whole framebuffer exactly once they start, so nothing needs pre-clearing. */
 
     /* Cortex-A9 is weak and this mplayer/ffmpeg build has no NEON-accelerated
@@ -2636,6 +2673,10 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_paused          = 0;
     g_last_progress_report = now_sec();
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
+
+    char vf_arg[96];
+    snprintf(vf_arg, sizeof(vf_arg), "scale=%d:-1,expand=%d:%d:-1:-1:1,dsize=%d:%d",
+             fb->width, fb->width, fb->height, fb->width, fb->height);
 
     int pfd[2];
     pipe(pfd);
@@ -2681,16 +2722,20 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                "-sws", "0",
                /* Decode is requested small server-side (see profile below)
                 * to keep the software H.264 decode cheap; this -vf chain
-                * scales it back up to fill /dev/fb0's native 640x288
+                * scales it back up to fill /dev/fb0's actual live size
                 * (cheap relative to decode) while preserving the source's
                 * own aspect ratio and letterboxing/pillarboxing with black
-                * bars — scale=640:-1 fits the wider dimension, expand pads
-                * the other to 640x288, and dsize=640:288 is required last:
-                * without it mplayer's own internal aspect "prescale" logic
+                * bars — scale=W:-1 fits the wider dimension, expand pads
+                * the other to WxH, and dsize=WxH is required last: without
+                * it mplayer's own internal aspect "prescale" logic
                 * recomputes and overrides the final display size (confirmed
                 * on hardware — omitting dsize gave a distorted stretch or a
-                * wrong-sized output depending on the rest of the chain). */
-               "-vf", "scale=640:-1,expand=640:288:-1:-1:1,dsize=640:288",
+                * wrong-sized output depending on the rest of the chain).
+                * Built from fb->width/height above — was hardcoded to
+                * 640x288 (the PAL framebuffer size), which caused green
+                * corruption artifacts once tested against a 240-tall NTSC
+                * framebuffer. */
+               "-vf", vf_arg,
                "-lavdopts", "threads=2:fast",
                "-af", "format=s16le",
                /* This build has no FreeType/fontconfig (confirmed on
@@ -2900,8 +2945,19 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     if (g_paused)
         draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
 
-    const int cover_max = 165;
+    /* cover_max is solved from the space actually available down to the
+     * hint bar, then capped at 165 (the original PAL-tuned size) so this is
+     * a no-op at 288 active lines. The fixed 63 below is every OTHER
+     * element between the cover and the hint bar that doesn't shrink with
+     * resolution (title/subtitle/timeline gaps + both VU meters — see the
+     * ty += ... chain below), plus 6px of safety margin; without solving
+     * for it, a fixed cover size pushed the VU meters past fb->height
+     * entirely at NTSC's 240 lines (confirmed on hardware — invisible,
+     * drawn off the bottom of the buffer). */
     int cover_top = SAFE_Y;
+    int cover_max = (fb->height - 8 - SAFE_Y_BOT) - cover_top - 63 - 6;
+    if (cover_max > 165) cover_max = 165;
+    if (cover_max < 80) cover_max = 80;
     int cy = cover_top + cover_max / 2;
 
     /* No placeholder box when there's genuinely no cover (track has no
@@ -3281,7 +3337,7 @@ int main(int argc, char **argv)
                 }
                 if (inp & INP_DOWN && g_item_count > 0) {
                     if (g_sel < g_item_count - 1) g_sel++;
-                    if (g_sel >= g_scroll + VISIBLE) g_scroll = g_sel - VISIBLE + 1;
+                    if (g_sel >= g_scroll + visible_rows(&fb)) g_scroll = g_sel - visible_rows(&fb) + 1;
                     nav = 1;
                 }
             }
