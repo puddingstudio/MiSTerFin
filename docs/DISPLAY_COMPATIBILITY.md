@@ -14,6 +14,10 @@ This doc tracks combos we've actually verified, plus the exact `MiSTer.ini` keys
 
 **Audio:** the VGA-to-SCART cable needs a separate 3.5mm jack input (alongside the VGA connector) to carry audio into the SCART's audio pins — video-only VGA-to-SCART cables exist and won't give you sound.
 
+| Connector on MiSTer | Connector on display | Picture |
+|---|---|---|
+| ![MiSTer Analog I/O board VGA connector](images/scart-mister-connector.jpg) | ![SCART socket on the back of the CRT TV](images/scart-tv-connector.jpg) | ![MiSTerFin displayed correctly on the Sony Trinitron](images/scart-tv-picture.jpg) |
+
 **Relevant `MiSTer.ini` settings:**
 
 ```ini
