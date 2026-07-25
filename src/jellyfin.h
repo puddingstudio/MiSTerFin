@@ -89,6 +89,13 @@ typedef struct {
     char       source_video_codec[16];
     int        source_width, source_height;
     int64_t    source_bitrate;          /* bits/sec, 0 if unknown */
+    /* Display aspect ratio (width/height), from the video stream's own
+     * "AspectRatio" field (e.g. "16:9") rather than source_width/height —
+     * those are raw pixel dims and can be wrong for anamorphic sources
+     * (e.g. a PAL DVD's 720x576 is really 16:9 despite a 5:4 pixel ratio,
+     * via non-square SAR). 0 if not fetched/parseable — caller should fall
+     * back to source_width/source_height in that case. */
+    double     source_aspect;
 } JfItem;
 
 typedef struct {

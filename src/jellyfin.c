@@ -256,6 +256,7 @@ static void parse_media_streams(const char *buf, JfItem *it)
     it->source_video_codec[0] = '\0';
     it->source_width = it->source_height = 0;
     it->source_bitrate = 0;
+    it->source_aspect = 0.0;
     int got_video = 0;
 
     const char *p = strstr(buf, "\"MediaStreams\":[");
@@ -298,6 +299,12 @@ static void parse_media_streams(const char *buf, JfItem *it)
             it->source_width = (int)w;
             it->source_height = (int)h;
             it->source_bitrate = br;
+
+            char ar_buf[16] = {0};
+            json_str(stream_buf, "AspectRatio", ar_buf, sizeof(ar_buf));
+            int ar_w = 0, ar_h = 0;
+            if (ar_buf[0] && sscanf(ar_buf, "%d:%d", &ar_w, &ar_h) == 2 && ar_h > 0)
+                it->source_aspect = (double)ar_w / (double)ar_h;
         }
 
         p = end + 1;

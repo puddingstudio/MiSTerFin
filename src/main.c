@@ -50,8 +50,13 @@
  * only for PAL's 288 lines; NTSC's 240 needs fewer rows to avoid the last
  * row colliding with the bottom hint bar). */
 #define ROW_H        30
-#define SAFE_X       24
-#define SAFE_Y       20
+/* Broadcast "title-safe" convention (80% of frame visible, 10% margin per
+ * side) — protects on-screen text from CRT overscan cropping. Computed
+ * once from the live framebuffer size (see main()) instead of hardcoded,
+ * so it's correct at any resolution; 24/20 below are just fallback values
+ * before that computation runs. */
+static int SAFE_X = 24;
+static int SAFE_Y = 20;
 #define SAFE_Y_BOT   SAFE_Y   /* match the top title margin — same overscan/visibility balance */
 #define SEEK_STEP        30.0
 #define AUDIO_SEEK_STEP  10.0   /* smaller than video's SEEK_STEP — tracks are short, real in-place seek (see STATE_PLAYING_AUDIO) */
@@ -283,17 +288,35 @@ static void fmt_time(char *buf, size_t sz, double secs)
 
 /* ── text rendering ──────────────────────────────────────────────────────── */
 
+/* Tried applying the same non-square-pixel correction used for cover art
+ * (par_correction()) to font glyph width on NTSC — visually correct per-
+ * character, but it doubles every string's on-screen width, which broke
+ * layouts never designed for text that wide (confirmed on hardware: home
+ * carousel library labels overlapping/running together). Fixing that
+ * properly would mean re-deriving card widths/spacing/truncation targets
+ * throughout the UI, not just the font — too large a change for what's a
+ * cosmetic improvement. Reverted to unconditional passthrough (identical
+ * on both PAL and NTSC); the `fb` parameter threaded through text_width()/
+ * truncate_to_width()/draw_wrapped() is otherwise unused now but left in
+ * place rather than unwinding ~40 call sites for no behavioral gain. */
+static int font_scale_x(FBDev *fb, int scale)
+{
+    (void)fb;
+    return scale;
+}
+
 static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
     if (c >= 128) c = '?';
+    int sx = font_scale_x(fb, scale);
     const uint8_t *glyph = font8x8_basic[c];
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < 8; col++) {
             if ((bits >> col) & 1)
-                fb_fill_rect_alpha(fb, x + col*scale, y + row*scale,
-                                   scale, scale, r, g, b, 255);
+                fb_fill_rect_alpha(fb, x + col*sx, y + row*scale,
+                                   sx, scale, r, g, b, 255);
         }
     }
 }
@@ -301,11 +324,12 @@ static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
 static void draw_text(FBDev *fb, int x, int y, const char *s, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
-    for (; *s; s++, x += 8*scale)
+    int sx = font_scale_x(fb, scale);
+    for (; *s; s++, x += 8*sx)
         draw_char(fb, x, y, (unsigned char)*s, scale, r, g, b);
 }
 
-static int text_width(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
+static int text_width(FBDev *fb, const char *s, int scale) { return (int)strlen(s) * 8 * font_scale_x(fb, scale); }
 
 /* Like draw_text, but skips any character whose whole glyph cell doesn't
  * fit within [clip_x0, clip_x1) — used for the scrolling browse title
@@ -323,9 +347,9 @@ static void draw_text_clipped(FBDev *fb, int x, int y, const char *s, int scale,
 /* Truncates s in-place (with a trailing "...") so it fits within max_w
  * pixels at the given scale — draw_text itself doesn't clip, so a long
  * title would otherwise run into whatever's to its right. */
-static void truncate_to_width(char *s, int scale, int max_w)
+static void truncate_to_width(FBDev *fb, char *s, int scale, int max_w)
 {
-    int max_chars = max_w / (8 * scale);
+    int max_chars = max_w / (8 * font_scale_x(fb, scale));
     int len = (int)strlen(s);
     if (len <= max_chars) return;
     if (max_chars > 3) { s[max_chars - 3] = '\0'; strcat(s, "..."); }
@@ -336,7 +360,7 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
                          int scale, int max_w, int max_lines,
                          uint8_t r, uint8_t g, uint8_t b)
 {
-    int cols    = max_w / (8 * scale);
+    int cols    = max_w / (8 * font_scale_x(fb, scale));
     int line_h  = 8 * scale + 2;
     char line[256] = {0};
     int  li         = 0;
@@ -1175,8 +1199,7 @@ static void toasty_update_spawn(FBDev *fb, double now)
 /* Single moon instance, drifting left-to-right (the one thing NOT flying
  * down-left with the toasters) across a fixed 20%-60%-height band over
  * MOON_DURATION real seconds one-way — verbatim update_moon(). */
-#define TOASTY_MOON_W 120
-#define TOASTY_MOON_H 72
+#define TOASTY_MOON_W 120   /* height is derived from par_correction(), see toasty_draw()'s fb_blit */
 #define TOASTY_MOON_DURATION 120.0
 static float  g_toasty_moon_x = 0, g_toasty_moon_y = 0;
 static double g_toasty_moon_start = 0.0;
@@ -1212,8 +1235,10 @@ static void toasty_sprite_draw(FBDev *fb, ToastySprite *t)
     if (!px) return;
     int size = TOASTY_LAYERS[t->layer].size;
     int dw = size;
-    int dh = (int)(size * 0.6f);   /* PAL pixel-aspect correction, same factor
-                                     * as Toasty's own PIXEL_ASPECT_R */
+    /* Was a fixed 0.6f (PAL's own pixel-aspect ratio, same fixed-factor bug
+     * MiSTer-Toasty-Squadron's own moon once had) — derived from
+     * par_correction() instead so sprites are also correct on NTSC. */
+    int dh = (int)(size / par_correction(fb) + 0.5f);
     int draw_y = (int)(t->y + sinf(t->float_phase * (float)M_PI / 180.0f) * t->float_amp);
     uint8_t layer_alpha = (uint8_t)(TOASTY_LAYERS[t->layer].alpha * 255.0f);
     fb_blit(fb, px, g_toasty_w[t->spec][t->frame], g_toasty_h[t->spec][t->frame],
@@ -1253,9 +1278,15 @@ static void draw_toasty_bg(FBDev *fb)
 
     toasty_update_spawn(fb, now);
     toasty_update_moon(fb, now);
-    if (g_toasty_moon_on_screen)
+    if (g_toasty_moon_on_screen) {
+        /* TOASTY_MOON_H used to be a fixed 72 (=120*0.6, PAL's own pixel
+         * aspect ratio, hand-tuned same as MiSTer-Toasty-Squadron's own
+         * MOON_H once was) — derived from par_correction() instead so it's
+         * also correct on NTSC's 240 lines. */
+        int moon_h = (int)(TOASTY_MOON_W / par_correction(fb) + 0.5);
         fb_blit(fb, g_toasty_moon_px, g_toasty_moon_w, g_toasty_moon_h,
-                (int)g_toasty_moon_x, (int)g_toasty_moon_y, TOASTY_MOON_W, TOASTY_MOON_H, 255);
+                (int)g_toasty_moon_x, (int)g_toasty_moon_y, TOASTY_MOON_W, moon_h, 255);
+    }
 
     for (int layer = 0; layer < TOASTY_LAYER_COUNT; layer++) {
         for (int i = 0; i < g_toasty_pool_size; i++) {
@@ -1360,11 +1391,11 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         cur_y += img_h_box + img_gap;
     }
 
-    draw_text(fb, (fb->width - text_width(title, ts)) / 2, cur_y, title, ts, COL_TITLE);
+    draw_text(fb, (fb->width - text_width(fb, title, ts)) / 2, cur_y, title, ts, COL_TITLE);
     cur_y += tch + lsp;
-    draw_text(fb, (fb->width - text_width(line1, s1)) / 2, cur_y, line1, s1, COL_ITEM);
+    draw_text(fb, (fb->width - text_width(fb, line1, s1)) / 2, cur_y, line1, s1, COL_ITEM);
     cur_y += sch + lsp;
-    draw_text(fb, (fb->width - text_width(line2, s1)) / 2, cur_y, line2, s1, COL_RESUME);
+    draw_text(fb, (fb->width - text_width(fb, line2, s1)) / 2, cur_y, line2, s1, COL_RESUME);
 
     if (show_footer) {
         pthread_mutex_lock(&g_upd_mutex);
@@ -1408,7 +1439,7 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         }
 
         const char *hint = "B: back";
-        draw_text(fb, fb->width - text_width(hint, 1) - SAFE_X, safe_y, hint, 1, COL_HINT);
+        draw_text(fb, fb->width - text_width(fb, hint, 1) - SAFE_X, safe_y, hint, 1, COL_HINT);
     }
 
     fb_flip(fb);
@@ -1443,7 +1474,15 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
     int cur_y = SAFE_Y;
     if (img_px && img_w > 0 && img_h > 0) {
         int max_w = fb->width - 2 * SAFE_X;
-        int max_h = 110;
+        /* Solved from the space available down to the hint bar (title +
+         * reason + the 4-line jellyfin.conf instructions below are fixed-
+         * height text that doesn't shrink with resolution), capped at 110
+         * (the original PAL-tuned size) so this is a no-op at 288 active
+         * lines. Without it, this screen's text overlapped the hint row on
+         * NTSC's 240 lines the same way draw_info's cast row once did. */
+        int max_h = fb->height - 156;
+        if (max_h > 110) max_h = 110;
+        if (max_h < 50) max_h = 50;
         int img_h_box = max_h < img_h ? max_h : img_h;
         int img_w_box = (int)((double)img_w / img_h * img_h_box * par_correction(fb) + 0.5);
         if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
@@ -1452,22 +1491,22 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
         cur_y += img_h_box + img_gap;
     }
 
-    draw_text(fb, (fb->width - text_width(title, ts)) / 2, cur_y, title, ts, COL_TITLE);
+    draw_text(fb, (fb->width - text_width(fb, title, ts)) / 2, cur_y, title, ts, COL_TITLE);
     cur_y += tch + lsp;
-    draw_text(fb, (fb->width - text_width(reason, s1)) / 2, cur_y, reason, s1, COL_ERR);
+    draw_text(fb, (fb->width - text_width(fb, reason, s1)) / 2, cur_y, reason, s1, COL_ERR);
     cur_y += sch + lsp * 2;
 
     const char *l1 = "Create /media/fat/misterfin/jellyfin.conf with:";
-    draw_text(fb, (fb->width - text_width(l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
+    draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
     cur_y += sch + lsp;
     static const char *fields[] = { "server_url", "api_key", "username" };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        draw_text(fb, (fb->width - text_width(fields[i], s1)) / 2, cur_y, fields[i], s1, COL_ITEM);
+        draw_text(fb, (fb->width - text_width(fb, fields[i], s1)) / 2, cur_y, fields[i], s1, COL_ITEM);
         cur_y += sch + lsp;
     }
 
     const char *hint = "B: exit";
-    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+    draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
@@ -1534,7 +1573,7 @@ static int draw_clock(FBDev *fb)
     char clock_buf[8];
     snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
     int clock_right = fb->width - SPINNER_SIZE - SPINNER_MARGIN - 8;
-    int clock_x = clock_right - text_width(clock_buf, 1);
+    int clock_x = clock_right - text_width(fb, clock_buf, 1);
     draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, COL_HINT);
     return clock_x;
 }
@@ -1545,7 +1584,7 @@ static void draw_top_bar(FBDev *fb, const char *title)
 
     int title_x0 = SAFE_X;
     int title_x1 = clock_x - 12;
-    int title_w  = text_width(title, 2);
+    int title_w  = text_width(fb, title, 2);
     if (strcmp(title, g_marquee_title) != 0) {
         strncpy(g_marquee_title, title, sizeof(g_marquee_title) - 1);
         g_marquee_title[sizeof(g_marquee_title) - 1] = '\0';
@@ -1568,7 +1607,7 @@ static void draw_confirm_exit(FBDev *fb)
 {
     const char *msg = "Exit? [A: yes  B: no]";
     int scale = 2;
-    int tw = text_width(msg, scale);
+    int tw = text_width(fb, msg, scale);
     int th = 8 * scale;
     int cx = (fb->width - tw) / 2;
     int cy = (fb->height - th) / 2;
@@ -1588,13 +1627,13 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
     char name[64];
     strncpy(name, it->name, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';
-    truncate_to_width(name, 2, CAROUSEL_CARD_W);
+    truncate_to_width(fb, name, 2, CAROUSEL_CARD_W);
     /* Can't ternary a multi-arg color macro straight into a call — the
      * comma in e.g. COL_TITLE splits into extra call arguments instead of
      * picking r/g/b together, silently mis-coloring this (caught by eye in
      * the --preview-browse render, not by the compiler). */
-    if (active) draw_text(fb, cx - text_width(name, 2) / 2, cy - 10, name, 2, COL_TITLE);
-    else        draw_text(fb, cx - text_width(name, 2) / 2, cy - 10, name, 2, 0xFF, 0xFF, 0xFF);
+    if (active) draw_text(fb, cx - text_width(fb, name, 2) / 2, cy - 10, name, 2, COL_TITLE);
+    else        draw_text(fb, cx - text_width(fb, name, 2) / 2, cy - 10, name, 2, 0xFF, 0xFF, 0xFF);
 
     if (count >= 0) {
         const char *ct = it->collection_type;
@@ -1607,7 +1646,7 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
             snprintf(cbuf, sizeof(cbuf), "%lld album%s", (long long)count, count == 1 ? "" : "s");
         else
             snprintf(cbuf, sizeof(cbuf), "%lld item%s", (long long)count, count == 1 ? "" : "s");
-        draw_text(fb, cx - text_width(cbuf, 1) / 2, cy + 12, cbuf, 1, COL_HINT);
+        draw_text(fb, cx - text_width(fb, cbuf, 1) / 2, cy + 12, cbuf, 1, COL_HINT);
     }
 }
 
@@ -1780,7 +1819,7 @@ static void draw_carousel_cards(FBDev *fb, double visual_sel, int cy)
 static void draw_carousel_hint(FBDev *fb)
 {
     const char *hint = "LEFT/RIGHT: browse   A:select   SELECT:list view   B:exit";
-    draw_text(fb, (fb->width - text_width(hint,1))/2,
+    draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 }
 
@@ -1835,7 +1874,7 @@ static void draw_browse_carousel(FBDev *fb)
         fb_clear(fb);
         draw_top_bar(fb, "MiSTerFin");
         const char *msg = "No libraries found";
-        draw_text(fb, (fb->width - text_width(msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
+        draw_text(fb, (fb->width - text_width(fb, msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
         fb_flip(fb);
         return;
     }
@@ -1867,7 +1906,7 @@ static void draw_browse(FBDev *fb)
 
     if (g_item_count == 0) {
         const char *msg = "Nothing here";
-        draw_text(fb, (fb->width - text_width(msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
+        draw_text(fb, (fb->width - text_width(fb, msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
         fb_flip(fb);
         return;
     }
@@ -1920,7 +1959,7 @@ static void draw_browse(FBDev *fb)
             snprintf(line1, sizeof(line1), "%s%s (%s)", type_folder_icon(it->type), it->name, it->year);
         else
             snprintf(line1, sizeof(line1), "%s%s", type_folder_icon(it->type), it->name);
-        truncate_to_width(line1, 1, row_max_w);
+        truncate_to_width(fb, line1, 1, row_max_w);
 
         /* Album: year + track count instead of a runtime — there's no
          * single "duration" for a whole album. Track: just its own
@@ -1973,7 +2012,7 @@ static void draw_browse(FBDev *fb)
                 snprintf(line2, sizeof(line2), "%d min", minutes);
             }
         }
-        truncate_to_width(line2, 1, row_max_w);
+        truncate_to_width(fb, line2, 1, row_max_w);
 
         if (is_sel) {
             fb_fill_rect_alpha(fb, SAFE_X - 4, y - 3,
@@ -1989,7 +2028,7 @@ static void draw_browse(FBDev *fb)
     if (g_item_count > visible) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d/%d", g_sel+1, g_item_count);
-        draw_text(fb, fb->width - text_width(buf,1) - SAFE_X,
+        draw_text(fb, fb->width - text_width(fb, buf,1) - SAFE_X,
                   fb->height - 8 - SAFE_Y_BOT, buf, 1, COL_HINT);
     }
 
@@ -1998,7 +2037,7 @@ static void draw_browse(FBDev *fb)
         (g_stack_depth > 1 && showing_artists) ? "A:select  SELECT:shuffle library  B:back" :
         (g_stack_depth > 1)                    ? "A:select  B:back" :
                                                   "A:select  SELECT:cover view  B:exit";
-    draw_text(fb, (fb->width - text_width(hint,1))/2,
+    draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
@@ -2081,7 +2120,7 @@ static void draw_info(FBDev *fb)
             snprintf(title_line, sizeof(title_line), "%s (%s)", g_info_item.name, g_info_item.year);
         else
             snprintf(title_line, sizeof(title_line), "%s", g_info_item.name);
-        draw_text(fb, (fb->width - text_width(title_line, 1)) / 2, hero_h - 28,
+        draw_text(fb, (fb->width - text_width(fb, title_line, 1)) / 2, hero_h - 28,
                   title_line, 1, COL_SEL_FG);
     }
 
@@ -2132,7 +2171,7 @@ static void draw_info(FBDev *fb)
     const char *hint = (g_info_item.resume_ticks > 0 && !g_info_item.played)
         ? "A:resume  SELECT:restart  B:back"
         : "A:play  B:back";
-    draw_text(fb, (fb->width - text_width(hint,1))/2,
+    draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
@@ -2165,7 +2204,7 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
     fmt_time(cur, sizeof(cur), pos);
     fmt_time(tot, sizeof(tot), duration);
     snprintf(label, sizeof(label), "%s / %s", cur, tot);
-    draw_text(fb, (fb->width - text_width(label, 1)) / 2, y + 10, label, 1, COL_ITEM);
+    draw_text(fb, (fb->width - text_width(fb, label, 1)) / 2, y + 10, label, 1, COL_ITEM);
 }
 
 static void draw_paused(FBDev *fb, const char *name, double pos)
@@ -2176,19 +2215,22 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
     fb_fill_rect_alpha(fb, 0, cy - 6, fb->width, 50, 0, 0, 0, 200);
 
     const char *ps = "|| PAUSED";
-    draw_text(fb, (fb->width - text_width(ps, 2)) / 2, cy, ps, 2, 0xFF, 0xFF, 0x00);
+    draw_text(fb, (fb->width - text_width(fb, ps, 2)) / 2, cy, ps, 2, 0xFF, 0xFF, 0x00);
 
     char nbuf[64];
     snprintf(nbuf, sizeof(nbuf), "%.60s", name);
-    draw_text(fb, (fb->width - text_width(nbuf, 1)) / 2, cy + 20, nbuf, 1, COL_ITEM);
+    draw_text(fb, (fb->width - text_width(fb, nbuf, 1)) / 2, cy + 20, nbuf, 1, COL_ITEM);
 
-    draw_timeline(fb, fb->height - 8 - SAFE_Y_BOT - 20, pos,
+    /* -20 leaves only ~2px between the timeline's time label and the hint
+     * row below on PAL too (same formula), but it's only been reported as
+     * too tight on NTSC — leaving PAL's spacing exactly as-is per instr. */
+    draw_timeline(fb, fb->height - 8 - SAFE_Y_BOT - (fb->height == 288 ? 20 : 28), pos,
                   (double)g_info_item.runtime_ticks / 10000000.0);
 
     const char *hint = (g_info_item.sub_count > 0)
         ? "A:resume  B:stop  L/R:vsync  SELECT:subs"
         : "A:resume  B:stop  L/R:vsync";
-    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+    draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
@@ -2549,7 +2591,7 @@ static void draw_submenu(FBDev *fb)
          * like "Undefined - SUBRIP - External") drawn past the box's own
          * width made the text stick out past the dark background behind
          * it — clip it to fit instead. */
-        truncate_to_width(line, 1, label_max_w);
+        truncate_to_width(fb, line, 1, label_max_w);
         if (active) draw_text(fb, list_x, list_y, line, 1, COL_RESUME);
         else        draw_text(fb, list_x, list_y, line, 1, COL_ITEM);
         list_y += 15;
@@ -2563,11 +2605,11 @@ static void draw_submenu(FBDev *fb)
     const char *hint1 = "UP/DOWN: select subtitle";
     const char *hint2 = "LEFT/RIGHT: adjust subtitle offset";
     const char *hint3 = "A: apply    B: cancel";
-    draw_text(fb, box_x + (box_w - text_width(hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
+    draw_text(fb, box_x + (box_w - text_width(fb, hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
     list_y += 12;
-    draw_text(fb, box_x + (box_w - text_width(hint2, 1)) / 2, list_y, hint2, 1, COL_HINT);
+    draw_text(fb, box_x + (box_w - text_width(fb, hint2, 1)) / 2, list_y, hint2, 1, COL_HINT);
     list_y += 12;
-    draw_text(fb, box_x + (box_w - text_width(hint3, 1)) / 2, list_y, hint3, 1, COL_HINT);
+    draw_text(fb, box_x + (box_w - text_width(fb, hint3, 1)) / 2, list_y, hint3, 1, COL_HINT);
 
     fb_flip(fb);
 }
@@ -2675,8 +2717,42 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
 
     char vf_arg[96];
-    snprintf(vf_arg, sizeof(vf_arg), "scale=%d:-1,expand=%d:%d:-1:-1:1,dsize=%d:%d",
-             fb->width, fb->width, fb->height, fb->width, fb->height);
+    if (fb->height == 288) {
+        /* PAL — byte-for-byte the original, long-proven chain. Deliberately
+         * NOT touched by the NTSC comb fix below: PAL's width-first
+         * "scale=640:-1" mismatch is real (confirmed via the same PAR math
+         * used for NTSC) but mild enough to have never shown a visible
+         * artifact, and there's no reason to risk regressing something
+         * that's worked for the platform's entire history over a
+         * theoretical aspect-precision improvement it doesn't need. */
+        snprintf(vf_arg, sizeof(vf_arg), "scale=%d:-1,expand=%d:%d:-1:-1:1,dsize=%d:%d",
+                 fb->width, fb->width, fb->height, fb->width, fb->height);
+    } else {
+        /* NTSC (and any other non-288 height) — confirmed on hardware that
+         * "scale=640:-1" (sizing height assuming square pixels) builds an
+         * intermediate frame far taller than the framebuffer, which
+         * something downstream (dsize/vo_fbdev) then has to crush back
+         * down — that crush is the comb/tearing artifact widely reported
+         * on NTSC. Scaling directly to the PAR-correct height instead
+         * (derived from g_info_item's real source aspect, which
+         * jf_get_item_details already fetches for the info screen) gives
+         * mplayer a single real swscale pass at the exact final size, so
+         * expand only ever pads, never shrinks. Falls back to raw source
+         * width/height, then a plain 16:9 guess, if aspect metadata is
+         * missing — better than reverting to the confirmed-broken chain. */
+        double dar = g_info_item.source_aspect;
+        if (dar <= 0.0 && g_info_item.source_width > 0 && g_info_item.source_height > 0)
+            dar = (double)g_info_item.source_width / (double)g_info_item.source_height;
+        if (dar <= 0.0) dar = 16.0 / 9.0;
+
+        int target_h = (int)(4.0 * fb->height / (3.0 * dar) + 0.5);
+        target_h &= ~1;                        /* even, required for yuv420p chroma subsampling */
+        if (target_h < 2) target_h = 2;
+        if (target_h > fb->height) target_h = fb->height;
+
+        snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,expand=%d:%d:-1:-1:1,dsize=%d:%d",
+                 fb->width, target_h, fb->width, fb->height, fb->width, fb->height);
+    }
 
     int pfd[2];
     pipe(pfd);
@@ -2950,11 +3026,15 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
      * a no-op at 288 active lines. The fixed 63 below is every OTHER
      * element between the cover and the hint bar that doesn't shrink with
      * resolution (title/subtitle/timeline gaps + both VU meters — see the
-     * ty += ... chain below), plus 6px of safety margin; without solving
-     * for it, a fixed cover size pushed the VU meters past fb->height
-     * entirely at NTSC's 240 lines (confirmed on hardware — invisible,
-     * drawn off the bottom of the buffer). */
-    int cover_top = SAFE_Y;
+     * ty += ... chain below, UNCHANGED from before — deliberately NOT
+     * touched here, only cover_top/the safety margin move). On non-PAL
+     * heights cover_top is raised close to the top edge (cover grows
+     * upward, not downward) so a bigger cover doesn't push that chain any
+     * later than it already sits — the safety margin is UNCHANGED (still
+     * 6, same as PAL) specifically so the bottom edge (cover_top+cover_max)
+     * lands at the exact same place regardless of cover_top, leaving
+     * everything below the cover untouched. */
+    int cover_top = (fb->height == 288) ? SAFE_Y : 2;
     int cover_max = (fb->height - 8 - SAFE_Y_BOT) - cover_top - 63 - 6;
     if (cover_max > 165) cover_max = 165;
     if (cover_max < 80) cover_max = 80;
@@ -2964,9 +3044,31 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
      * embedded art and no album fallback either, see JfItem.image_tag) —
      * per user request, empty space reads better than a gray rectangle
      * that looks like a broken image. */
-    if (g_nowplaying_cover_px)
+    if (g_nowplaying_cover_px) {
+        /* blit_fit_centered's par_correction() math assumes max_w/max_h
+         * describe a FRAMEBUFFER-PIXEL box, but album covers are
+         * physically square — passing cover_max for both (a literal
+         * square box) makes a square cover's PAR-corrected width come out
+         * roughly 2x its height at NTSC (1.67x at PAL), which the function
+         * then has to clamp back down, more than halving what actually
+         * gets drawn regardless of how big cover_max itself is. Widening
+         * max_w by par_correction() describes the box as physically
+         * square instead, so the clamp never triggers and the cover
+         * actually reaches cover_max. PAL kept passing cover_max/cover_max
+         * unchanged — this bug technically exists there too (milder,
+         * since its par_correction is smaller) but nobody's ever reported
+         * it and PAL isn't being touched here. */
+        /* Now that the clamp above no longer silently shrinks it, the full
+         * cover_max came out visually too big on NTSC — 75% of it (still
+         * centered within the same reserved cover_top..cover_max area, so
+         * nothing below shifts) reads better. PAL untouched as above. */
+        int cover_disp_h = (fb->height == 288) ? cover_max : (int)(cover_max * 0.75 + 0.5);
+        int cover_max_w = (fb->height == 288)
+            ? cover_disp_h
+            : (int)(cover_disp_h * par_correction(fb) + 0.5);
         blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
-                           fb->width / 2, cy, cover_max, cover_max, 255);
+                           fb->width / 2, cy, cover_max_w, cover_disp_h, 255);
+    }
 
     int16_t af_buf[4096];
     /* Don't read the export file while paused — decode has stopped, so it
@@ -2975,7 +3077,7 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     int af_n = g_paused ? 0 : read_af_samples(af_buf, 4096);
 
     int ty = cover_top + cover_max - 3;
-    draw_text(fb, (fb->width - text_width(it->name, 1)) / 2, ty, it->name, 1, COL_TITLE);
+    draw_text(fb, (fb->width - text_width(fb, it->name, 1)) / 2, ty, it->name, 1, COL_TITLE);
     ty += 10;
 
     char sub[300] = {0};
@@ -2986,8 +3088,8 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     else if (it->album[0])
         snprintf(sub, sizeof(sub), "%s", it->album);
     if (sub[0]) {
-        truncate_to_width(sub, 1, fb->width - 2 * SAFE_X);
-        draw_text(fb, (fb->width - text_width(sub, 1)) / 2, ty, sub, 1, COL_ITEM);
+        truncate_to_width(fb, sub, 1, fb->width - 2 * SAFE_X);
+        draw_text(fb, (fb->width - text_width(fb, sub, 1)) / 2, ty, sub, 1, COL_ITEM);
     }
     ty += 16;   /* clearer gap so the bar itself visibly sits between the album line and its own time label below */
 
@@ -3008,7 +3110,7 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
      * moved up instead, per user feedback that this must stay consistent. */
     const char *hint = g_paused ? "A:resume  L/R:seek  U/D:prev/next  SELECT:bg  B:stop"
                                  : "A:pause  L/R:seek  U/D:prev/next  SELECT:bg  B:stop";
-    draw_text(fb, (fb->width - text_width(hint, 1)) / 2,
+    draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     /* Mega-tier Toasty sprites fly over everything above — see
