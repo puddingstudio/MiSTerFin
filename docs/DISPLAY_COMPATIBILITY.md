@@ -8,9 +8,9 @@ This doc tracks combos we've actually verified, plus the exact `MiSTer.ini` keys
 
 ---
 
-## ✅ Confirmed: Analog I/O board (VGA) → SCART → CRT TV
+## ✅ Confirmed: Analog I/O board (VGA) → SCART → CRT TV (PAL)
 
-**Chain:** MiSTer main board → official MiSTer Analog I/O board (VGA-style DB15 output) → VGA-to-SCART cable → a classic consumer CRT TV, Sony Trinitron, SCART (RGB) input.
+**Chain:** MiSTer main board → official MiSTer Analog I/O board (VGA-style DB15 output) → VGA-to-SCART cable → a classic consumer CRT TV, Sony Trinitron, SCART (RGB) input, PAL.
 
 **Audio:** the VGA-to-SCART cable needs a separate 3.5mm jack input (alongside the VGA connector) to carry audio into the SCART's audio pins — video-only VGA-to-SCART cables exist and won't give you sound.
 
@@ -76,6 +76,40 @@ The same `[Menu]`-scoped override from the SCART combo above (`vga_scaler=1` + t
 
 ---
 
+## ✅ Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (NTSC)
+
+**Chain:** same hardware as the PAL Component combo above (Sony LMD-1410, component input) — this display supports both 525-line (NTSC) and 625-line (PAL) natively — just switched to NTSC.
+
+| Connector on MiSTer | Connector on display | Picture |
+|---|---|---|
+| ![MiSTer Analog I/O board VGA connector](images/mister-connector.jpg) | ![Component breakout cable connected to the monitor's BNC inputs](images/tv-connector.jpg) | ![MiSTerFin video playing correctly on the LMD-1410, monitor's own OSD confirming COMPONENT / 480/60I](images/component-ntsc-tv-picture.jpg) |
+
+**Relevant `MiSTer.ini` settings — same `ypbpr`/`composite_sync`/`forced_scandoubler`/`vga_scaler` as the PAL Component combo above**, plus a *different* `[Menu]`-scoped override and one extra top-level key:
+
+```ini
+menu_pal=0             ; forces the Menu core itself to NTSC-native (60Hz) — required to match
+                        ; the [Menu] video_mode below; leaving this at 1 (PAL) left the Menu core
+                        ; generating 50Hz-native video while the scaler output timing below was
+                        ; ~60Hz, and the mismatch showed up as a stretched/incorrect picture on
+                        ; the stock MiSTer OSD menu itself, not just MiSTerFin.
+```
+
+```ini
+[Menu]
+vga_scaler=1
+video_mode=640,26,60,74,240,0,4,18,12587
+```
+
+`240` active lines (vs PAL's `288`) and the adjusted vertical timing give a real ~15.73kHz/60.05Hz signal — confirmed correct: the display reports "480/60i", the exact same way the PAL combo's display reports "575/50i" for what's actually 288p. That label is expected, not an error.
+
+**`jellyfin.conf`'s 4th line must be `NTSC`** (not `PAL`) to match — MiSTerFin letterboxes/scales video against whichever one you set there, independent of the ini.
+
+**Known minor cosmetic issue, not yet resolved:** the picture sits slightly off-center on this monitor under this NTSC timing (more empty space top/left than bottom/right) — confirmed present on the stock MiSTer OSD menu too, so it isn't a MiSTerFin bug, and PAL is unaffected on the exact same monitor. Likely needs further `video_mode` porch tuning or a monitor-side geometry adjustment. Doesn't affect usability.
+
+**Status:** confirmed working, including full video playback (a real NTSC-specific mplayer scaling bug was found and fixed along the way — see the repo's commit history) — 2026-07-25.
+
+---
+
 ## Untested / reported problem combos
 
 *(to fill in as we verify or get reports)*
@@ -83,5 +117,6 @@ The same `[Menu]`-scoped override from the SCART combo above (`vga_scaler=1` + t
 - HDMI direct to a modern TV/monitor
 - HDMI → Blackmagic-style capture card (see the aspect-ratio caveat below — MiSTer stretches a Script's framebuffer to fill the target `video_mode` canvas with no aspect correction, unlike FPGA cores)
 - Component (YPbPr) via a passive VGA-to-component adapter, i.e. **without** the official Analog I/O board (**likely does NOT work** — these adapters just rewire pins, they don't do the RGB→YPbPr color-space conversion; confirmed this produces "no sync" on at least one display we tried)
-- NTSC on either SCART or component (not yet tested — the `[Menu]` custom `video_mode` line above is untested for whether it needs different values for NTSC)
+- NTSC over SCART/RGB (NTSC is only confirmed over Component so far — see above)
+- A dedicated VGA monitor (not a SCART/component CRT) — testing in progress
 - Direct Video Adapter (HDMI-to-VGA DAC) for VGA/component output
