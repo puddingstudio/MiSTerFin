@@ -110,6 +110,43 @@ video_mode=640,26,60,74,240,0,4,18,12587
 
 ---
 
+## ✅ Confirmed: Analog I/O board (VGA) → a real multisync VGA CRT monitor, IBM P76 (240p @ 120Hz)
+
+**This is still 240p** — MiSTerFin can't tell this apart from the NTSC Component combo above (same 640×240 framebuffer), it's just reaching a genuine computer VGA monitor instead of a SCART/component-input CRT TV.
+
+**Chain:** MiSTer main board → official MiSTer Analog I/O board (VGA-style DB15 output) → straight VGA cable → IBM P76 (17" multisync CRT computer monitor).
+
+| Connector on MiSTer | Video playback | Music player |
+|---|---|---|
+| ![MiSTer Analog I/O board VGA connector](images/vga240p-mister-connector.jpg) | ![MiSTerFin video playing correctly on the IBM P76](images/vga240p-video.jpg) | ![MiSTerFin music player with VU meters on the IBM P76](images/vga240p-music.jpg) |
+
+**Why this needs a different `video_mode` line than the NTSC Component combo:** a genuine multisync *computer* monitor is built for a much higher horizontal sync frequency (commonly ~31.5kHz+) than a 15kHz-range broadcast-video CRT — feeding it the same ~15.7kHz line used for Component/SCART gives "out of scan range", not a picture. The fix (a known trick, not something we invented — see [RetroRGB's writeup](https://retrorgb.com/mister-240p-120hz-on-a-vga-crt-monitor.html)): keep the same 240 *active lines* but double the field rate to 120Hz. Since horizontal frequency = pixel clock ÷ line length, doubling the *effective* rate this way pushes the horizontal frequency up into a real VGA monitor's supported range while the vertical resolution — and everything MiSTerFin actually draws — stays exactly 240p.
+
+**Relevant `MiSTer.ini` settings:**
+
+```ini
+forced_scandoubler=0   ; we want genuine 240 lines, not scandoubled up to 480
+ypbpr=0                ; RGB
+composite_sync=0       ; separate H/V sync, not combined onto HSync — what a real VGA connector expects
+menu_pal=0
+```
+
+```ini
+[Menu]
+vga_scaler=1
+video_mode=640,240,120
+```
+
+That simpler 3-value `video_mode=width,height,Hz` form (rather than the full 9-value custom-timing form used elsewhere in this doc) is a MiSTer shorthand — it computes matching timing automatically. `640,240,120` = 240 active lines, MiSTer picks the rest so the field rate lands at 120Hz.
+
+**Not every multisync VGA monitor will accept this** — it depends on the monitor's actual supported horizontal frequency range. The IBM P76 does; a monitor with a higher minimum horizontal frequency might not.
+
+**`jellyfin.conf`'s 4th line should be `NTSC`** — same reasoning as the Component NTSC combo (this is the same 240p framebuffer).
+
+**Status:** confirmed working, including video and music playback — 2026-07-25.
+
+---
+
 ## Untested / reported problem combos
 
 *(to fill in as we verify or get reports)*
@@ -118,5 +155,4 @@ video_mode=640,26,60,74,240,0,4,18,12587
 - HDMI → Blackmagic-style capture card (see the aspect-ratio caveat below — MiSTer stretches a Script's framebuffer to fill the target `video_mode` canvas with no aspect correction, unlike FPGA cores)
 - Component (YPbPr) via a passive VGA-to-component adapter, i.e. **without** the official Analog I/O board (**likely does NOT work** — these adapters just rewire pins, they don't do the RGB→YPbPr color-space conversion; confirmed this produces "no sync" on at least one display we tried)
 - NTSC over SCART/RGB (NTSC is only confirmed over Component so far — see above)
-- A dedicated VGA monitor (not a SCART/component CRT) — testing in progress
 - Direct Video Adapter (HDMI-to-VGA DAC) for VGA/component output

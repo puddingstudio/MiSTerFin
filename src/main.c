@@ -881,12 +881,16 @@ static double par_correction(FBDev *fb)
 }
 
 /* How many list rows fit between the list's top (SAFE_Y + 24, see
- * draw_browse) and the bottom hint bar (fb->height - 28) without overlap.
- * At fb->height=288 this floors to exactly 7 — the old hardcoded VISIBLE,
- * unchanged. At fb->height=240 (NTSC) it comes out to 5. */
+ * draw_browse) and the bottom hint bar (fb->height - 8 - SAFE_Y_BOT)
+ * without overlap. */
 static int visible_rows(FBDev *fb)
 {
-    return (fb->height - 28 - (SAFE_Y + 24)) / ROW_H;
+    /* The "28" here used to be a hardcoded stand-in for 8+SAFE_Y_BOT (only
+     * correct back when SAFE_Y_BOT was a flat 20) — now that SAFE_Y_BOT is
+     * derived from par_correction() and comes out smaller on both PAL and
+     * NTSC, using it directly here reclaims that space as an extra visible
+     * row instead of leaving it as unused slack. */
+    return (fb->height - (8 + SAFE_Y_BOT) - (SAFE_Y + 24)) / ROW_H;
 }
 
 /* Simple "flying through stars" background for the About screen — each
@@ -3221,6 +3225,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Cannot open /dev/fb0\n");
         return 1;
     }
+    /* SAFE_Y as a plain pixel count made the top/bottom margin look
+     * noticeably BIGGER than the left/right margin on real hardware, even
+     * though 20 < 24 — because our pixels aren't square. Physically,
+     * SAFE_Y rows are worth more screen distance than SAFE_X columns by
+     * exactly par_correction()'s factor, so dividing by it here equalizes
+     * the four margins in real physical terms instead of raw pixel count.
+     * At fb->height=288 this comes out to 24/1.667≈14 (was a flat 20) —
+     * confirmed as a real improvement there too, not NTSC-only. */
+    SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
     memcpy(fb.mem, fb.back, (size_t)fb.stride * fb.height);
 
     cursor_hide();

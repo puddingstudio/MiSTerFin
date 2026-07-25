@@ -6,6 +6,8 @@ A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfp
 
 Having trouble getting it onto a CRT? Check [docs/DISPLAY_COMPATIBILITY.md](docs/DISPLAY_COMPATIBILITY.md) for confirmed working display/cable/`MiSTer.ini` combinations.
 
+The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it isn't optimized for higher resolutions yet (that may come later). That said, a regular multisync VGA CRT monitor can still be made to show a genuine 240p picture via an `MiSTer.ini` trick documented in the compatibility guide above — in effect, "simulating" a CRT TV's picture on an ordinary computer monitor, for a PVM/BVM-like look without needing broadcast-video hardware.
+
 ---
 
 ## Features
