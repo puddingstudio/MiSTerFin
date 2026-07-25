@@ -194,6 +194,22 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ---
 
+## Changelog
+
+### v0.9.2
+- Fixed video corruption (comb/tearing artifacts) on NTSC displays
+- Various NTSC UI polish — margins, list size, music player cover
+- Display compatibility guide now also covers VGA CRT monitors (240p@120Hz)
+
+### v0.9.1
+- NTSC display support — UI now adapts correctly instead of looking stretched
+- New display compatibility guide for CRT/SCART/component setups having trouble getting picture
+
+### v0.9
+- First public preview release
+
+---
+
 ## Licence
 
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, share, and modify, non-commercial only.
