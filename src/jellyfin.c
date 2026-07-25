@@ -6,9 +6,32 @@
 #include <strings.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 
 #define JF_BUF_SIZE   (256 * 1024)
 #define JF_ITEM_BUF   (JF_OVERVIEW_LEN + JF_NAME_LEN + 512)
+
+#ifndef APP_VERSION
+#define APP_VERSION "dev"
+#endif
+/* Client/Device/DeviceId/Version identify us to Jellyfin's own Dashboard →
+ * Devices list — without them the server had nothing to go on beyond the
+ * bare API token and showed up as a generic/guessed name instead of
+ * "MiSTerFin". DeviceId is a fixed string rather than something derived
+ * per-install (e.g. a MAC address) — multiple MiSTers would show up as one
+ * "device" to Jellyfin, an acceptable trade-off for how small this project
+ * is; nothing here is used for anything security-sensitive. */
+#define JF_CLIENT_HEADERS \
+    "Client=\"MiSTerFin\", Device=\"MiSTer FPGA\", DeviceId=\"misterfin-client\", Version=\"" APP_VERSION "\", "
+
+/* Every jf_* function below that fetches+parses a response uses its own
+ * function-local "static char buf[JF_BUF_SIZE]" — fine when everything runs
+ * on one thread, but the home screen's background grid-cache prefetch
+ * thread (main.c) calls some of these same functions concurrently with the
+ * main thread. One coarse mutex around each of those functions' bodies is
+ * enough: these are all short, sequential fetch+parse calls (no real
+ * parallelism to lose), so serializing them costs nothing meaningful. */
+static pthread_mutex_t g_jf_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Ids and image tags below (item_id, series_id, season_id, parent_id, the
  * ImageTags.Primary hash) come from server JSON and get embedded into
@@ -55,6 +78,19 @@ static int json_str(const char *buf, const char *key, char *out, int maxlen)
         p++;
     }
     out[i] = '\0';
+    return 1;
+}
+
+static int json_double(const char *buf, const char *key, double *out)
+{
+    char pat[80];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(buf, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':') p++;
+    if (!(*p == '-' || *p == '.' || (*p >= '0' && *p <= '9'))) return 0;
+    *out = strtod(p, NULL);
     return 1;
 }
 
@@ -133,6 +169,7 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
     json_str(item_buf, "Name", it->name, sizeof(it->name));
     json_str(item_buf, "Overview", it->overview, sizeof(it->overview));
     json_str(item_buf, "Primary", it->image_tag, sizeof(it->image_tag));
+    json_double(item_buf, "CommunityRating", &it->community_rating);
 
     strncpy(it->image_item_id,    it->id, sizeof(it->image_item_id) - 1);
     strncpy(it->backdrop_item_id, it->id, sizeof(it->backdrop_item_id) - 1);
@@ -350,7 +387,7 @@ static int jf_get(const JfConfig *cfg, const char *path_and_query, char *buf, in
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
         "curl -sfk --max-time 8 "
-        "-H 'Authorization: MediaBrowser Token=\"%s\"' "
+        "-H 'Authorization: MediaBrowser " JF_CLIENT_HEADERS "Token=\"%s\"' "
         "'%s%s' 2>/dev/null",
         cfg->api_key, cfg->server, path_and_query);
 
@@ -377,7 +414,7 @@ static void jf_post_json(const JfConfig *cfg, const char *path, const char *json
     char cmd[768];
     snprintf(cmd, sizeof(cmd),
         "curl -sfk --max-time 5 -X POST "
-        "-H 'Authorization: MediaBrowser Token=\"%s\"' "
+        "-H 'Authorization: MediaBrowser " JF_CLIENT_HEADERS "Token=\"%s\"' "
         "-H 'Content-Type: application/json' "
         "--data-binary @%s "
         "'%s%s' >/dev/null 2>&1",
@@ -431,11 +468,12 @@ int jf_config_load(JfConfig *cfg)
 
 int jf_resolve_user_id(JfConfig *cfg)
 {
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, "/Users", buf, sizeof(buf))) return -1;
+    if (!jf_get(cfg, "/Users", buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
 
     const char *p = strchr(buf, '[');
-    if (!p) return -1;
+    if (!p) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
     p++;
 
     while (1) {
@@ -454,10 +492,13 @@ int jf_resolve_user_id(JfConfig *cfg)
         json_str(ubuf, "Name", name, sizeof(name));
         if (!strcasecmp(name, cfg->username)) {
             json_str(ubuf, "Id", cfg->user_id, sizeof(cfg->user_id));
-            return cfg->user_id[0] != '\0';
+            int ok = cfg->user_id[0] != '\0';
+            pthread_mutex_unlock(&g_jf_mutex);
+            return ok;
         }
         p = end + 1;
     }
+    pthread_mutex_unlock(&g_jf_mutex);
     return 0;
 }
 
@@ -468,10 +509,12 @@ int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
     char path[256];
     snprintf(path, sizeof(path), "/UserViews?userId=%s", cfg->user_id);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
     int n = parse_item_list(buf, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_FOLDER;
+    pthread_mutex_unlock(&g_jf_mutex);
     return n;
 }
 
@@ -490,10 +533,13 @@ int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *i
             "/Items?userId=%s&ParentId=%s&Recursive=true&Limit=0",
             cfg->user_id, safe_parent);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return -1;
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
     int64_t count = 0;
-    return json_int64(buf, "TotalRecordCount", &count) ? count : -1;
+    int64_t result = json_int64(buf, "TotalRecordCount", &count) ? count : -1;
+    pthread_mutex_unlock(&g_jf_mutex);
+    return result;
 }
 
 int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int max)
@@ -511,9 +557,12 @@ int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int m
         "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
         cfg->user_id, safe_parent, max);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
-    return parse_item_list(buf, out, max);
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
+    int n = parse_item_list(buf, out, max);
+    pthread_mutex_unlock(&g_jf_mutex);
+    return n;
 }
 
 int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
@@ -538,9 +587,12 @@ int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
             "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
             cfg->user_id, safe_parent, max);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
-    return parse_item_list(buf, out, max);
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
+    int n = parse_item_list(buf, out, max);
+    pthread_mutex_unlock(&g_jf_mutex);
+    return n;
 }
 
 int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *out, int max)
@@ -555,9 +607,12 @@ int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *ou
         "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
         cfg->user_id, safe_parent, max);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
-    return parse_item_list(buf, out, max);
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
+    int n = parse_item_list(buf, out, max);
+    pthread_mutex_unlock(&g_jf_mutex);
+    return n;
 }
 
 int jf_get_item_details(const JfConfig *cfg, const char *item_id, JfItem *out)
@@ -567,16 +622,18 @@ int jf_get_item_details(const JfConfig *cfg, const char *item_id, JfItem *out)
 
     char path[384];
     snprintf(path, sizeof(path),
-        "/Items/%s?userId=%s&Fields=Overview,ProductionYear,RunTimeTicks,People,MediaStreams"
+        "/Items/%s?userId=%s&Fields=Overview,ProductionYear,RunTimeTicks,People,MediaStreams,CommunityRating"
         "&EnableUserData=true&EnableImageTypes=Primary,Logo,Backdrop",
         safe_id, cfg->user_id);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
 
     parse_item_fields(buf, out);
     parse_cast(buf, out);
     parse_media_streams(buf, out);
+    pthread_mutex_unlock(&g_jf_mutex);
     return 1;
 }
 
@@ -588,10 +645,12 @@ int jf_list_seasons(const JfConfig *cfg, const char *series_id, JfItem *out, int
     char path[256];
     snprintf(path, sizeof(path), "/Shows/%s/Seasons?userId=%s", safe_series, cfg->user_id);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
     int n = parse_item_list(buf, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_SEASON;
+    pthread_mutex_unlock(&g_jf_mutex);
     return n;
 }
 
@@ -609,10 +668,12 @@ int jf_list_episodes(const JfConfig *cfg, const char *series_id, const char *sea
         "&ImageTypeLimit=1&EnableImageTypes=Primary",
         safe_series, safe_season, cfg->user_id);
 
+    pthread_mutex_lock(&g_jf_mutex);
     static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) return 0;
+    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
     int n = parse_item_list(buf, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_EPISODE;
+    pthread_mutex_unlock(&g_jf_mutex);
     return n;
 }
 

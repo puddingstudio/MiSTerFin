@@ -79,6 +79,7 @@ typedef struct {
     int64_t    resume_ticks;           /* UserData.PlaybackPositionTicks */
     int        played;                 /* UserData.Played */
     int        index_number;           /* episode/season number, -1 if n/a */
+    double     community_rating;       /* CommunityRating, e.g. 7.4 — 0 if unset/not fetched */
     JfPerson   cast[JF_MAX_CAST];       /* Actors only, empty unless fetched via jf_get_item_details */
     int        cast_count;
     JfSubtitle subs[JF_MAX_SUBS];       /* empty unless fetched via jf_get_item_details */

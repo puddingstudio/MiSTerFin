@@ -38,6 +38,8 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 Grab the latest release zip from the [Releases](../../releases) page and skip straight to **Installation** below, or build from source if you'd rather. Everything needed to run MiSTerFin (including its own `mplayer-arm`) is built from this repo either way; you don't need a separate mplayer install or any other MiSTer app already set up.
 
+Prefer updating through a MiSTer Downloader? There's also a community-maintained [MiSTerFin database](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin) for [Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer) — install it once and future updates get picked up automatically alongside your other MiSTer Downloader-managed content, as an alternative to the in-app updater above.
+
 Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbdev:/dev/fb0`) and works on any menu core.
 
 ---
@@ -108,7 +110,7 @@ PAL
 ```
 
 1. **Server URL** — no trailing slash.
-2. **API key** — Jellyfin admin dashboard → Advanced → API Keys → **+**.
+2. **API key** — Jellyfin admin dashboard → Advanced → API Keys → **+**. Name it something recognizable like "MiSTerFin" when you create it — Jellyfin's Dashboard → Devices/Sessions shows the *key's own registered name* as the client, permanently fixed at creation time, not something MiSTerFin can override later (its actual version number still shows up correctly regardless). A generically-named key (or one created before you'd settled on a name) will just show that name instead — harmless, but confusing to look at later.
 3. **Username** — your plain Jellyfin username. MiSTerFin resolves it to the real user id via `GET /Users` at startup (the raw id isn't easily findable anywhere in the Jellyfin UI — it only shows up buried in a dashboard URL — but everyone already knows their own username).
 4. **TV mode** — `PAL` or `NTSC`. Optional, defaults to `PAL`.
 
@@ -118,57 +120,59 @@ There is no on-screen setup keyboard in v1 — edit the file over SSH (using the
 
 ## Controls
 
+Button labels below follow Xbox-style naming (bottom face button = A, right face button = B) — this matches most controllers, including generic/8BitDo pads in Xbox mode. Nintendo/SNES-style controllers are the notable exception: their A/B (and X/Y) positions are swapped relative to Xbox, so on those pads the button positions are reversed from the labels here.
+
 ### Browser
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | Left / Right | Left / Right | Navigate the home screen's library carousel |
 | Up / Down | Up / Down | Navigate (home screen in list mode, or anywhere below it) |
 | SELECT | Tab | Home screen only: swap between the carousel and the classic list |
-| A | Enter / X | Open / drill in (library → series → season → episode, or library → artist → album → track) |
-| B | Esc / Backspace / Z | Back (opens an exit-confirm dialog from the top-level library screen — B cancels, A confirms) |
+| B | Enter / X | Open / drill in (library → series → season → episode, or library → artist → album → track) |
+| A | Esc / Backspace / Z | Back (opens an exit-confirm dialog from the top-level library screen — A cancels, B confirms) |
 | START | Pause / Home | About screen |
 
 ### About screen (START)
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter / X | Install the update, if one's available (applied on next launch) |
-| B | Esc / Backspace / Z | Back |
+| B | Enter / X | Install the update, if one's available (applied on next launch) |
+| A | Esc / Backspace / Z | Back |
 
 ### Info screen (movies/episodes)
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter / X | Play (resumes automatically if a resume position exists) |
+| B | Enter / X | Play (resumes automatically if a resume position exists) |
 | SELECT | Tab | Restart from the beginning (only shown if a resume position exists) |
-| B | Esc / Backspace / Z | Back to browser |
+| A | Esc / Backspace / Z | Back to browser |
 
 ### During video playback
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter / X | Pause / resume |
+| B | Enter / X | Pause / resume |
 | Left / Right | Left / Right | Seek back/forward 30s (or adjust subtitle sync, in the subtitle menu) |
 | SELECT | Tab | Open the subtitle menu |
 | L | PageUp | VSync ON |
 | R | PageDown | VSync OFF |
-| B | Esc / Backspace / Z | Stop, back to browser |
+| A | Esc / Backspace / Z | Stop, back to browser |
 
 ### Subtitle menu (SELECT during video playback)
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | Up / Down | Up / Down | Select subtitle track (or off) |
 | Left / Right | Left / Right | Adjust subtitle sync offset |
-| A | Enter / X | Apply |
-| B / SELECT | Esc / Backspace / Z / Tab | Cancel |
+| B | Enter / X | Apply |
+| A / SELECT | Esc / Backspace / Z / Tab | Cancel |
 
 VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom.
 
 ### Now playing (music) — selecting a track plays it immediately, no separate info screen
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| A | Enter / X | Pause / resume |
+| B | Enter / X | Pause / resume |
 | Left / Right | Left / Right | Seek back/forward 10s within the track |
 | Up / Down | Up / Down | Previous / next track in the current album/list |
 | SELECT | Tab | Cycle the background effect (starfield / rain / Toasty Squadron sprites) |
-| B | Esc / Backspace / Z | Stop, back to browser |
+| A | Esc / Backspace / Z | Stop, back to browser |
 
 Reaching the end of a track auto-advances to the next one in the same list, same as any normal music player. Audio is direct-played, so seeking is a real in-place seek (no stop/restart the way video's seek needs).
 
@@ -195,6 +199,14 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## Changelog
+
+### v0.9.3
+- Redesigned info screen — full-height backdrop art, bigger logo, star rating
+- Home screen loads faster — library covers now cache to the SD card and prefetch in the background
+- No more black screen on startup — shows a loading indicator instead
+- Button hints now use Xbox-style A/B/X/Y labels to match most modern controllers
+- Jellyfin dashboard now correctly shows device name and app version
+- Display compatibility guide now also covers PAL 288p@100Hz on VGA CRT monitors
 
 ### v0.9.2
 - Fixed video corruption (comb/tearing artifacts) on NTSC displays

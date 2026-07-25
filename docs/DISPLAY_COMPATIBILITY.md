@@ -145,6 +145,33 @@ That simpler 3-value `video_mode=width,height,Hz` form (rather than the full 9-v
 
 **Status:** confirmed working, including video and music playback — 2026-07-25.
 
+### PAL variant: 288p @ 100Hz
+
+The same trick has a PAL-side equivalent, and it's confirmed working on the same IBM P76 monitor — same cable, same chain, no new photos needed since it looks basically identical to the 240p shots above. This is essentially a clean, native PAL picture — PVM-style — on an ordinary VGA CRT monitor, and with 288 active lines instead of 240 it has a bit more vertical room to work with than the NTSC/240p variant.
+
+The math carries over directly: 288p at 100Hz (PAL's 50Hz field rate, doubled) lands on the same horizontal sync frequency as regular 576p50, which is exactly the range a multisync VGA CRT already has to support — so any monitor that accepts the 240p/120Hz trick above should accept this one too.
+
+**Relevant `MiSTer.ini` settings** (same idea as the 240p block above, PAL-side):
+
+```ini
+forced_scandoubler=0
+ypbpr=0
+composite_sync=0
+menu_pal=1
+```
+
+```ini
+[Menu]
+vga_scaler=1
+video_mode=640,288,100
+```
+
+**`jellyfin.conf`'s 4th line should be `PAL`** — this is the normal 288-line framebuffer, same as the SCART/Component PAL combos above.
+
+**One caveat worth knowing:** at 100Hz, 50fps PAL content can show a faint "double image" effect in fast motion (the same tradeoff the 240p/120Hz trick has with 60fps content at 120Hz, just a bit more noticeable since PAL's native rate is lower) — not something MiSTerFin can do anything about, it's inherent to the doubled-refresh trick itself.
+
+**Status:** confirmed working — 2026-07-26.
+
 ---
 
 ## Untested / reported problem combos

@@ -12,6 +12,7 @@
 #include <linux/input.h>
 #include <linux/kd.h>
 #include <time.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <math.h>
 #ifndef M_PI
@@ -30,6 +31,13 @@
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
+/* Separate download scratch path for the background grid-cache prefetch
+ * thread (see grid_prefetch_thread()) — it must never share POSTER_TMP with
+ * the main thread's own in-flight download (info screen backdrop/logo,
+ * browse cover panel, etc.), which would silently clobber whichever one
+ * finishes last. */
+#define POSTER_TMP_BG "/tmp/misterfin_poster_bg.img"
+#define GRID_CACHE_DIR "/media/fat/misterfin/gridcache"
 #define CRASH_LOG    "/media/fat/misterfin/crash.log"
 /* mplayer's -af export writes live PCM samples to this mmap'd file for the
  * now-playing visualizer to read — confirmed supported on this build
@@ -1352,7 +1360,7 @@ static void draw_now_playing_gradient(FBDev *fb)
 }
 
 /* show_footer=0 skips the "<version> installed"/update-available line and
- * the "B: back" hint — used by the --capture-about tool to render a clean
+ * the "A: back" hint — used by the --capture-about tool to render a clean
  * frame for a standalone marketing GIF (see tools/capture_about_gif.py). */
 static void draw_about_frame(FBDev *fb, int show_footer)
 {
@@ -1436,13 +1444,13 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         } else if (us == UPD_AVAILABLE) {
             draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
             char upd[64];
-            snprintf(upd, sizeof(upd), "%s available   A: install", latest);
+            snprintf(upd, sizeof(upd), "%s available   B: install", latest);
             draw_text(fb, SAFE_X, safe_y, upd, 1, 220, 150, 40);
         } else {
             draw_text(fb, SAFE_X, safe_y, installed, 1, COL_DIM);
         }
 
-        const char *hint = "B: back";
+        const char *hint = "A: back";
         draw_text(fb, fb->width - text_width(fb, hint, 1) - SAFE_X, safe_y, hint, 1, COL_HINT);
     }
 
@@ -1509,7 +1517,7 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
         cur_y += sch + lsp;
     }
 
-    const char *hint = "B: exit";
+    const char *hint = "A: exit";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -1569,7 +1577,7 @@ static void browse_cover_sync(void)
  * (SPINNER_SIZE+SPINNER_MARGIN) so a loading spinner never overlaps it.
  * Returns the clock's own left edge x, so callers that also draw a title
  * (draw_top_bar) know where they need to stop. */
-static int draw_clock(FBDev *fb)
+static int draw_clock_color(FBDev *fb, uint8_t r, uint8_t g, uint8_t b)
 {
     time_t now_t = time(NULL);
     struct tm now_tm;
@@ -1578,8 +1586,27 @@ static int draw_clock(FBDev *fb)
     snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
     int clock_right = fb->width - SPINNER_SIZE - SPINNER_MARGIN - 8;
     int clock_x = clock_right - text_width(fb, clock_buf, 1);
-    draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, COL_HINT);
+    draw_text(fb, clock_x, SAFE_Y + 4, clock_buf, 1, r, g, b);
     return clock_x;
+}
+
+static int draw_clock(FBDev *fb)
+{
+    return draw_clock_color(fb, COL_HINT);
+}
+
+/* Small filled-diamond "rating star" icon — this build's bitmap font is
+ * ASCII-only (no ★ glyph), so a rating number is preceded by this instead
+ * of the word "Rating". 5x5 at scale 1. */
+static void draw_star_icon(FBDev *fb, int x, int y, int scale, uint8_t r, uint8_t g, uint8_t b)
+{
+    static const uint8_t rows[5] = { 0x04, 0x0E, 0x1F, 0x0E, 0x04 };
+    for (int row = 0; row < 5; row++) {
+        for (int col = 0; col < 5; col++) {
+            if ((rows[row] >> (4 - col)) & 1)
+                fb_fill_rect_alpha(fb, x + col * scale, y + row * scale, scale, scale, r, g, b, 255);
+        }
+    }
 }
 
 static void draw_top_bar(FBDev *fb, const char *title)
@@ -1609,7 +1636,7 @@ static void draw_top_bar(FBDev *fb, const char *title)
  * same layering as the subtitle submenu's own overlay. */
 static void draw_confirm_exit(FBDev *fb)
 {
-    const char *msg = "Exit? [A: yes  B: no]";
+    const char *msg = "Exit? [B: yes  A: no]";
     int scale = 2;
     int tw = text_width(fb, msg, scale);
     int th = 8 * scale;
@@ -1684,11 +1711,21 @@ typedef struct {
      * navigation, so reshuffling per-draw would make the background
      * visibly jitter. */
     int      cell_order[GRID_COLS * GRID_ROWS];
+    /* Set only once grid_cache_populate() fully finishes — a slot's
+     * view_id becomes visible to other threads' scans (under g_grid_mutex)
+     * as soon as it's reserved, before population (which can take a while
+     * and deliberately runs without the lock held) completes. Checked by
+     * draw_grid_background so it never renders a slot mid-fill. */
+    int      ready;
 } GridLibCache;
 
 static GridLibCache g_grid_cache[GRID_LIB_CACHE_MAX];
 static int           g_grid_cache_n  = 0;    /* slots filled so far */
 static int           g_grid_active   = -1;   /* index of the currently-shown library's slot, -1 = none */
+/* Protects g_grid_cache/g_grid_cache_n/g_grid_active — grid_covers_sync()
+ * (main thread, interactive) and grid_prefetch_thread() (background,
+ * launched once from the home screen) both touch these. */
+static pthread_mutex_t g_grid_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* A plain Fisher-Yates shuffle of the (count-cycled) index list still reads
  * as "repeating" with few unique covers spread over many cells (e.g. 4
@@ -1719,47 +1756,212 @@ static void grid_cell_order_shuffle(GridLibCache *gc)
     }
 }
 
-/* Sequential downloads+decodes (up to GRID_FETCH_MAX) the first time a
- * given library is seen — covered by the corner spinner between steps,
- * same as info_assets_load's own sequential image fetches. Small request
- * width (100px) keeps each JPEG decode cheap since these only ever render
- * at ~80x72 tile size anyway. Already-cached libraries return immediately
- * (just a linear scan over however many are cached, at most
- * GRID_LIB_CACHE_MAX — trivial). */
-static void grid_covers_sync(FBDev *fb, const JfItem *view)
+/* Turns a Jellyfin GUID view_id into a safe filename — GUIDs are already
+ * hex+dashes so this is just a defensive fallback, not real sanitizing. */
+static void grid_cache_disk_path(const char *view_id, char *out, size_t outsz)
 {
-    for (int i = 0; i < g_grid_cache_n; i++) {
-        if (!strcmp(g_grid_cache[i].view_id, view->id)) { g_grid_active = i; return; }
+    char safe[JF_ID_LEN];
+    size_t j = 0;
+    for (size_t i = 0; view_id[i] && j < sizeof(safe) - 1; i++) {
+        char c = view_id[i];
+        safe[j++] = (isalnum((unsigned char)c) || c == '-') ? c : '_';
     }
-    if (g_grid_cache_n >= GRID_LIB_CACHE_MAX) { g_grid_active = -1; return; }
+    safe[j] = '\0';
+    snprintf(out, outsz, GRID_CACHE_DIR "/%s.dat", safe);
+}
 
-    GridLibCache *gc = &g_grid_cache[g_grid_cache_n];
-    memset(gc, 0, sizeof(*gc));
-    strncpy(gc->view_id, view->id, sizeof(gc->view_id) - 1);
+/* Persisted grid cache survives an app restart — without it, every
+ * library's mosaic had to be re-downloaded/re-decoded from scratch on
+ * every single launch even though nothing in the library had changed,
+ * confirmed as a real lag spike by the user. Freshness check is a single
+ * cheap jf_count_items() (Limit=0) call: if the library's total item count
+ * still matches what it was when this was written, trust the cache as-is.
+ * Doesn't catch a same-count swap (one item replaced by another), but
+ * that's a rare edge case for what's purely decorative background art.
+ * Pixels are stored raw/uncompressed rather than re-encoded to JPEG (this
+ * build's stb_image.h is decode-only, no encoder) — at most ~480KB per
+ * library (12 covers * ~100x100x4 bytes), trivial for an SD card. */
+static int grid_cache_load_from_disk(GridLibCache *gc, const JfItem *view, const char *item_type)
+{
+    int64_t current_count = jf_count_items(&g_cfg, view->id, item_type);
+    if (current_count < 0) return 0;
 
-    static JfItem grid_items[GRID_FETCH_MAX];
+    char path[300];
+    grid_cache_disk_path(view->id, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    int64_t cached_count = -1;
+    int32_t n_covers = 0;
+    if (fread(&cached_count, sizeof(cached_count), 1, f) != 1 ||
+        fread(&n_covers, sizeof(n_covers), 1, f) != 1 ||
+        cached_count != current_count || n_covers <= 0 || n_covers > GRID_FETCH_MAX) {
+        fclose(f);
+        return 0;
+    }
+
+    for (int i = 0; i < n_covers; i++) {
+        int32_t w = 0, h = 0;
+        size_t need;
+        if (fread(&w, sizeof(w), 1, f) != 1 || fread(&h, sizeof(h), 1, f) != 1 ||
+            w <= 0 || h <= 0 || (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
+            fclose(f);
+            for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
+            gc->count = 0;
+            return 0;
+        }
+        uint8_t *px = malloc(need);
+        if (!px || fread(px, 1, need, f) != need) {
+            free(px);
+            fclose(f);
+            for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
+            gc->count = 0;
+            return 0;
+        }
+        gc->px[gc->count] = px;
+        gc->w[gc->count] = w;
+        gc->h[gc->count] = h;
+        gc->count++;
+    }
+    fclose(f);
+    return gc->count > 0;
+}
+
+static void grid_cache_save_to_disk(const GridLibCache *gc, const char *view_id, int64_t count)
+{
+    if (gc->count <= 0) return;
+    mkdir(GRID_CACHE_DIR, 0755);   /* ignore EEXIST/already-there */
+    char path[300];
+    grid_cache_disk_path(view_id, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+
+    int32_t n_covers = gc->count;
+    fwrite(&count, sizeof(count), 1, f);
+    fwrite(&n_covers, sizeof(n_covers), 1, f);
+    for (int i = 0; i < gc->count; i++) {
+        int32_t w = gc->w[i], h = gc->h[i];
+        fwrite(&w, sizeof(w), 1, f);
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(gc->px[i], 1, (size_t)w * (size_t)h * 4, f);
+    }
+    fclose(f);
+}
+
+/* Fills a freshly-reserved (memset to 0, view_id already set) cache slot —
+ * disk cache first (grid_cache_load_from_disk), falling back to sequential
+ * downloads+decodes (up to GRID_FETCH_MAX) otherwise. Shared by the
+ * interactive path (grid_covers_sync, called from the main thread when the
+ * user navigates to a library) and grid_prefetch_thread (background,
+ * silent). dest_path is caller-owned scratch space (POSTER_TMP for the
+ * main thread, POSTER_TMP_BG for the background thread) so the two never
+ * clobber each other's in-flight download; fb_show_ui is NULL for the
+ * silent background path (no spinner/fb_flip — those must stay main-
+ * thread-only, same reasoning as every other "don't touch the framebuffer
+ * off-thread" rule already in this codebase). Deliberately NOT called
+ * under g_grid_mutex — this does slow network I/O, and the slot it's
+ * writing into isn't visible to any reader until the caller marks it
+ * active/counted, so nothing needs the lock held here. */
+static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
+                                 const char *dest_path, FBDev *fb_show_ui)
+{
     const char *item_type = collection_item_type(view->collection_type);
+    if (grid_cache_load_from_disk(gc, view, item_type)) {
+        grid_cell_order_shuffle(gc);
+        gc->ready = 1;
+        return;
+    }
+
+    JfItem grid_items[GRID_FETCH_MAX];
     int n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
 
     int spinner_frame = 0;
     for (int i = 0; i < n && gc->count < GRID_FETCH_MAX; i++) {
         if (!grid_items[i].image_tag[0]) continue;
-        draw_spinner_frame(fb, spinner_frame++); fb_flip(fb);
+        if (fb_show_ui) { draw_spinner_frame(fb_show_ui, spinner_frame++); fb_flip(fb_show_ui); }
         if (jf_download_item_image(&g_cfg, grid_items[i].image_item_id, "Primary",
-                                    grid_items[i].image_tag, 100, POSTER_TMP)) {
-            uint8_t *px = load_image_tmp(POSTER_TMP, &gc->w[gc->count], &gc->h[gc->count]);
+                                    grid_items[i].image_tag, 100, dest_path)) {
+            uint8_t *px = load_image_tmp(dest_path, &gc->w[gc->count], &gc->h[gc->count]);
             if (px) gc->px[gc->count++] = px;
         }
     }
     grid_cell_order_shuffle(gc);
-    g_grid_active = g_grid_cache_n++;
+    int64_t count = jf_count_items(&g_cfg, view->id, item_type);
+    if (count >= 0) grid_cache_save_to_disk(gc, view->id, count);
+    gc->ready = 1;
+}
+
+/* Already-cached libraries (checked here under g_grid_mutex) return
+ * immediately — just a linear scan over however many are cached, at most
+ * GRID_LIB_CACHE_MAX. A never-seen library reserves its slot under the
+ * lock (cheap) then populates it lock-free (grid_cache_populate does the
+ * slow network I/O) before marking it active. */
+static void grid_covers_sync(FBDev *fb, const JfItem *view)
+{
+    pthread_mutex_lock(&g_grid_mutex);
+    for (int i = 0; i < g_grid_cache_n; i++) {
+        if (!strcmp(g_grid_cache[i].view_id, view->id)) {
+            g_grid_active = i;
+            pthread_mutex_unlock(&g_grid_mutex);
+            return;
+        }
+    }
+    if (g_grid_cache_n >= GRID_LIB_CACHE_MAX) {
+        g_grid_active = -1;
+        pthread_mutex_unlock(&g_grid_mutex);
+        return;
+    }
+    int slot = g_grid_cache_n++;
+    GridLibCache *gc = &g_grid_cache[slot];
+    memset(gc, 0, sizeof(*gc));
+    strncpy(gc->view_id, view->id, sizeof(gc->view_id) - 1);
+    pthread_mutex_unlock(&g_grid_mutex);
+
+    grid_cache_populate(gc, view, POSTER_TMP, fb);
+
+    pthread_mutex_lock(&g_grid_mutex);
+    g_grid_active = slot;
+    pthread_mutex_unlock(&g_grid_mutex);
+}
+
+/* Runs once, kicked off (detached) right after the home screen first
+ * loads. Silently walks every library the user has and pre-populates any
+ * that the interactive path hasn't already claimed, so switching to a
+ * library the user hasn't visited yet in this session still shows its
+ * mosaic immediately instead of a blank/dim background while it fetches.
+ * Uses its own download scratch path and never touches fb — see
+ * grid_cache_populate's own comment for why. */
+static void *grid_prefetch_thread(void *arg)
+{
+    (void)arg;
+    JfItem views[GRID_LIB_CACHE_MAX];
+    int n = jf_list_views(&g_cfg, views, GRID_LIB_CACHE_MAX);
+
+    for (int i = 0; i < n; i++) {
+        pthread_mutex_lock(&g_grid_mutex);
+        int already = 0;
+        for (int j = 0; j < g_grid_cache_n; j++)
+            if (!strcmp(g_grid_cache[j].view_id, views[i].id)) { already = 1; break; }
+        int slot = -1;
+        if (!already && g_grid_cache_n < GRID_LIB_CACHE_MAX) {
+            slot = g_grid_cache_n++;
+            GridLibCache *gc = &g_grid_cache[slot];
+            memset(gc, 0, sizeof(*gc));
+            strncpy(gc->view_id, views[i].id, sizeof(gc->view_id) - 1);
+        }
+        pthread_mutex_unlock(&g_grid_mutex);
+        if (slot < 0) continue;
+
+        grid_cache_populate(&g_grid_cache[slot], &views[i], POSTER_TMP_BG, NULL);
+    }
+    return NULL;
 }
 
 static void draw_grid_background(FBDev *fb)
 {
     if (g_grid_active < 0) return;
     GridLibCache *gc = &g_grid_cache[g_grid_active];
-    if (gc->count == 0) return;
+    if (!gc->ready || gc->count == 0) return;
     int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
     for (int row = 0; row < GRID_ROWS; row++) {
         for (int col = 0; col < GRID_COLS; col++) {
@@ -1822,7 +2024,7 @@ static void draw_carousel_cards(FBDev *fb, double visual_sel, int cy)
 
 static void draw_carousel_hint(FBDev *fb)
 {
-    const char *hint = "LEFT/RIGHT: browse   A:select   SELECT:list view   B:exit";
+    const char *hint = "LEFT/RIGHT: browse   B:select   SELECT:list view   A:exit";
     draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 }
@@ -2038,9 +2240,9 @@ static void draw_browse(FBDev *fb)
 
     int showing_artists = g_item_count > 0 && g_items[0].type == JF_TYPE_ARTIST;
     const char *hint =
-        (g_stack_depth > 1 && showing_artists) ? "A:select  SELECT:shuffle library  B:back" :
-        (g_stack_depth > 1)                    ? "A:select  B:back" :
-                                                  "A:select  SELECT:cover view  B:exit";
+        (g_stack_depth > 1 && showing_artists) ? "B:select  SELECT:shuffle library  A:back" :
+        (g_stack_depth > 1)                    ? "B:select  A:back" :
+                                                  "B:select  SELECT:cover view  A:exit";
     draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -2074,62 +2276,109 @@ static void draw_info(FBDev *fb)
 {
     fb_clear(fb);
 
-    /* cast_thumb/overview_lines are the fixed-size elements below the
-     * banner (font row height and photo size don't shrink with
-     * resolution) — hero_h is solved from whatever's left so the cast row
-     * never gets clipped/pushed under the hint bar, then capped at 150 (the
-     * original PAL-tuned size) so this is a no-op at 288 active lines. */
-    const int cast_thumb = 34;
+    /* Cast row is disabled for now (see the commented-out block further
+     * down) — too small to read well at this resolution, per user
+     * feedback. cast_thumb is no longer subtracted from hero_h's budget,
+     * so the banner/logo area and the text below both get more room than
+     * before. overview_lines is still the one fixed-size element below the
+     * banner (font row height doesn't shrink with resolution) — hero_h is
+     * solved from whatever's left, capped at 150 (the original PAL-tuned
+     * size) so this is a no-op at 288 active lines. */
+    const int cast_thumb = 34;   /* kept as a constant for when the cast row above is re-enabled */
+    (void)cast_thumb;            /* unused while that row is #if 0'd out below */
     const int overview_lines = 3;
-    int hero_h = fb->height - 58 - overview_lines * 10 - cast_thumb;
+    int hero_h = fb->height - 58 - overview_lines * 10;
     if (hero_h > 150) hero_h = 150;
     if (hero_h < 80) hero_h = 80;
 
-    /* Backdrop: full-bleed cover-crop (crop the taller dimension so the
-     * remaining region already matches the target box's aspect ratio,
-     * then a single uniform fb_blit stretch is distortion-free) — a plain
-     * stretch-to-fill would visibly warp most 16:9-ish backdrops into our
-     * much wider 640-wide box. */
+    /* Backdrops are Jellyfin's standard 16:9 — shown here at that real
+     * physical aspect ratio, using the WHOLE image (fb_blit scales/
+     * compresses every source row into the target box, it doesn't crop),
+     * spanning the full width, glued to the top edge. (3*fb->height)/4 is
+     * the closed-form pixel height for a 16:9-DAR image spanning fb->width
+     * on this platform's non-square pixels (same derivation as
+     * par_correction(), simplifies cleanly for the 16:9 case specifically)
+     * — the first attempt at this got the target height right but then
+     * CROPPED down to it instead of scaling the full image into it, which
+     * was the actual bug (discarding real picture content unnecessarily).
+     * hero_h itself (logo/title/ty layout below) is unchanged — this only
+     * affects how tall the image+gradient extends above/behind that
+     * existing content. */
+    int hero_h_full = (3 * fb->height) / 4;
+    if (hero_h_full < hero_h) hero_h_full = hero_h;
     if (g_backdrop_px) {
-        int crop_h = g_backdrop_w * hero_h / fb->width;
-        if (crop_h > g_backdrop_h) crop_h = g_backdrop_h;
-        int skip = (g_backdrop_h - crop_h) / 2;
-        const uint8_t *cropped = g_backdrop_px + (size_t)skip * g_backdrop_w * 4;
-        fb_blit(fb, cropped, g_backdrop_w, crop_h, 0, 0, fb->width, hero_h, 255);
+        fb_blit(fb, g_backdrop_px, g_backdrop_w, g_backdrop_h, 0, 0, fb->width, hero_h_full, 255);
     } else {
-        fb_fill_rect_alpha(fb, 0, 0, fb->width, hero_h, 0x18, 0x18, 0x18, 255);
+        fb_fill_rect_alpha(fb, 0, 0, fb->width, hero_h_full, 0x18, 0x18, 0x18, 255);
     }
 
-    /* Legibility gradient behind the logo/title: transparent at the
-     * backdrop's midpoint, fading to near-opaque black by the bottom edge
-     * so it blends smoothly into the solid black area below the hero
-     * instead of showing a hard-edged bar. */
-    int grad_top = hero_h / 2;
-    for (int gy = grad_top; gy < hero_h; gy++) {
-        int a = (gy - grad_top) * 220 / (hero_h - grad_top);
+    /* Legibility gradient over the whole image: transparent at the very
+     * top, fully opaque black by the image's own bottom edge so it blends
+     * into the solid black area below (and behind whatever of the existing
+     * title/logo/text happens to land on top of it, unchanged position). */
+    for (int gy = 0; gy < hero_h_full; gy++) {
+        int a = gy * 255 / (hero_h_full - 1);
         fb_fill_rect_alpha(fb, 0, gy, fb->width, 1, 0, 0, 0, (uint8_t)a);
     }
 
+    draw_clock(fb);
+
+    /* Logo (or the text fallback) is centered horizontally and anchored
+     * toward the BOTTOM of the 0..hero_h band (not its vertical middle) —
+     * per feedback, low in the banner reads better than dead-center.
+     * Replicates blit_fit_centered's own dw/dh calc so the box's actual
+     * (aspect-fit) size is known up front, same technique already used
+     * for draw_browse's cover panel. */
+    int logo_max_h = 44;
+    int logo_cy = hero_h - logo_max_h / 2 + 3;
     if (g_logo_px) {
-        /* max_w bumped from 280: the 5/3 PAR-corrected width for a wide
-         * logo often exceeds that, which clamped height down below the
-         * intended 34px target (confirmed on hardware — logos looked
-         * smaller after the aspect fix). 480 covers essentially any real
-         * logo's aspect ratio at the full target height. */
+        int dh = logo_max_h;
+        int dw = (int)((double)g_logo_w / g_logo_h * dh * par_correction(fb) + 0.5);
+        if (dw > 480) { dh = dh * 480 / dw; dw = 480; }
         blit_fit_centered(fb, g_logo_px, g_logo_w, g_logo_h,
-                           fb->width / 2, hero_h - 24, 480, 34, 255);
+                           fb->width / 2, logo_cy, dw, dh, 255);
     } else {
         char title_line[300];
         if (g_info_item.year[0])
             snprintf(title_line, sizeof(title_line), "%s (%s)", g_info_item.name, g_info_item.year);
         else
             snprintf(title_line, sizeof(title_line), "%s", g_info_item.name);
-        draw_text(fb, (fb->width - text_width(fb, title_line, 1)) / 2, hero_h - 28,
+        draw_text(fb, (fb->width - text_width(fb, title_line, 1)) / 2, logo_cy - 4,
                   title_line, 1, COL_SEL_FG);
     }
 
-    int ty = hero_h + 8;
+    /* Text block (year/rating/status + overview) is anchored from the
+     * BOTTOM up, not stacked right under the banner: with the cast row
+     * gone there's a lot of freed vertical space, and the goal is for the
+     * block's bottom edge to land close to (not all the way down to)
+     * where the old cast row used to sit, just above the hint bar —
+     * rather than leaving that space empty right under the banner.
+     * content_h_estimate mirrors the same "16 for the rating row + 10px
+     * per overview line" budget hero_h's own formula above assumes. */
+    int content_h_estimate = 16 + overview_lines * 10 + 4;
+    int content_bottom = fb->height - 8 - SAFE_Y_BOT - 34;
+    int ty = content_bottom - content_h_estimate;
+    if (ty < hero_h + 4) ty = hero_h + 4;
     int tw = fb->width - 2 * SAFE_X;
+
+    /* Year + rating (gold star icon, not the word "Rating" — this build's
+     * font has no ★ glyph) on the left, runtime/watched-or-resume status
+     * on the right — same row, opposite ends of the safe zone. */
+    int lx = SAFE_X;
+    int left_info_shown = 0;
+    if (g_info_item.year[0]) {
+        draw_text(fb, lx, ty, g_info_item.year, 1, COL_DIM);
+        lx += text_width(fb, g_info_item.year, 1) + 8;
+        left_info_shown = 1;
+    }
+    if (g_info_item.community_rating > 0) {
+        draw_star_icon(fb, lx, ty + 1, 1, 0xFF, 0xD7, 0x00);
+        lx += 5 + 4;
+        char rating_buf[8];
+        snprintf(rating_buf, sizeof(rating_buf), "%.1f", g_info_item.community_rating);
+        draw_text(fb, lx, ty, rating_buf, 1, COL_DIM);
+        left_info_shown = 1;
+    }
 
     char status[64] = {0};
     if (g_info_item.runtime_ticks > 0)
@@ -2144,16 +2393,24 @@ static void draw_info(FBDev *fb)
         strncpy(status, rbuf, sizeof(status) - 1);
     }
     if (status[0]) {
-        if (g_info_item.played)                          draw_text(fb, SAFE_X, ty, status, 1, COL_WATCHED);
-        else if (g_info_item.resume_ticks > 0)            draw_text(fb, SAFE_X, ty, status, 1, COL_RESUME);
-        else                                              draw_text(fb, SAFE_X, ty, status, 1, COL_DIM);
-        ty += 12;
+        int sx = fb->width - SAFE_X - text_width(fb, status, 1);
+        if (g_info_item.played)                          draw_text(fb, sx, ty, status, 1, COL_WATCHED);
+        else if (g_info_item.resume_ticks > 0)            draw_text(fb, sx, ty, status, 1, COL_RESUME);
+        else                                              draw_text(fb, sx, ty, status, 1, COL_DIM);
     }
+    if (status[0] || left_info_shown) ty += 16;
 
     if (g_info_item.overview[0])
         ty += draw_wrapped(fb, SAFE_X, ty, g_info_item.overview, 1, tw, overview_lines, COL_ITEM);
     ty += 4;
 
+#if 0
+    /* Cast row — disabled for now, per user feedback: the headshots are too
+     * small to read well at this resolution either way. Kept here (not
+     * deleted) in case it's worth reviving — e.g. at a bigger thumb size,
+     * or once there's more vertical room to work with. cast_thumb is still
+     * defined above (just no longer subtracted from hero_h's budget) so
+     * re-enabling this is a matter of restoring that subtraction too. */
     /* Cast row — small headshots only, no name labels: there isn't enough
      * vertical room left at this resolution for both a photo and legible
      * text per person. */
@@ -2171,10 +2428,11 @@ static void draw_info(FBDev *fb)
                         cx - thumb/2, cy - thumb/2, thumb, thumb, 255);
         }
     }
+#endif
 
     const char *hint = (g_info_item.resume_ticks > 0 && !g_info_item.played)
-        ? "A:resume  SELECT:restart  B:back"
-        : "A:play  B:back";
+        ? "B:resume  SELECT:restart  A:back"
+        : "B:play  A:back";
     draw_text(fb, (fb->width - text_width(fb, hint,1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -2232,8 +2490,8 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
                   (double)g_info_item.runtime_ticks / 10000000.0);
 
     const char *hint = (g_info_item.sub_count > 0)
-        ? "A:resume  B:stop  L/R:vsync  SELECT:subs"
-        : "A:resume  B:stop  L/R:vsync";
+        ? "B:resume  A:stop  L/R:vsync  SELECT:subs"
+        : "B:resume  A:stop  L/R:vsync";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -2608,7 +2866,7 @@ static void draw_submenu(FBDev *fb)
 
     const char *hint1 = "UP/DOWN: select subtitle";
     const char *hint2 = "LEFT/RIGHT: adjust subtitle offset";
-    const char *hint3 = "A: apply    B: cancel";
+    const char *hint3 = "B: apply    A: cancel";
     draw_text(fb, box_x + (box_w - text_width(fb, hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
     list_y += 12;
     draw_text(fb, box_x + (box_w - text_width(fb, hint2, 1)) / 2, list_y, hint2, 1, COL_HINT);
@@ -3112,8 +3370,8 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     /* Hint line stays at the SAME height as every other screen's hint row
      * (fb->height - 8 - SAFE_Y_BOT) — everything above it got tightened/
      * moved up instead, per user feedback that this must stay consistent. */
-    const char *hint = g_paused ? "A:resume  L/R:seek  U/D:prev/next  SELECT:bg  B:stop"
-                                 : "A:pause  L/R:seek  U/D:prev/next  SELECT:bg  B:stop";
+    const char *hint = g_paused ? "B:resume  L/R:seek  U/D:prev/next  SELECT:bg  A:stop"
+                                 : "B:pause  L/R:seek  U/D:prev/next  SELECT:bg  A:stop";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -3203,6 +3461,38 @@ static void redraw_current_screen(FBDev *fb, AppState state)
     }
 }
 
+/* ── startup resolve (backgrounded so the black screen at launch can show
+ * the blinking corner spinner instead of just sitting there) ──────────────
+ * jf_config_load + jf_resolve_user_id + the initial library listing
+ * (push_frame's fetch_frame call) are a few sequential blocking network
+ * round-trips — on a slow/distant server this was the whole cause of the
+ * occasional 5-6s black-screen pause at launch, not SD card reads. Running
+ * them on a thread and blinking the spinner on the main thread in the
+ * meantime turns that dead pause into visible feedback; when the server's
+ * fast this thread finishes before the first spinner flip even happens, so
+ * the screen just goes black-to-browse same as before — no flash. */
+#define STARTUP_PENDING -2
+#define STARTUP_CONFIG_MISSING -3
+static pthread_mutex_t g_startup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_startup_result = STARTUP_PENDING;
+
+static void *startup_resolve_thread(void *arg)
+{
+    (void)arg;
+    int result;
+    if (!jf_config_load(&g_cfg)) {
+        result = STARTUP_CONFIG_MISSING;
+    } else {
+        result = jf_resolve_user_id(&g_cfg);
+        if (result == 1)
+            push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+    }
+    pthread_mutex_lock(&g_startup_mutex);
+    g_startup_result = result;
+    pthread_mutex_unlock(&g_startup_mutex);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--capture-about") == 0)
@@ -3244,27 +3534,40 @@ int main(int argc, char **argv)
      * each frame (see VSYNC_FLAG comment above). */
     { int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644); if (vf >= 0) close(vf); }
 
+    pthread_t startup_tid;
+    pthread_create(&startup_tid, NULL, startup_resolve_thread, NULL);
+    {
+        int spinner_frame = 0;
+        for (;;) {
+            pthread_mutex_lock(&g_startup_mutex);
+            int done = (g_startup_result != STARTUP_PENDING);
+            pthread_mutex_unlock(&g_startup_mutex);
+            if (done) break;
+            draw_spinner_frame(&fb, spinner_frame++);
+            fb_flip(&fb);
+            usleep(SPINNER_BLINK_MS * 1000);
+        }
+    }
+    pthread_join(startup_tid, NULL);
+
     AppState state;
-    if (!jf_config_load(&g_cfg)) {
+    int resolved = g_startup_result;
+    if (resolved == STARTUP_CONFIG_MISSING) {
         state = STATE_CONFIG_ERROR;
         snprintf(g_setup_reason, sizeof(g_setup_reason), "jellyfin.conf not found or incomplete");
         draw_setup_screen(&fb, g_setup_reason);
+    } else if (resolved == 1) {
+        state = STATE_BROWSE;
     } else {
-        int resolved = jf_resolve_user_id(&g_cfg);
-        if (resolved == 1) {
-            state = STATE_BROWSE;
-            push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
-        } else {
-            state = STATE_CONFIG_ERROR;
-            /* -1 = the request itself failed (server unreachable) — don't
-             * blame the config for that, it might be perfectly correct and
-             * the server's just down/wrong URL. 0 = server answered but no
-             * user matched, which really is a config problem. */
-            snprintf(g_setup_reason, sizeof(g_setup_reason),
-                     resolved == -1 ? "Can't connect to server (check server URL)"
-                                    : "Username not found on server (check spelling)");
-            draw_setup_screen(&fb, g_setup_reason);
-        }
+        state = STATE_CONFIG_ERROR;
+        /* -1 = the request itself failed (server unreachable) — don't
+         * blame the config for that, it might be perfectly correct and
+         * the server's just down/wrong URL. 0 = server answered but no
+         * user matched, which really is a config problem. */
+        snprintf(g_setup_reason, sizeof(g_setup_reason),
+                 resolved == -1 ? "Can't connect to server (check server URL)"
+                                : "Username not found on server (check spelling)");
+        draw_setup_screen(&fb, g_setup_reason);
     }
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu core
@@ -3287,6 +3590,19 @@ int main(int argc, char **argv)
         pthread_attr_setdetachstate(&upd_attr, PTHREAD_CREATE_DETACHED);
         pthread_create(&upd_tid, &upd_attr, update_check_thread, NULL);
         pthread_attr_destroy(&upd_attr);
+    }
+
+    /* Silently pre-fetch every library's grid background in the
+     * background, so switching to one the user hasn't visited yet this
+     * session doesn't show a blank/dim background while it fetches — see
+     * grid_prefetch_thread's own comment. */
+    {
+        pthread_t grid_tid;
+        pthread_attr_t grid_attr;
+        pthread_attr_init(&grid_attr);
+        pthread_attr_setdetachstate(&grid_attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&grid_tid, &grid_attr, grid_prefetch_thread, NULL);
+        pthread_attr_destroy(&grid_attr);
     }
 
     int playing = 0;
