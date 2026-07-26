@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
@@ -29,6 +30,7 @@
 #include "stb_image.h"
 #include "ddr.h"
 #include "jellyfin.h"
+#include "json.h"
 #include "subtitles.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
@@ -139,31 +141,93 @@ static pthread_mutex_t g_upd_mutex = PTHREAD_MUTEX_INITIALIZER;
  * APP_VERSION. No-op-safe if that repo doesn't exist yet (this project is
  * local-only for now) — the request just fails and the About screen shows
  * no update line, same as any other network hiccup. */
+/* Runs a command with an explicit argv and NO SHELL, optionally capturing
+ * stdout. Same reasoning as jf_curl_run in jellyfin.c: the update path
+ * interpolates a GitHub-supplied release tag, and with a shell that tag is
+ * parsed by /bin/sh. Returns 1 if the command exited 0. */
+static int run_no_shell(char *const argv[], char *out, int outlen)
+{
+    if (out && outlen > 0) out[0] = '\0';
+
+    int pfd[2];
+    if (out && pipe(pfd) != 0) return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (out) { close(pfd[0]); close(pfd[1]); }
+        return 0;
+    }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (out) { dup2(pfd[1], STDOUT_FILENO); close(pfd[0]); close(pfd[1]); }
+        else if (devnull >= 0) dup2(devnull, STDOUT_FILENO);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    if (out) {
+        close(pfd[1]);
+        int len = 0;
+        for (;;) {
+            ssize_t got = read(pfd[0], out + len, (size_t)(outlen - 1 - len));
+            if (got <= 0) break;
+            len += (int)got;
+            if (len >= outlen - 1) break;
+        }
+        out[len] = '\0';
+        close(pfd[0]);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* A release tag is pasted into a download URL and a filename, so it gets a
+ * strict allowlist rather than being trusted. Real tags look like "v0.9.3".
+ * Returns 1 if the tag is safe to use. */
+static int update_tag_is_sane(const char *tag)
+{
+    if (!tag || !tag[0] || strlen(tag) > 24) return 0;
+    for (const char *p = tag; *p; p++) {
+        int ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                 (*p >= '0' && *p <= '9') || *p == '.' || *p == '-' || *p == '_';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* Deliberately WITHOUT -k, unlike requests to the user's own Jellyfin server.
+ * A self-signed certificate is normal for a home media server, so verification
+ * is relaxed there; github.com has a valid certificate and there is no reason
+ * to accept anything else. It matters more here than anywhere else in the app:
+ * this path decides which binary gets written over misterfin-arm and run at
+ * next launch, so accepting a substituted response is accepting a substituted
+ * executable. No amount of quoting downstream fixes that. */
 static void *update_check_thread(void *arg)
 {
     (void)arg;
-    FILE *f = popen(
-        "curl -sfk --max-time 8 "
-        "https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest "
-        "2>/dev/null", "r");
-    if (!f) {
-        pthread_mutex_lock(&g_upd_mutex);
-        g_upd_state = UPD_FAILED;
-        pthread_mutex_unlock(&g_upd_mutex);
-        return NULL;
-    }
-    char buf[4096] = {0};
-    fread(buf, 1, sizeof(buf) - 1, f);
-    pclose(f);
 
-    char *p = strstr(buf, "\"tag_name\"");
-    if (!p) goto fail;
-    p = strchr(p, ':'); if (!p) goto fail;
-    p++;
-    while (*p == ' ' || *p == '"') p++;
+    char *const argv[] = {
+        (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
+        (char *)"--tlsv1.2", (char *)"--max-time", (char *)"8",
+        (char *)"https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest",
+        NULL
+    };
+
+    char buf[8192];
+    if (!run_no_shell(argv, buf, sizeof(buf))) goto fail;
+
+    /* Parsed properly rather than scanned for — the same reason every other
+     * response in this app is. */
+    JsonDoc doc;
+    if (!json_parse(&doc, buf)) goto fail;
     char tag[32] = {0};
-    int i = 0;
-    while (*p && *p != '"' && i < 31) tag[i++] = *p++;
+    json_copy_str(&doc, NULL, "tag_name", tag, sizeof(tag));
+    json_free(&doc);
+
+    if (!update_tag_is_sane(tag)) goto fail;
 
     pthread_mutex_lock(&g_upd_mutex);
     strncpy(g_upd_latest, tag, sizeof(g_upd_latest) - 1);
@@ -177,8 +241,6 @@ fail:
     pthread_mutex_unlock(&g_upd_mutex);
     return NULL;
 }
-
-/* ── Install ──────────────────────────────────────────────────────────────── */
 
 typedef enum { INST_IDLE, INST_DOWNLOADING, INST_DONE, INST_FAILED } InstallState;
 
@@ -206,22 +268,55 @@ static void *install_thread(void *arg)
     tag[sizeof(tag) - 1] = '\0';
     pthread_mutex_unlock(&g_upd_mutex);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "curl -Lsk --max-time 120 "
-        "https://github.com/puddingstudio/MiSTerFin/releases/download/%s/misterfin-%s.zip "
-        "-o /tmp/misterfin-update.zip 2>/dev/null",
-        tag, tag);
-    if (system(cmd) != 0) { set_inst(INST_FAILED); return NULL; }
+    /* Re-checked here, not just where it was parsed: the tag crosses a mutex
+     * and a thread boundary in between, and this is the point where it turns
+     * into a URL. */
+    if (!update_tag_is_sane(tag)) { set_inst(INST_FAILED); return NULL; }
 
-    system("rm -rf /tmp/misterfin-update/");
-    if (system("unzip -q -o /tmp/misterfin-update.zip -d /tmp/misterfin-update/ 2>/dev/null") != 0)
-        { set_inst(INST_FAILED); return NULL; }
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://github.com/puddingstudio/MiSTerFin/releases/download/%s/misterfin-%s.zip",
+             tag, tag);
 
-    system("cp -r /tmp/misterfin-update/misterfin/font/.    /media/fat/misterfin/font/    2>/dev/null");
-    system("cp -r /tmp/misterfin-update/misterfin/subfont/. /media/fat/misterfin/subfont/ 2>/dev/null");
-    system("cp -r /tmp/misterfin-update/misterfin/toasty/.  /media/fat/misterfin/toasty/  2>/dev/null");
-    system("cp    /tmp/misterfin-update/misterfin/about.png /media/fat/misterfin/about.png 2>/dev/null");
+    {
+        char *const argv[] = {
+            (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
+            (char *)"--tlsv1.2", (char *)"--max-time", (char *)"120",
+            url, (char *)"-o", (char *)"/tmp/misterfin-update.zip", NULL
+        };
+        if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
+    }
+
+    {
+        char *const argv[] = { (char *)"rm", (char *)"-rf",
+                               (char *)"/tmp/misterfin-update/", NULL };
+        run_no_shell(argv, NULL, 0);
+    }
+    {
+        /* -qq quiet, -o overwrite. Info-ZIP refuses absolute and ../ paths by
+         * default, so a crafted archive can't escape the destination. */
+        char *const argv[] = { (char *)"unzip", (char *)"-qq", (char *)"-o",
+                               (char *)"/tmp/misterfin-update.zip",
+                               (char *)"-d", (char *)"/tmp/misterfin-update/", NULL };
+        if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
+    }
+
+    static const char *const asset_copies[][3] = {
+        { "-r", "/tmp/misterfin-update/misterfin/font/.",    "/media/fat/misterfin/font/"    },
+        { "-r", "/tmp/misterfin-update/misterfin/subfont/.", "/media/fat/misterfin/subfont/" },
+        { "-r", "/tmp/misterfin-update/misterfin/toasty/.",  "/media/fat/misterfin/toasty/"  },
+        { NULL, "/tmp/misterfin-update/misterfin/about.png", "/media/fat/misterfin/about.png" },
+    };
+    for (size_t i = 0; i < sizeof(asset_copies) / sizeof(asset_copies[0]); i++) {
+        char *argv[6];
+        int n = 0;
+        argv[n++] = (char *)"cp";
+        if (asset_copies[i][0]) argv[n++] = (char *)asset_copies[i][0];
+        argv[n++] = (char *)asset_copies[i][1];
+        argv[n++] = (char *)asset_copies[i][2];
+        argv[n]   = NULL;
+        run_no_shell(argv, NULL, 0);
+    }
 
     FILE *f = fopen("/tmp/misterfin_apply_update.sh", "w");
     if (f) {
