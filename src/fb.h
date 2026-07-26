@@ -10,8 +10,13 @@ typedef struct {
     int      stride;    /* bytes per row */
     int      n_pages;   /* 1 or 2 (double-buffered fbdev) */
     size_t   mmap_size; /* total mmap'd bytes (stride * height * n_pages) */
+    int      headless;  /* 1 = plain malloc'd buffers, no real fbdev (see fb_open) */
 } FBDev;
 
+/* Opens the real fbdev at `path`, UNLESS the MISTERFIN_FB environment
+ * variable is set — in which case it fabricates an equivalent FBDev backed
+ * by plain malloc'd buffers instead (see fb_open's own comment). Format is
+ * "WxH", e.g. MISTERFIN_FB=640x288 for PAL, 640x240 for NTSC. */
 int  fb_open(FBDev *fb, const char *path);
 void fb_close(FBDev *fb);
 void fb_clear(FBDev *fb);   /* clear back-buffer to black */

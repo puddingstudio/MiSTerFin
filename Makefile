@@ -1,4 +1,4 @@
-SRCS = src/main.c src/fb.c src/ddr.c src/jellyfin.c
+SRCS = src/main.c src/fb.c src/ddr.c src/jellyfin.c src/json.c src/subtitles.c
 
 TARGET     = misterfin
 TARGET_ARM = misterfin-arm
@@ -13,12 +13,26 @@ CFLAGS_ARM = -O2 -Isrc -DAPP_VERSION=\"$(VERSION)\" -D_FILE_OFFSET_BITS=64
 
 MISTER_HOST ?= mister.local
 
-.PHONY: all arm clean deploy
+.PHONY: all arm clean deploy test
 
 all: $(TARGET)
 
+# Unit tests. Host build only; neither of these has anything platform-specific
+# in it. The JSON parser sits under every server response the client reads;
+# the subtitle clean-up can only otherwise be checked during playback, which
+# needs real hardware.
+test:
+	$(CC) $(CFLAGS) -o /tmp/misterfin_test_json tests/test_json.c src/json.c
+	@/tmp/misterfin_test_json
+	$(CC) $(CFLAGS) -o /tmp/misterfin_test_subtitles \
+		tests/test_subtitles.c src/subtitles.c src/jellyfin.c src/json.c
+	@/tmp/misterfin_test_subtitles
+
+# -lm: stb_image needs pow(), the Toasty sprite paths need sinf/sincosf. The
+# ARM build gets libm folded into libc by zig's target libc, so only the host
+# build has to ask for it explicitly.
 $(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread -lm
 
 arm: $(SRCS)
 	$(CC_ARM) $(CFLAGS_ARM) -o $(TARGET_ARM) $^ -lpthread -ldl

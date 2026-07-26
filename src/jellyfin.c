@@ -1,4 +1,5 @@
 #include "jellyfin.h"
+#include "json.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,32 +7,25 @@
 #include <strings.h>
 #include <unistd.h>
 #include <time.h>
-#include <pthread.h>
-
-#define JF_BUF_SIZE   (256 * 1024)
-#define JF_ITEM_BUF   (JF_OVERVIEW_LEN + JF_NAME_LEN + 512)
 
 #ifndef APP_VERSION
 #define APP_VERSION "dev"
 #endif
-/* Client/Device/DeviceId/Version identify us to Jellyfin's own Dashboard →
- * Devices list — without them the server had nothing to go on beyond the
- * bare API token and showed up as a generic/guessed name instead of
- * "MiSTerFin". DeviceId is a fixed string rather than something derived
- * per-install (e.g. a MAC address) — multiple MiSTers would show up as one
- * "device" to Jellyfin, an acceptable trade-off for how small this project
- * is; nothing here is used for anything security-sensitive. */
+/* Client/Device/Version identify us to Jellyfin's own Dashboard → Devices
+ * list — without them the server had nothing to go on beyond the bare token
+ * and showed up as a generic/guessed name instead of "MiSTerFin". DeviceId is
+ * appended separately by jf_auth_header, since it's per-install rather than a
+ * compile-time constant (see JfConfig.device_id for why that matters). */
 #define JF_CLIENT_HEADERS \
-    "Client=\"MiSTerFin\", Device=\"MiSTer FPGA\", DeviceId=\"misterfin-client\", Version=\"" APP_VERSION "\", "
+    "Client=\"MiSTerFin\", Device=\"MiSTer FPGA\", Version=\"" APP_VERSION "\""
 
-/* Every jf_* function below that fetches+parses a response uses its own
- * function-local "static char buf[JF_BUF_SIZE]" — fine when everything runs
- * on one thread, but the home screen's background grid-cache prefetch
- * thread (main.c) calls some of these same functions concurrently with the
- * main thread. One coarse mutex around each of those functions' bodies is
- * enough: these are all short, sequential fetch+parse calls (no real
- * parallelism to lose), so serializing them costs nothing meaningful. */
-static pthread_mutex_t g_jf_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* There is deliberately no lock in this file any more. Each fetch now reads
+ * into its own heap buffer instead of a function-local "static char
+ * buf[256K]", so two threads calling in at once (the home screen's
+ * background cover prefetch does exactly that) no longer share anything
+ * mutable. The mutex that used to serialize every request existed solely to
+ * protect those static buffers — dropping it lets the prefetch thread
+ * actually run in parallel with the main thread instead of taking turns. */
 
 /* Ids and image tags below (item_id, series_id, season_id, parent_id, the
  * ImageTags.Primary hash) come from server JSON and get embedded into
@@ -49,127 +43,175 @@ static void jf_sanitize_id(const char *in, char *out, int outlen)
     out[i] = '\0';
 }
 
-/* ── tiny flat-key JSON extractors (same technique as MiSTerDVD's json_str,
- *    adapted with int64/bool variants; safe because Jellyfin's per-item
- *    field names — Name, Overview, ProductionYear, RunTimeTicks, Played,
- *    PlaybackPositionTicks, Primary — are unique enough within one item's
- *    JSON object that a flat strstr scan cannot cross into a sibling field
- *    with a colliding name). ────────────────────────────────────────────── */
+/* ── text for an ASCII-only display ──────────────────────────────────────── */
 
-static int json_str(const char *buf, const char *key, char *out, int maxlen)
+/* Folds UTF-8 down to the ASCII the on-screen bitmap font can actually draw
+ * (src/font8x8.h covers 0x00-0x7F and nothing else; draw_char turns anything
+ * above that into '?').
+ *
+ * This became necessary the moment escapes were decoded properly. Jellyfin
+ * escapes every non-ASCII character as \uXXXX, and the old scanner emitted
+ * the escape's own letters verbatim — so "Amélie" reached the screen as
+ * "Amu00e9lie". Decoding it correctly yields real UTF-8, which without this
+ * would render as "Am??lie": more honest, but no more readable. Folding to
+ * the base letter gives "Amelie", which is what someone actually wants to
+ * see on a CRT.
+ *
+ * Accents are dropped rather than approximated with digraphs, except where a
+ * digraph IS the conventional transliteration (ß→ss, Æ→AE). Anything with no
+ * sensible ASCII form collapses to a single '?' per run, so a CJK title
+ * reads as "?" rather than a wall of one '?' per byte. */
+static void append_ascii(char *out, int outlen, int *pos, const char *s)
 {
-    char pat[80];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == ':') p++;
-    if (*p != '"') return 0;
-    p++;
-    int i = 0;
-    while (*p && *p != '"' && i < maxlen - 1) {
-        if (*p == '\\') {
-            p++;
-            if (*p == 'n' || *p == 'r') out[i++] = ' ';
-            else if (*p) out[i++] = *p;
-        } else {
-            out[i++] = *p;
-        }
-        p++;
+    while (*s && *pos < outlen - 1) out[(*pos)++] = *s++;
+}
+
+static const char *fold_codepoint(unsigned cp)
+{
+    /* Latin-1 Supplement, in code-point order from U+00C0. */
+    static const char *const latin1[] = {
+        "A","A","A","A","A","A","AE","C","E","E","E","E","I","I","I","I",
+        "D","N","O","O","O","O","O","x","O","U","U","U","U","Y","Th","ss",
+        "a","a","a","a","a","a","ae","c","e","e","e","e","i","i","i","i",
+        "d","n","o","o","o","o","o","/","o","u","u","u","u","y","th","y"
+    };
+    /* Latin Extended-A, U+0100..U+017F — base letters only; the pattern is
+     * regular enough that a flat table is clearer than per-range rules. */
+    static const char *const latin_a[] = {
+        "A","a","A","a","A","a","C","c","C","c","C","c","C","c","D","d",
+        "D","d","E","e","E","e","E","e","E","e","E","e","G","g","G","g",
+        "G","g","G","g","H","h","H","h","I","i","I","i","I","i","I","i",
+        "I","i","IJ","ij","J","j","K","k","k","L","l","L","l","L","l","L",
+        "l","L","l","N","n","N","n","N","n","n","N","n","O","o","O","o",
+        "O","o","OE","oe","R","r","R","r","R","r","S","s","S","s","S","s",
+        "S","s","T","t","T","t","T","t","U","u","U","u","U","u","U","u",
+        "U","u","U","u","W","w","Y","y","Y","Z","z","Z","z","Z","z","s"
+    };
+
+    if (cp >= 0xC0 && cp <= 0xFF) return latin1[cp - 0xC0];
+    if (cp >= 0x100 && cp <= 0x17F) return latin_a[cp - 0x100];
+
+    switch (cp) {
+    case 0xA0: return " ";           /* non-breaking space */
+    case 0xAB: return "\"";          /* « */
+    case 0xBB: return "\"";          /* » */
+    case 0x2010: case 0x2011:
+    case 0x2012: case 0x2013:
+    case 0x2014: case 0x2015: return "-";
+    case 0x2018: case 0x2019:
+    case 0x201A: case 0x201B: return "'";
+    case 0x201C: case 0x201D:
+    case 0x201E: case 0x201F: return "\"";
+    case 0x2026: return "...";
+    case 0x2032: return "'";
+    case 0x2033: return "\"";
+    case 0x20AC: return "EUR";
+    case 0x2122: return "TM";
+    default: return NULL;
     }
-    out[i] = '\0';
-    return 1;
 }
 
-static int json_double(const char *buf, const char *key, double *out)
+/* Decodes one UTF-8 sequence at *s, advancing it. Returns the code point, or
+ * 0xFFFD for an invalid sequence (consuming one byte so it always makes
+ * progress). */
+static unsigned utf8_next(const char **s)
 {
-    char pat[80];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == ':') p++;
-    if (!(*p == '-' || *p == '.' || (*p >= '0' && *p <= '9'))) return 0;
-    *out = strtod(p, NULL);
-    return 1;
+    const unsigned char *p = (const unsigned char *)*s;
+    unsigned c = *p;
+
+    int extra;
+    unsigned cp;
+    if      (c < 0x80)         { *s += 1; return c; }
+    else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+    else                       { *s += 1; return 0xFFFD; }
+
+    for (int i = 1; i <= extra; i++) {
+        if ((p[i] & 0xC0) != 0x80) { *s += 1; return 0xFFFD; }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    *s += extra + 1;
+    return cp;
 }
 
-static int json_int64(const char *buf, const char *key, int64_t *out)
+void jf_text_to_display(const char *utf8, char *out, int outlen)
 {
-    char pat[80];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == ':') p++;
-    if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return 0;
-    *out = strtoll(p, NULL, 10);
-    return 1;
-}
+    if (!out || outlen <= 0) return;
+    out[0] = '\0';
+    if (!utf8) return;
 
-static int json_bool(const char *buf, const char *key, int *out)
-{
-    char pat[80];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == ':') p++;
-    if (strncmp(p, "true", 4) == 0)  { *out = 1; return 1; }
-    if (strncmp(p, "false", 5) == 0) { *out = 0; return 1; }
-    return 0;
-}
+    int pos = 0;
+    int last_was_unknown = 0;
+    const char *s = utf8;
 
-/* Extracts the first quoted string from a "key":[ "a", "b", ... ] array
- * (used for BackdropImageTags — we only ever want the first backdrop). */
-static int json_first_array_str(const char *buf, const char *key, char *out, int maxlen)
-{
-    char pat[80];
-    snprintf(pat, sizeof(pat), "\"%s\":[", key);
-    const char *p = strstr(buf, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
-    if (*p != '"') return 0;   /* empty array or not a string array */
-    p++;
-    int i = 0;
-    while (*p && *p != '"' && i < maxlen - 1) out[i++] = *p++;
-    out[i] = '\0';
-    return 1;
-}
+    while (*s && pos < outlen - 1) {
+        unsigned cp = utf8_next(&s);
 
-/* Returns pointer to the matching closing brace for the object starting at
- * obj_start (which must point at '{'), or NULL. Skips braces inside strings. */
-static const char *json_find_obj_end(const char *obj_start)
-{
-    int depth = 0, in_str = 0;
-    for (const char *p = obj_start; *p; p++) {
-        if (in_str) {
-            if (*p == '\\') { p++; continue; }
-            if (*p == '"') in_str = 0;
+        if (cp < 0x80) {
+            /* Newlines inside an overview would break single-line layout;
+             * the previous implementation flattened them to spaces too. */
+            out[pos++] = (cp == '\n' || cp == '\r' || cp == '\t') ? ' ' : (char)cp;
+            last_was_unknown = 0;
             continue;
         }
-        if (*p == '"') { in_str = 1; continue; }
-        if (*p == '{') depth++;
-        else if (*p == '}') { depth--; if (depth == 0) return p; }
+
+        const char *rep = fold_codepoint(cp);
+        if (rep) {
+            append_ascii(out, outlen, &pos, rep);
+            last_was_unknown = 0;
+        } else if (!last_was_unknown) {
+            out[pos++] = '?';
+            last_was_unknown = 1;   /* collapse a run into a single '?' */
+        }
     }
-    return NULL;
+    out[pos] = '\0';
 }
+
+/* json_copy_str + jf_text_to_display in one step — every string that ends up
+ * on screen goes through this, so none of them can skip the fold. */
+static int copy_display_str(const JsonDoc *doc, const JsonNode *from,
+                             const char *path, char *out, int outlen)
+{
+    const JsonNode *n = json_find(doc, from, path);
+    const char *s = json_as_str(n, NULL);
+    if (!s) { if (outlen > 0) out[0] = '\0'; return 0; }
+    jf_text_to_display(s, out, outlen);
+    return 1;
+}
+
+/* Ids and image tags are opaque hex/GUID strings that never get displayed —
+ * copy them verbatim, no folding. */
+static int copy_raw_str(const JsonDoc *doc, const JsonNode *from,
+                         const char *path, char *out, int outlen)
+{
+    return json_copy_str(doc, from, path, out, outlen);
+}
+
+/* ── item parsing ────────────────────────────────────────────────────────── */
 
 /* Fills in the fields shared by a browse-list row and a full single-item
  * fetch. Does NOT touch cast — that's only ever populated by
  * jf_get_item_details() via parse_cast(), since it needs Fields=People
- * (an extra cost we don't want on every row of every browse list). */
-static void parse_item_fields(const char *item_buf, JfItem *it)
+ * (an extra cost we don't want on every row of every browse list).
+ *
+ * `item` is the item's own object node, so every lookup below is scoped to
+ * it. That scoping is the point: these same field names (Name, Type, Id)
+ * also appear inside the nested People and MediaStreams arrays, and the
+ * previous flat text search found whichever copy happened to come first in
+ * the byte stream. It got the right answer only because Jellyfin's C# DTO
+ * declares Type before People — an ordering no one upstream knows is load
+ * bearing. */
+static void parse_item_fields(const JsonDoc *doc, const JsonNode *item, JfItem *it)
 {
     memset(it, 0, sizeof(*it));
     it->index_number = -1;
 
-    json_str(item_buf, "Id",   it->id,   sizeof(it->id));
-    json_str(item_buf, "Name", it->name, sizeof(it->name));
-    json_str(item_buf, "Overview", it->overview, sizeof(it->overview));
-    json_str(item_buf, "Primary", it->image_tag, sizeof(it->image_tag));
-    json_double(item_buf, "CommunityRating", &it->community_rating);
+    copy_raw_str    (doc, item, "Id",       it->id,       sizeof(it->id));
+    copy_display_str(doc, item, "Name",     it->name,     sizeof(it->name));
+    copy_display_str(doc, item, "Overview", it->overview, sizeof(it->overview));
+    copy_raw_str    (doc, item, "ImageTags.Primary", it->image_tag, sizeof(it->image_tag));
+    it->community_rating = json_as_dbl(json_find(doc, item, "CommunityRating"), 0.0);
 
     strncpy(it->image_item_id,    it->id, sizeof(it->image_item_id) - 1);
     strncpy(it->backdrop_item_id, it->id, sizeof(it->backdrop_item_id) - 1);
@@ -183,8 +225,8 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
      * until this fallback, other albums whose files DO have embedded art
      * were unaffected). Same pattern as the Logo/Backdrop fallback below. */
     if (!it->image_tag[0]) {
-        if (json_str(item_buf, "AlbumPrimaryImageTag", it->image_tag, sizeof(it->image_tag)))
-            json_str(item_buf, "AlbumId", it->image_item_id, sizeof(it->image_item_id));
+        if (copy_raw_str(doc, item, "AlbumPrimaryImageTag", it->image_tag, sizeof(it->image_tag)))
+            copy_raw_str(doc, item, "AlbumId", it->image_item_id, sizeof(it->image_item_id));
     }
 
     /* Episodes/seasons normally don't carry their own Logo/BackdropImageTags —
@@ -194,17 +236,16 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
      * episode's own ImageTags has no "Logo" key and BackdropImageTags is
      * empty, which is why the info screen for any TV episode never showed a
      * backdrop/logo before this fallback — not specific to one show. */
-    if (!json_str(item_buf, "Logo", it->logo_tag, sizeof(it->logo_tag))) {
-        if (json_str(item_buf, "ParentLogoImageTag", it->logo_tag, sizeof(it->logo_tag)))
-            json_str(item_buf, "ParentLogoItemId", it->logo_item_id, sizeof(it->logo_item_id));
+    if (!copy_raw_str(doc, item, "ImageTags.Logo", it->logo_tag, sizeof(it->logo_tag))) {
+        if (copy_raw_str(doc, item, "ParentLogoImageTag", it->logo_tag, sizeof(it->logo_tag)))
+            copy_raw_str(doc, item, "ParentLogoItemId", it->logo_item_id, sizeof(it->logo_item_id));
     }
-    if (!json_first_array_str(item_buf, "BackdropImageTags", it->backdrop_tag, sizeof(it->backdrop_tag))) {
-        if (json_first_array_str(item_buf, "ParentBackdropImageTags", it->backdrop_tag, sizeof(it->backdrop_tag)))
-            json_str(item_buf, "ParentBackdropItemId", it->backdrop_item_id, sizeof(it->backdrop_item_id));
+    if (!copy_raw_str(doc, item, "BackdropImageTags[0]", it->backdrop_tag, sizeof(it->backdrop_tag))) {
+        if (copy_raw_str(doc, item, "ParentBackdropImageTags[0]", it->backdrop_tag, sizeof(it->backdrop_tag)))
+            copy_raw_str(doc, item, "ParentBackdropItemId", it->backdrop_item_id, sizeof(it->backdrop_item_id));
     }
 
-    char type_buf[24] = {0};
-    json_str(item_buf, "Type", type_buf, sizeof(type_buf));
+    const char *type_buf = json_as_str(json_find(doc, item, "Type"), "");
     if      (!strcmp(type_buf, "Series"))       it->type = JF_TYPE_SERIES;
     else if (!strcmp(type_buf, "Season"))        it->type = JF_TYPE_SEASON;
     else if (!strcmp(type_buf, "Episode"))       it->type = JF_TYPE_EPISODE;
@@ -217,186 +258,257 @@ static void parse_item_fields(const char *item_buf, JfItem *it)
     else                                          it->type = JF_TYPE_OTHER;
 
     if (it->type == JF_TYPE_TRACK) {
-        json_str(item_buf, "Album", it->album, sizeof(it->album));
-        json_str(item_buf, "AlbumArtist", it->artist, sizeof(it->artist));
+        copy_display_str(doc, item, "Album",       it->album,  sizeof(it->album));
+        copy_display_str(doc, item, "AlbumArtist", it->artist, sizeof(it->artist));
     }
+    if (it->type == JF_TYPE_EPISODE)
+        copy_display_str(doc, item, "SeriesName", it->series_name, sizeof(it->series_name));
 
-    json_str(item_buf, "CollectionType", it->collection_type, sizeof(it->collection_type));
+    copy_raw_str(doc, item, "CollectionType", it->collection_type, sizeof(it->collection_type));
 
-    int64_t year = 0;
-    if (json_int64(item_buf, "ProductionYear", &year))
-        snprintf(it->year, sizeof(it->year), "%lld", (long long)year);
+    int64_t year = json_as_i64(json_find(doc, item, "ProductionYear"), 0);
+    if (year > 0) snprintf(it->year, sizeof(it->year), "%lld", (long long)year);
 
-    json_int64(item_buf, "RunTimeTicks", &it->runtime_ticks);
+    it->runtime_ticks        = json_as_i64(json_find(doc, item, "RunTimeTicks"), 0);
+    it->child_count          = (int)json_as_i64(json_find(doc, item, "ChildCount"), 0);
+    it->recursive_item_count = (int)json_as_i64(json_find(doc, item, "RecursiveItemCount"), 0);
+    it->index_number         = (int)json_as_i64(json_find(doc, item, "IndexNumber"), -1);
+    it->parent_index_number  = (int)json_as_i64(json_find(doc, item, "ParentIndexNumber"), -1);
 
-    int64_t child_count = 0;
-    if (json_int64(item_buf, "ChildCount", &child_count))
-        it->child_count = (int)child_count;
-
-    int64_t idx_num;
-    if (json_int64(item_buf, "IndexNumber", &idx_num))
-        it->index_number = (int)idx_num;
-
-    json_int64(item_buf, "PlaybackPositionTicks", &it->resume_ticks);
-    json_bool(item_buf, "Played", &it->played);
+    /* Scoped to UserData rather than searched for loose: PlayedPercentage and
+     * UnplayedItemCount live in the same object, and a bare "Played" search
+     * was one rename away from matching the wrong one. */
+    it->resume_ticks = json_as_i64 (json_find(doc, item, "UserData.PlaybackPositionTicks"), 0);
+    it->played       = json_as_bool(json_find(doc, item, "UserData.Played"), 0);
 }
 
 /* Populates it->cast[] (Actor entries only, first JF_MAX_CAST of them) from
- * a "People":[ ... ] array anywhere in buf. */
-static void parse_cast(const char *buf, JfItem *it)
+ * the item's People array. */
+static void parse_cast(const JsonDoc *doc, const JsonNode *item, JfItem *it)
 {
     it->cast_count = 0;
-    const char *p = strstr(buf, "\"People\":[");
-    if (!p) return;
-    p = strchr(p, '[');
-    if (!p) return;
-    p++;
+    const JsonNode *people = json_find(doc, item, "People");
+    if (!people) return;
 
-    while (it->cast_count < JF_MAX_CAST) {
-        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') p++;
-        if (*p != '{') break;
-        const char *end = json_find_obj_end(p);
-        if (!end) break;
+    JSON_FOREACH(doc, people, person_node) {
+        if (it->cast_count >= JF_MAX_CAST) break;
+        if (strcmp(json_as_str(json_find(doc, person_node, "Type"), ""), "Actor") != 0)
+            continue;
 
-        int len = (int)(end - p + 1);
-        char person_buf[768];
-        if (len > (int)sizeof(person_buf) - 1) len = (int)sizeof(person_buf) - 1;
-        memcpy(person_buf, p, len);
-        person_buf[len] = '\0';
-
-        char type_buf[24] = {0};
-        json_str(person_buf, "Type", type_buf, sizeof(type_buf));
-        if (!strcmp(type_buf, "Actor")) {
-            JfPerson *person = &it->cast[it->cast_count];
-            memset(person, 0, sizeof(*person));
-            json_str(person_buf, "Id", person->id, sizeof(person->id));
-            json_str(person_buf, "Name", person->name, sizeof(person->name));
-            json_str(person_buf, "Role", person->role, sizeof(person->role));
-            json_str(person_buf, "PrimaryImageTag", person->image_tag, sizeof(person->image_tag));
-            it->cast_count++;
-        }
-
-        p = end + 1;
+        JfPerson *person = &it->cast[it->cast_count];
+        memset(person, 0, sizeof(*person));
+        copy_raw_str    (doc, person_node, "Id",              person->id,        sizeof(person->id));
+        copy_display_str(doc, person_node, "Name",            person->name,      sizeof(person->name));
+        copy_display_str(doc, person_node, "Role",            person->role,      sizeof(person->role));
+        copy_raw_str    (doc, person_node, "PrimaryImageTag", person->image_tag, sizeof(person->image_tag));
+        it->cast_count++;
     }
 }
 
-/* Populates it->subs[] and it->source_* from a "MediaStreams":[ ... ] array
- * anywhere in buf (confirmed shape on a real server: Type is the string
+/* Populates it->subs[], it->audio[] and it->source_* from the item's
+ * MediaStreams array (confirmed shape on a real server: Type is the string
  * "Subtitle"/"Video"/"Audio" — not the numeric enum some other Jellyfin API
- * responses use). Subtitle label prefers Language; external/undefined
- * tracks often have no Language, so DisplayTitle is the fallback. Only the
- * first Video stream's specs are kept (source_* is for display only, next
- * to the subtitle picker — what's actually streamed is JfStreamProfile). */
-static void parse_media_streams(const char *buf, JfItem *it)
+ * responses use). Only the first Video stream's specs are kept (source_* is
+ * for display only, next to the track pickers — what's actually streamed is
+ * JfStreamProfile). */
+static void parse_media_streams(const JsonDoc *doc, const JsonNode *item, JfItem *it)
 {
     it->sub_count = 0;
+    it->audio_count = 0;
     it->source_video_codec[0] = '\0';
     it->source_width = it->source_height = 0;
     it->source_bitrate = 0;
     it->source_aspect = 0.0;
     int got_video = 0;
 
-    const char *p = strstr(buf, "\"MediaStreams\":[");
-    if (!p) return;
-    p = strchr(p, '[');
-    if (!p) return;
-    p++;
+    const JsonNode *streams = json_find(doc, item, "MediaStreams");
+    if (!streams) return;
 
-    while (1) {
-        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') p++;
-        if (*p != '{') break;
-        const char *end = json_find_obj_end(p);
-        if (!end) break;
+    JSON_FOREACH(doc, streams, stream) {
+        const char *type_buf = json_as_str(json_find(doc, stream, "Type"), "");
 
-        int len = (int)(end - p + 1);
-        char stream_buf[768];
-        if (len > (int)sizeof(stream_buf) - 1) len = (int)sizeof(stream_buf) - 1;
-        memcpy(stream_buf, p, len);
-        stream_buf[len] = '\0';
-
-        char type_buf[24] = {0};
-        json_str(stream_buf, "Type", type_buf, sizeof(type_buf));
         if (!strcmp(type_buf, "Subtitle") && it->sub_count < JF_MAX_SUBS) {
             JfSubtitle *sub = &it->subs[it->sub_count];
             memset(sub, 0, sizeof(*sub));
-            int64_t idx = 0;
-            json_int64(stream_buf, "Index", &idx);
-            sub->index = (int)idx;
-            if (!json_str(stream_buf, "Language", sub->label, sizeof(sub->label)) || !sub->label[0])
-                json_str(stream_buf, "DisplayTitle", sub->label, sizeof(sub->label));
-            json_str(stream_buf, "Codec", sub->codec, sizeof(sub->codec));
+            sub->index = (int)json_as_i64(json_find(doc, stream, "Index"), 0);
+            /* DisplayTitle first, Language only as a fallback. Language alone
+             * is not enough to tell two tracks apart, and that's the common
+             * case rather than an edge one: a release with English dialogue
+             * subtitles AND an English signs/songs or forced track shows up
+             * as two identical "eng" rows, with no way to know which is
+             * which except by picking one and watching.
+             *
+             * The server already composes what's needed — DisplayTitle leads
+             * with the track's own Title when it has one ("Signs & Songs"),
+             * then appends whichever of Hearing Impaired / Default / Forced /
+             * codec / External apply. Worth preferring even though it's
+             * longer: if it overflows the label it's the trailing codec and
+             * External tags that get cut, which are the least useful parts. */
+            if (!copy_display_str(doc, stream, "DisplayTitle", sub->label, sizeof(sub->label)) ||
+                !sub->label[0])
+                copy_display_str(doc, stream, "Language", sub->label, sizeof(sub->label));
+            copy_raw_str(doc, stream, "Codec", sub->codec, sizeof(sub->codec));
+            sub->is_forced  = json_as_bool(json_find(doc, stream, "IsForced"), 0);
+            sub->is_default = json_as_bool(json_find(doc, stream, "IsDefault"), 0);
             it->sub_count++;
+
+        } else if (!strcmp(type_buf, "Audio") && it->audio_count < JF_MAX_AUDIO) {
+            JfAudioTrack *aud = &it->audio[it->audio_count];
+            memset(aud, 0, sizeof(*aud));
+            aud->index    = (int)json_as_i64(json_find(doc, stream, "Index"), 0);
+            aud->channels = (int)json_as_i64(json_find(doc, stream, "Channels"), 0);
+            aud->is_default = json_as_bool(json_find(doc, stream, "IsDefault"), 0);
+            copy_raw_str(doc, stream, "Codec", aud->codec, sizeof(aud->codec));
+            /* DisplayTitle first here, unlike subtitles: the server composes
+             * it as e.g. "English - Dolby Digital 5.1 - Default", which is
+             * exactly what a track picker wants to show. Language alone
+             * can't distinguish two English tracks (a commentary from the
+             * main mix), which is the common case worth getting right. */
+            if (!copy_display_str(doc, stream, "DisplayTitle", aud->label, sizeof(aud->label)) ||
+                !aud->label[0])
+                copy_display_str(doc, stream, "Language", aud->label, sizeof(aud->label));
+            it->audio_count++;
+
         } else if (!strcmp(type_buf, "Video") && !got_video) {
             got_video = 1;
-            json_str(stream_buf, "Codec", it->source_video_codec, sizeof(it->source_video_codec));
-            int64_t w = 0, h = 0, br = 0;
-            json_int64(stream_buf, "Width", &w);
-            json_int64(stream_buf, "Height", &h);
-            json_int64(stream_buf, "BitRate", &br);
-            it->source_width = (int)w;
-            it->source_height = (int)h;
-            it->source_bitrate = br;
+            copy_raw_str(doc, stream, "Codec", it->source_video_codec, sizeof(it->source_video_codec));
+            it->source_width   = (int)json_as_i64(json_find(doc, stream, "Width"), 0);
+            it->source_height  = (int)json_as_i64(json_find(doc, stream, "Height"), 0);
+            it->source_bitrate = json_as_i64(json_find(doc, stream, "BitRate"), 0);
 
-            char ar_buf[16] = {0};
-            json_str(stream_buf, "AspectRatio", ar_buf, sizeof(ar_buf));
+            const char *ar_buf = json_as_str(json_find(doc, stream, "AspectRatio"), "");
             int ar_w = 0, ar_h = 0;
             if (ar_buf[0] && sscanf(ar_buf, "%d:%d", &ar_w, &ar_h) == 2 && ar_h > 0)
                 it->source_aspect = (double)ar_w / (double)ar_h;
         }
-
-        p = end + 1;
     }
 }
 
-/* Parses a {"Items":[ ... ]} BaseItemDtoQueryResult buffer into out[]. */
-static int parse_item_list(const char *buf, JfItem *out, int max)
+/* Parses a {"Items":[ ... ]} BaseItemDtoQueryResult into out[]. */
+static int parse_item_list(const JsonDoc *doc, JfItem *out, int max)
 {
+    const JsonNode *items = json_find(doc, NULL, "Items");
+    if (!items) return 0;
+
     int count = 0;
-    const char *p = strstr(buf, "\"Items\":[");
-    if (!p) return 0;
-    p = strchr(p, '[');
-    if (!p) return 0;
-    p++;
-
-    while (count < max) {
-        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') p++;
-        if (*p != '{') break;
-        const char *end = json_find_obj_end(p);
-        if (!end) break;
-
-        int len = (int)(end - p + 1);
-        if (len > JF_ITEM_BUF - 1) len = JF_ITEM_BUF - 1;
-        char item_buf[JF_ITEM_BUF];
-        memcpy(item_buf, p, len);
-        item_buf[len] = '\0';
-
-        parse_item_fields(item_buf, &out[count]);
-
+    JSON_FOREACH(doc, items, item) {
+        if (count >= max) break;
+        parse_item_fields(doc, item, &out[count]);
         count++;
-        p = end + 1;
     }
     return count;
 }
 
 /* ── curl transport ──────────────────────────────────────────────────────── */
 
-/* Runs `curl -H "Authorization: ..." <url>`, captures stdout into buf.
- * Returns 1 on success (non-empty response), 0 on failure. */
-static int jf_get(const JfConfig *cfg, const char *path_and_query, char *buf, int buflen)
+/* Builds the Authorization header.
+ *
+ * The Token part is omitted entirely when there isn't one, rather than sent
+ * as Token="". That matters for exactly one call: QuickConnect/Initiate is
+ * unauthenticated by definition (it's how you GET a credential), but it does
+ * need the Client/Device/DeviceId fields, since those are what the server
+ * shows the user when asking them to approve the request. */
+static void jf_auth_header(const JfConfig *cfg, char *out, int outlen)
 {
+    /* Comma-space separated with Token last and omitted when absent — the
+     * same shape jellyfin-apiclient-python builds (http.py's
+     * _get_authenication_header), which is the reference for what real
+     * clients send. */
+    if (cfg->token[0])
+        snprintf(out, outlen,
+                 "Authorization: MediaBrowser " JF_CLIENT_HEADERS
+                 ", DeviceId=\"%s\", Token=\"%s\"",
+                 cfg->device_id, cfg->token);
+    else
+        snprintf(out, outlen,
+                 "Authorization: MediaBrowser " JF_CLIENT_HEADERS ", DeviceId=\"%s\"",
+                 cfg->device_id);
+}
+
+/* A fetched response and the parse tree over it. The tree's strings point
+ * into `text`, so the two have to be freed together — jf_response_free does
+ * both, and nothing should hold a JsonNode past that. */
+typedef struct {
+    JsonDoc doc;
+    char   *text;
+} JfResponse;
+
+static void jf_response_free(JfResponse *r)
+{
+    if (!r) return;
+    json_free(&r->doc);
+    free(r->text);
+    r->text = NULL;
+}
+
+/* Runs `curl -H "Authorization: ..." <url>` and returns its entire stdout as
+ * a NUL-terminated heap buffer (caller frees), or NULL on failure.
+ *
+ * Grows to fit rather than reading into a fixed buffer. The previous fixed
+ * 256KB cap was a silent data-loss bug: a response larger than the cap was
+ * cut mid-JSON and the old scanner simply stopped at the first malformed
+ * object, presenting a truncated library as a complete one. Now the response
+ * is always read in full, and if it somehow still can't be, parsing rejects
+ * it outright instead of half-accepting it. */
+static char *jf_request_alloc(const JfConfig *cfg, const char *method,
+                               const char *path_and_query, const char *body_file,
+                               int timeout_secs)
+{
+    char auth[320];
+    jf_auth_header(cfg, auth, sizeof(auth));
+
+    /* Assembled as optional fragments rather than branching over whole
+     * command lines — the four combinations of {GET, POST} × {body, no body}
+     * are otherwise four near-identical format strings to keep in step. */
+    char method_arg[24] = "";
+    if (method) snprintf(method_arg, sizeof(method_arg), "-X %s ", method);
+
+    char body_arg[128] = "";
+    if (body_file)
+        snprintf(body_arg, sizeof(body_arg),
+                 "-H 'Content-Type: application/json' --data-binary @%s ", body_file);
+
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "curl -sfk --max-time 8 "
-        "-H 'Authorization: MediaBrowser " JF_CLIENT_HEADERS "Token=\"%s\"' "
-        "'%s%s' 2>/dev/null",
-        cfg->api_key, cfg->server, path_and_query);
+        "curl -sfk --max-time %d %s-H '%s' %s'%s%s' 2>/dev/null",
+        timeout_secs, method_arg, auth, body_arg, cfg->server, path_and_query);
 
     FILE *f = popen(cmd, "r");
-    if (!f) return 0;
-    size_t n = fread(buf, 1, (size_t)buflen - 1, f);
+    if (!f) return NULL;
+
+    size_t cap = 64 * 1024, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { pclose(f); return NULL; }
+
+    for (;;) {
+        if (len + 1 >= cap) {
+            size_t ncap = cap * 2;
+            char *grown = (char *)realloc(buf, ncap);
+            if (!grown) { free(buf); pclose(f); return NULL; }
+            buf = grown;
+            cap = ncap;
+        }
+        size_t got = fread(buf + len, 1, cap - len - 1, f);
+        if (got == 0) break;
+        len += got;
+    }
     pclose(f);
-    buf[n] = '\0';
-    return n > 0;
+
+    if (len == 0) { free(buf); return NULL; }
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Fetch + parse in one step. Returns 1 on success, with *r owning both the
+ * text and the tree; 0 if the request failed or the response wasn't valid
+ * JSON (in which case *r is already cleaned up). */
+static int jf_fetch(const JfConfig *cfg, const char *path_and_query, JfResponse *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->text = jf_request_alloc(cfg, NULL, path_and_query, NULL, 8);
+    if (!r->text) return 0;
+    if (!json_parse(&r->doc, r->text)) { jf_response_free(r); return 0; }
+    return 1;
 }
 
 /* Fire-and-forget POST with a JSON body (Sessions/Playing family). Body is
@@ -411,14 +523,17 @@ static void jf_post_json(const JfConfig *cfg, const char *path, const char *json
     fputs(json_body, f);
     fclose(f);
 
+    char auth[320];
+    jf_auth_header(cfg, auth, sizeof(auth));
+
     char cmd[768];
     snprintf(cmd, sizeof(cmd),
         "curl -sfk --max-time 5 -X POST "
-        "-H 'Authorization: MediaBrowser " JF_CLIENT_HEADERS "Token=\"%s\"' "
+        "-H '%s' "
         "-H 'Content-Type: application/json' "
         "--data-binary @%s "
         "'%s%s' >/dev/null 2>&1",
-        cfg->api_key, tmp_path, cfg->server, path);
+        auth, tmp_path, cfg->server, path);
     system(cmd);
     unlink(tmp_path);
 }
@@ -442,6 +557,20 @@ int jf_config_load(JfConfig *cfg)
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         if (line[0] == '\0' || line[0] == '#') continue;
+
+        /* PAL/NTSC is recognised wherever it appears rather than strictly as
+         * the 4th line. The file is positional and blank lines are skipped,
+         * so with Quick Connect making the API key and username optional
+         * there was no way to write "no key, but NTSC" — the mode would slide
+         * up into the api_key slot and be read as a credential. Matching it
+         * by value instead keeps every combination expressible, and costs
+         * nothing: no server URL, key or username is ever the literal string
+         * "PAL" or "NTSC". */
+        if (!strcasecmp(line, "PAL") || !strcasecmp(line, "NTSC")) {
+            strncpy(cfg->tv_mode, line, sizeof(cfg->tv_mode) - 1);
+            continue;
+        }
+
         char *dst;
         int dstlen;
         switch (line_no) {
@@ -463,43 +592,286 @@ int jf_config_load(JfConfig *cfg)
     if (strcasecmp(cfg->tv_mode, "NTSC") != 0)
         strncpy(cfg->tv_mode, "PAL", sizeof(cfg->tv_mode) - 1);
 
-    return (cfg->server[0] && cfg->api_key[0] && cfg->username[0]);
+    /* An API key in the config file is used as-is; without one the caller
+     * falls back to a saved token, then to Quick Connect. */
+    strncpy(cfg->token, cfg->api_key, sizeof(cfg->token) - 1);
+
+    /* Only the server URL is required. api_key/username missing used to be a
+     * hard failure, which forced every user through the admin dashboard to
+     * mint a key — Quick Connect exists precisely so they don't have to. */
+    return cfg->server[0] != '\0';
+}
+
+int jf_has_credential(const JfConfig *cfg)
+{
+    return cfg && cfg->token[0] != '\0';
+}
+
+/* ── device identity ──────────────────────────────────────────────────────── */
+
+static const char *jf_device_paths[] = {
+    "/media/fat/misterfin/device.conf",
+    "./device.conf",
+    NULL
+};
+
+/* A random RFC-4122-shaped v4 GUID, which is what every other Jellyfin client
+ * reports. Seeded from /dev/urandom; rand() is the fallback for the
+ * essentially-impossible case of that being unavailable, and collisions there
+ * would only mean two installs sharing a device entry, not anything unsafe. */
+static void jf_generate_device_id(char *out, int outlen)
+{
+    unsigned char b[16];
+    int got = 0;
+
+    FILE *ur = fopen("/dev/urandom", "rb");
+    if (ur) {
+        got = (fread(b, 1, sizeof(b), ur) == sizeof(b));
+        fclose(ur);
+    }
+    if (!got) {
+        srand((unsigned)(time(NULL) ^ (getpid() << 16)));
+        for (size_t i = 0; i < sizeof(b); i++) b[i] = (unsigned char)(rand() & 0xFF);
+    }
+
+    b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);   /* version 4 */
+    b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);   /* variant 1 */
+
+    snprintf(out, outlen,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+void jf_device_id_init(JfConfig *cfg)
+{
+    FILE *f = NULL;
+    for (int i = 0; jf_device_paths[i] && !f; i++) f = fopen(jf_device_paths[i], "r");
+
+    if (f) {
+        char line[80] = {0};
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            /* Sanitised on the way in: it's read from disk, and it ends up
+             * inside a single-quoted shell argument. Generated ids only ever
+             * contain hex and dashes, so this is a no-op for them and only
+             * bites a hand-corrupted file. */
+            jf_sanitize_id(line, cfg->device_id, sizeof(cfg->device_id));
+        }
+        fclose(f);
+        if (cfg->device_id[0]) return;
+    }
+
+    jf_generate_device_id(cfg->device_id, sizeof(cfg->device_id));
+
+    /* Prefer the real install location; fall back to the working directory
+     * when it isn't there, same as the token file. */
+    const char *path = jf_device_paths[1];
+    FILE *probe = fopen("/media/fat/misterfin/jellyfin.conf", "r");
+    if (probe) { fclose(probe); path = jf_device_paths[0]; }
+
+    FILE *w = fopen(path, "w");
+    if (w) { fprintf(w, "%s\n", cfg->device_id); fclose(w); }
+    /* A write failure is survivable — the id just won't persist, so the
+     * server sees a new device next launch. Not worth failing startup over. */
+}
+
+/* ── saved token ──────────────────────────────────────────────────────────── */
+
+/* Written next to jellyfin.conf, with the desktop fallback the config loader
+ * uses so off-hardware runs don't try to write to /media/fat. Two lines:
+ * access token, then user id — the id is stored rather than re-resolved
+ * because /Users needs elevated access that a plain user token doesn't have. */
+static const char *jf_token_paths[] = {
+    "/media/fat/misterfin/token.conf",
+    "./token.conf",
+    NULL
+};
+
+static const char *jf_token_writable_path(void)
+{
+    /* Prefer the real install location, but fall back to the working
+     * directory when it isn't there (desktop runs). */
+    FILE *probe = fopen("/media/fat/misterfin/jellyfin.conf", "r");
+    if (probe) { fclose(probe); return jf_token_paths[0]; }
+    return jf_token_paths[1];
+}
+
+int jf_token_save(const JfConfig *cfg)
+{
+    if (!cfg->token[0]) return 0;
+    const char *path = jf_token_writable_path();
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    fprintf(f, "%s\n%s\n%s\n", cfg->token, cfg->user_id, cfg->username);
+    fclose(f);
+    return 1;
+}
+
+int jf_token_load(JfConfig *cfg)
+{
+    FILE *f = NULL;
+    for (int i = 0; jf_token_paths[i] && !f; i++) f = fopen(jf_token_paths[i], "r");
+    if (!f) return 0;
+
+    char token[192] = {0}, user_id[JF_ID_LEN] = {0}, username[64] = {0};
+    int ok = 0;
+    if (fgets(token, sizeof(token), f)) {
+        token[strcspn(token, "\r\n")] = '\0';
+        if (fgets(user_id, sizeof(user_id), f)) {
+            user_id[strcspn(user_id, "\r\n")] = '\0';
+            if (fgets(username, sizeof(username), f))
+                username[strcspn(username, "\r\n")] = '\0';
+            ok = token[0] && user_id[0];
+        }
+    }
+    fclose(f);
+    if (!ok) return 0;
+
+    strncpy(cfg->token,   token,   sizeof(cfg->token) - 1);
+    strncpy(cfg->user_id, user_id, sizeof(cfg->user_id) - 1);
+    if (username[0]) strncpy(cfg->username, username, sizeof(cfg->username) - 1);
+    return 1;
+}
+
+void jf_token_clear(void)
+{
+    for (int i = 0; jf_token_paths[i]; i++) unlink(jf_token_paths[i]);
+}
+
+/* ── Quick Connect ────────────────────────────────────────────────────────── */
+
+/* POST + parse, for the two Quick Connect calls that return a body.
+ * json_body may be NULL (Initiate takes no body at all). */
+static int jf_post_fetch(const JfConfig *cfg, const char *path,
+                          const char *json_body, JfResponse *r)
+{
+    memset(r, 0, sizeof(*r));
+
+    char tmp_path[64] = "";
+    if (json_body) {
+        snprintf(tmp_path, sizeof(tmp_path), "/tmp/misterfin_qc_%d.json", getpid());
+        FILE *f = fopen(tmp_path, "w");
+        if (!f) return 0;
+        fputs(json_body, f);
+        fclose(f);
+    }
+
+    r->text = jf_request_alloc(cfg, "POST", path, json_body ? tmp_path : NULL, 10);
+    if (json_body) unlink(tmp_path);
+
+    if (!r->text) return 0;
+    if (!json_parse(&r->doc, r->text)) { jf_response_free(r); return 0; }
+    return 1;
+}
+
+int jf_quick_connect_enabled(const JfConfig *cfg)
+{
+    /* Returns a bare `true`/`false` rather than an object — still valid JSON,
+     * so the parser handles it and the root node is the boolean itself. */
+    JfResponse r;
+    if (!jf_fetch(cfg, "/QuickConnect/Enabled", &r)) return 0;
+    int enabled = json_as_bool(json_root(&r.doc), 0);
+    jf_response_free(&r);
+    return enabled;
+}
+
+int jf_quick_connect_initiate(const JfConfig *cfg, JfQuickConnect *qc)
+{
+    memset(qc, 0, sizeof(*qc));
+
+    JfResponse r;
+    if (!jf_post_fetch(cfg, "/QuickConnect/Initiate", NULL, &r)) return 0;
+
+    json_copy_str(&r.doc, NULL, "Secret", qc->secret, sizeof(qc->secret));
+    json_copy_str(&r.doc, NULL, "Code",   qc->code,   sizeof(qc->code));
+    jf_response_free(&r);
+
+    return qc->secret[0] && qc->code[0];
+}
+
+int jf_quick_connect_poll(const JfConfig *cfg, const JfQuickConnect *qc)
+{
+    /* The secret is server-generated and goes into a URL, so it gets the same
+     * allowlist treatment as any other id from the server. */
+    char safe_secret[128];
+    jf_sanitize_id(qc->secret, safe_secret, sizeof(safe_secret));
+
+    char path[192];
+    snprintf(path, sizeof(path), "/QuickConnect/Connect?secret=%s", safe_secret);
+
+    JfResponse r;
+    /* A failed request here is ambiguous — 404 means the server has forgotten
+     * this request (expired or denied), but so does a dropped connection.
+     * Reported as -1 either way; the caller retries a couple of times before
+     * giving up, so a transient blip doesn't abandon a live request. */
+    if (!jf_fetch(cfg, path, &r)) return -1;
+
+    int authed = json_as_bool(json_find(&r.doc, NULL, "Authenticated"), 0);
+    jf_response_free(&r);
+    return authed ? 1 : 0;
+}
+
+int jf_quick_connect_authenticate(JfConfig *cfg, const JfQuickConnect *qc)
+{
+    char body[192];
+    snprintf(body, sizeof(body), "{\"Secret\":\"%s\"}", qc->secret);
+
+    JfResponse r;
+    if (!jf_post_fetch(cfg, "/Users/AuthenticateWithQuickConnect", body, &r)) return 0;
+
+    char token[sizeof(cfg->token)] = {0};
+    char user_id[JF_ID_LEN] = {0};
+    char username[64] = {0};
+    json_copy_str(&r.doc, NULL, "AccessToken",  token,    sizeof(token));
+    json_copy_str(&r.doc, NULL, "User.Id",      user_id,  sizeof(user_id));
+    json_copy_str(&r.doc, NULL, "User.Name",    username, sizeof(username));
+    jf_response_free(&r);
+
+    if (!token[0] || !user_id[0]) return 0;
+
+    strncpy(cfg->token,   token,   sizeof(cfg->token) - 1);
+    strncpy(cfg->user_id, user_id, sizeof(cfg->user_id) - 1);
+    /* Whoever approved the request IS the user — no /Users lookup needed, and
+     * no need for the username in the config file to match (or be there). */
+    if (username[0]) strncpy(cfg->username, username, sizeof(cfg->username) - 1);
+    return 1;
+}
+
+int jf_credential_works(const JfConfig *cfg)
+{
+    if (!jf_has_credential(cfg) || !cfg->user_id[0]) return 0;
+
+    /* UserViews is the smallest authenticated, user-scoped call available —
+     * it fails for a revoked token but doesn't need elevated access the way
+     * /Users does. */
+    char path[256];
+    snprintf(path, sizeof(path), "/UserViews?userId=%s", cfg->user_id);
+
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int ok = json_find(&r.doc, NULL, "Items") != NULL;
+    jf_response_free(&r);
+    return ok;
 }
 
 int jf_resolve_user_id(JfConfig *cfg)
 {
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, "/Users", buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
+    JfResponse r;
+    if (!jf_fetch(cfg, "/Users", &r)) return -1;
 
-    const char *p = strchr(buf, '[');
-    if (!p) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
-    p++;
-
-    while (1) {
-        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') p++;
-        if (*p != '{') break;
-        const char *end = json_find_obj_end(p);
-        if (!end) break;
-
-        int len = (int)(end - p + 1);
-        char ubuf[512];
-        if (len > (int)sizeof(ubuf) - 1) len = (int)sizeof(ubuf) - 1;
-        memcpy(ubuf, p, len);
-        ubuf[len] = '\0';
-
-        char name[64] = {0};
-        json_str(ubuf, "Name", name, sizeof(name));
-        if (!strcasecmp(name, cfg->username)) {
-            json_str(ubuf, "Id", cfg->user_id, sizeof(cfg->user_id));
-            int ok = cfg->user_id[0] != '\0';
-            pthread_mutex_unlock(&g_jf_mutex);
-            return ok;
-        }
-        p = end + 1;
+    /* /Users returns a bare array, so the root node is what to iterate. */
+    int result = 0;
+    JSON_FOREACH(&r.doc, json_root(&r.doc), user) {
+        const char *name = json_as_str(json_find(&r.doc, user, "Name"), "");
+        if (strcasecmp(name, cfg->username) != 0) continue;
+        json_copy_str(&r.doc, user, "Id", cfg->user_id, sizeof(cfg->user_id));
+        result = cfg->user_id[0] != '\0';
+        break;
     }
-    pthread_mutex_unlock(&g_jf_mutex);
-    return 0;
+
+    jf_response_free(&r);
+    return result;
 }
 
 /* ── browsing ─────────────────────────────────────────────────────────────── */
@@ -509,12 +881,11 @@ int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
     char path[256];
     snprintf(path, sizeof(path), "/UserViews?userId=%s", cfg->user_id);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_FOLDER;
-    pthread_mutex_unlock(&g_jf_mutex);
+    jf_response_free(&r);
     return n;
 }
 
@@ -533,35 +904,54 @@ int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *i
             "/Items?userId=%s&ParentId=%s&Recursive=true&Limit=0",
             cfg->user_id, safe_parent);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return -1; }
-    int64_t count = 0;
-    int64_t result = json_int64(buf, "TotalRecordCount", &count) ? count : -1;
-    pthread_mutex_unlock(&g_jf_mutex);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return -1;
+    int64_t result = json_as_i64(json_find(&r.doc, NULL, "TotalRecordCount"), -1);
+    jf_response_free(&r);
     return result;
 }
 
-int jf_list_items(const JfConfig *cfg, const char *parent_id, JfItem *out, int max)
+/* Reads TotalRecordCount into *total_out (may be NULL), leaving it untouched
+ * if the server didn't send one — the caller then falls back to however many
+ * items actually arrived. */
+static void parse_total_count(const JsonDoc *doc, int64_t *total_out)
+{
+    if (!total_out) return;
+    const JsonNode *n = json_find(doc, NULL, "TotalRecordCount");
+    if (n && n->type == JSON_NUMBER) *total_out = n->i64;
+}
+
+int jf_list_items(const JfConfig *cfg, const char *parent_id, int start_index,
+                   JfItem *out, int max, int64_t *total_out)
 {
     char safe_parent[JF_ID_LEN];
     jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
+    if (start_index < 0) start_index = 0;
 
     /* ChildCount here (unlike on a top-level library view — see
      * jf_count_items's comment) is exactly what it sounds like for a
      * MusicAlbum: its own track count, confirmed against a real server. */
+    /* Overview is deliberately NOT requested here even though JfItem has a
+     * field for it: no browse-list row ever displays it (the info screen
+     * re-fetches via jf_get_item_details, which is where overview actually
+     * comes from), so it would be several times the JSON per row for nothing.
+     * Response size no longer risks losing data the way it once did — buffers
+     * grow to fit and a short read is now a hard parse failure — but there's
+     * still no reason to transfer and parse a paragraph per row that nothing
+     * reads. */
     char path[512];
     snprintf(path, sizeof(path),
         "/Items?userId=%s&ParentId=%s&SortBy=SortName&SortOrder=Ascending"
-        "&Fields=Overview,ProductionYear,RunTimeTicks,ChildCount&EnableUserData=true"
-        "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
-        cfg->user_id, safe_parent, max);
+        "&Fields=ProductionYear,RunTimeTicks,ChildCount,RecursiveItemCount"
+        "&EnableUserData=true"
+        "&ImageTypeLimit=1&EnableImageTypes=Primary&StartIndex=%d&Limit=%d",
+        cfg->user_id, safe_parent, start_index, max);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
-    pthread_mutex_unlock(&g_jf_mutex);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    parse_total_count(&r.doc, total_out);
+    jf_response_free(&r);
     return n;
 }
 
@@ -571,27 +961,29 @@ int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
     char safe_parent[JF_ID_LEN];
     jf_sanitize_id(parent_id, safe_parent, sizeof(safe_parent));
 
+    /* No Overview here either — see jf_list_items. This one only ever feeds
+     * the carousel's background cover grid, which needs nothing but ids and
+     * image tags. */
     char path[560];
     if (item_type && item_type[0])
         snprintf(path, sizeof(path),
             "/Items?userId=%s&ParentId=%s&Recursive=true&IncludeItemTypes=%s"
             "&SortBy=SortName&SortOrder=Ascending"
-            "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+            "&Fields=ProductionYear,RunTimeTicks&EnableUserData=true"
             "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
             cfg->user_id, safe_parent, item_type, max);
     else
         snprintf(path, sizeof(path),
             "/Items?userId=%s&ParentId=%s&Recursive=true"
             "&SortBy=SortName&SortOrder=Ascending"
-            "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+            "&Fields=ProductionYear,RunTimeTicks&EnableUserData=true"
             "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
             cfg->user_id, safe_parent, max);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
-    pthread_mutex_unlock(&g_jf_mutex);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    jf_response_free(&r);
     return n;
 }
 
@@ -603,15 +995,60 @@ int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *ou
     char path[512];
     snprintf(path, sizeof(path),
         "/Items?userId=%s&ParentId=%s&Recursive=true&IncludeItemTypes=Audio&SortBy=Random"
-        "&Fields=Overview,ProductionYear,RunTimeTicks&EnableUserData=true"
+        "&Fields=ProductionYear,RunTimeTicks&EnableUserData=true"
         "&ImageTypeLimit=1&EnableImageTypes=Primary&Limit=%d",
         cfg->user_id, safe_parent, max);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
-    pthread_mutex_unlock(&g_jf_mutex);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    jf_response_free(&r);
+    return n;
+}
+
+/* Shared field list for the two home rows. Both want enough to draw a browse
+ * row (year, runtime, watched/resume state, a cover) and nothing more. */
+#define JF_HOME_ROW_FIELDS \
+    "&Fields=ProductionYear,RunTimeTicks&EnableUserData=true" \
+    "&ImageTypeLimit=1&EnableImageTypes=Primary&EnableTotalRecordCount=true"
+
+int jf_list_resume(const JfConfig *cfg, JfItem *out, int max, int64_t *total_out)
+{
+    /* MediaTypes=Video keeps half-listened music out of a row the user reads
+     * as "films and episodes I'm partway through". Jellyfin orders these by
+     * DatePlayed descending server-side, which is the order to preserve. */
+    char path[384];
+    snprintf(path, sizeof(path),
+        "/UserItems/Resume?userId=%s&MediaTypes=Video&Limit=%d" JF_HOME_ROW_FIELDS,
+        cfg->user_id, max);
+
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    parse_total_count(&r.doc, total_out);
+    jf_response_free(&r);
+    return n;
+}
+
+int jf_list_nextup(const JfConfig *cfg, JfItem *out, int max, int64_t *total_out)
+{
+    /* enableResumable=false: a part-watched episode already appears under
+     * Continue Watching, and having the same episode in both rows makes the
+     * two look broken rather than complementary. Next Up is then strictly
+     * "what to start next". */
+    char path[384];
+    snprintf(path, sizeof(path),
+        "/Shows/NextUp?userId=%s&Limit=%d&enableResumable=false" JF_HOME_ROW_FIELDS,
+        cfg->user_id, max);
+
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    parse_total_count(&r.doc, total_out);
+    /* NextUp returns episodes by definition, but says so only via each item's
+     * own Type — set it explicitly for the same reason jf_list_episodes does. */
+    for (int i = 0; i < n; i++) out[i].type = JF_TYPE_EPISODE;
+    jf_response_free(&r);
     return n;
 }
 
@@ -626,14 +1063,16 @@ int jf_get_item_details(const JfConfig *cfg, const char *item_id, JfItem *out)
         "&EnableUserData=true&EnableImageTypes=Primary,Logo,Backdrop",
         safe_id, cfg->user_id);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
 
-    parse_item_fields(buf, out);
-    parse_cast(buf, out);
-    parse_media_streams(buf, out);
-    pthread_mutex_unlock(&g_jf_mutex);
+    /* A single-item fetch returns the item object itself as the root, so all
+     * three parsers are scoped to it rather than to a list element. */
+    const JsonNode *item = json_root(&r.doc);
+    parse_item_fields(&r.doc, item, out);
+    parse_cast(&r.doc, item, out);
+    parse_media_streams(&r.doc, item, out);
+    jf_response_free(&r);
     return 1;
 }
 
@@ -645,35 +1084,35 @@ int jf_list_seasons(const JfConfig *cfg, const char *series_id, JfItem *out, int
     char path[256];
     snprintf(path, sizeof(path), "/Shows/%s/Seasons?userId=%s", safe_series, cfg->user_id);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_SEASON;
-    pthread_mutex_unlock(&g_jf_mutex);
+    jf_response_free(&r);
     return n;
 }
 
 int jf_list_episodes(const JfConfig *cfg, const char *series_id, const char *season_id,
-                      JfItem *out, int max)
+                      int start_index, JfItem *out, int max, int64_t *total_out)
 {
     char safe_series[JF_ID_LEN], safe_season[JF_ID_LEN];
     jf_sanitize_id(series_id, safe_series, sizeof(safe_series));
     jf_sanitize_id(season_id, safe_season, sizeof(safe_season));
+    if (start_index < 0) start_index = 0;
 
-    char path[384];
+    char path[416];
     snprintf(path, sizeof(path),
         "/Shows/%s/Episodes?seasonId=%s&userId=%s"
-        "&Fields=Overview,RunTimeTicks&EnableUserData=true"
-        "&ImageTypeLimit=1&EnableImageTypes=Primary",
-        safe_series, safe_season, cfg->user_id);
+        "&Fields=RunTimeTicks&EnableUserData=true"
+        "&ImageTypeLimit=1&EnableImageTypes=Primary&StartIndex=%d&Limit=%d",
+        safe_series, safe_season, cfg->user_id, start_index, max);
 
-    pthread_mutex_lock(&g_jf_mutex);
-    static char buf[JF_BUF_SIZE];
-    if (!jf_get(cfg, path, buf, sizeof(buf))) { pthread_mutex_unlock(&g_jf_mutex); return 0; }
-    int n = parse_item_list(buf, out, max);
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return 0;
+    int n = parse_item_list(&r.doc, out, max);
+    parse_total_count(&r.doc, total_out);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_EPISODE;
-    pthread_mutex_unlock(&g_jf_mutex);
+    jf_response_free(&r);
     return n;
 }
 
@@ -729,6 +1168,7 @@ int jf_download_image(const JfConfig *cfg, const JfItem *item, const char *dest_
 int jf_stream_url(const JfConfig *cfg, const char *item_id,
                    const JfStreamProfile *profile, int64_t start_ticks,
                    const char *play_session_id, int burn_in_sub_index,
+                   int audio_stream_index,
                    char *out, int outlen)
 {
     char safe_id[JF_ID_LEN];
@@ -764,15 +1204,22 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
         snprintf(sub_params, sizeof(sub_params),
                  "&subtitleStreamIndex=%d&subtitleMethod=Encode", burn_in_sub_index);
 
+    /* Omitted entirely rather than guessed when no explicit track is wanted,
+     * so the server applies the source's own default selection. */
+    char audio_params[32] = "";
+    if (audio_stream_index >= 0)
+        snprintf(audio_params, sizeof(audio_params),
+                 "&audioStreamIndex=%d", audio_stream_index);
+
     snprintf(out, outlen,
         "%s/Videos/%s/stream?static=false&videoCodec=mpeg2video&container=ts"
         "&audioCodec=mp3&audioChannels=2"
         "&maxWidth=%d&maxHeight=%d&videoBitRate=%d"
-        "&startTimeTicks=%lld&playSessionId=%s%s&ApiKey=%s",
+        "&startTimeTicks=%lld&playSessionId=%s%s%s&ApiKey=%s",
         cfg->server, safe_id,
         profile->max_width, profile->max_height, profile->video_bitrate,
         (long long)(start_ticks > 0 ? start_ticks : 0),
-        safe_session, sub_params, cfg->api_key);
+        safe_session, sub_params, audio_params, cfg->token);
     return 1;
 }
 
@@ -802,7 +1249,7 @@ int jf_audio_stream_url(const JfConfig *cfg, const char *item_id,
     jf_sanitize_id(play_session_id, safe_session, sizeof(safe_session));
     snprintf(out, outlen,
         "%s/Audio/%s/stream?static=true&playSessionId=%s&ApiKey=%s",
-        cfg->server, safe_id, safe_session, cfg->api_key);
+        cfg->server, safe_id, safe_session, cfg->token);
     return 1;
 }
 
@@ -816,7 +1263,7 @@ int jf_download_subtitle(const JfConfig *cfg, const char *item_id,
 
     char url[384];
     snprintf(url, sizeof(url), "%s/Videos/%s/%s/Subtitles/%d/Stream.srt?ApiKey=%s",
-              cfg->server, safe_id, safe_msid, sub_index, cfg->api_key);
+              cfg->server, safe_id, safe_msid, sub_index, cfg->token);
 
     char cmd[768];
     snprintf(cmd, sizeof(cmd),
