@@ -511,12 +511,34 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
 
 /* ── input (evdev gamepad, same model as MiSTerDVD) ─────────────────────── */
 
-#define MAX_INPUT_FDS 8
+/* Bit-array helpers for the evdev state ioctls below (linux/input.h returns
+ * these as an array of unsigned long). */
+#define INPUT_BITS_PER_LONG  (8 * (int)sizeof(unsigned long))
+#define INPUT_NLONGS(n)      (((n) + INPUT_BITS_PER_LONG - 1) / INPUT_BITS_PER_LONG)
+#define INPUT_TEST_BIT(arr, bit) \
+    ((arr)[(bit) / INPUT_BITS_PER_LONG] & (1UL << ((bit) % INPUT_BITS_PER_LONG)))
+
+/* Was 8. A MiSTer has well over that many /dev/input/event* nodes once
+ * keyboards, mice, the MiSTer virtual input device and a pad or two are
+ * present — and a single pad often exposes several. With a hard cap and no
+ * eviction, which devices got opened came down to readdir order, which is
+ * filesystem order rather than anything meaningful. */
+#define MAX_INPUT_FDS 32
 static int  input_fds[MAX_INPUT_FDS];
 static int  input_swap_ab[MAX_INPUT_FDS];
 static int  input_is_virtual[MAX_INPUT_FDS];
 static char input_names[MAX_INPUT_FDS][32];   /* e.g. "event0" — see input_open() */
 static int  input_count = 0;
+/* MISTERFIN_INPUT_DEBUG=1 — prints every incoming event with its device, raw
+ * code, and what it mapped to (or why it was dropped). MiSTer's input routing
+ * is genuinely unusual: it grabs directly-wired USB pads exclusively and
+ * re-emits them on a synthetic "MiSTer virtual input" device, so which button
+ * arrives on which node, under which code, varies by pad and by connection
+ * type. Guessing at that from a bug report is hopeless; this makes it a
+ * two-minute answer. Output goes to stderr, so run over SSH — it doesn't
+ * touch the framebuffer UI. */
+static int  input_debug = 0;
+
 
 /* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
  * report their printed A/B buttons as BTN_SOUTH/BTN_EAST swapped relative to
@@ -555,6 +577,18 @@ static int device_is_mister_virtual(const char *name)
 #define INP_L      0x100
 #define INP_R      0x200
 
+static const char *inp_bit_name(int bit)
+{
+    switch (bit) {
+    case INP_UP: return "UP";       case INP_DOWN:  return "DOWN";
+    case INP_LEFT: return "LEFT";   case INP_RIGHT: return "RIGHT";
+    case INP_A: return "A";         case INP_B:     return "B";
+    case INP_START: return "START"; case INP_SELECT: return "SELECT";
+    case INP_L: return "L";         case INP_R:      return "R";
+    default: return "?";
+    }
+}
+
 /* Safe to call repeatedly (see the periodic re-scan in the main loop) —
  * skips any /dev/input/eventN already tracked, only opening ones that are
  * new since the last call (a reconnected wireless pad, for example, can
@@ -571,6 +605,7 @@ static void input_open(void)
      * the old behavior on real hardware. Safe to call repeatedly, same as
      * the evdev scan below (see this function's own header comment). */
     if (getenv("MISTERFIN_STDIN")) stdin_input_open();
+    if (getenv("MISTERFIN_INPUT_DEBUG")) input_debug = 1;
     script_open();
 
     DIR *d = opendir("/dev/input");
@@ -589,17 +624,56 @@ static void input_open(void)
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
 
+        /* Skip anything with neither buttons nor axes. A system has plenty of
+         * such nodes (power buttons, lid switches, accelerometers, the
+         * console's own pseudo-devices) and every one of them used to occupy
+         * a slot that a real controller then couldn't have. */
+        unsigned long evbits[INPUT_NLONGS(EV_MAX + 1)];
+        memset(evbits, 0, sizeof(evbits));
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0 ||
+            (!INPUT_TEST_BIT(evbits, EV_KEY) && !INPUT_TEST_BIT(evbits, EV_ABS))) {
+            close(fd);
+            continue;
+        }
+
         char name[128] = "";
         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
         input_swap_ab[input_count]    = device_needs_ab_swap(name);
         input_is_virtual[input_count] = device_is_mister_virtual(name);
         strncpy(input_names[input_count], e->d_name, sizeof(input_names[0]) - 1);
         input_fds[input_count++] = fd;
+        if (input_debug)
+            fprintf(stderr, "[input] opened %s \"%s\"%s (%d tracked)\n",
+                    e->d_name, name,
+                    device_is_mister_virtual(name) ? " [MiSTer virtual]" : "",
+                    input_count);
     }
     closedir(d);
 }
 
 static void input_repeat_reset(void);   /* forward decl — defined with the repeat logic below */
+
+/* Drops a device that has disappeared, compacting the parallel arrays.
+ *
+ * Without this, a controller that disconnects and comes back — which is
+ * routine for anything wireless, and is exactly what happens after a pad
+ * freezes and gets reconnected — leaves its dead entry holding a slot
+ * forever while the live node needs a new one. Slots leak on every reconnect
+ * until nothing new can be opened at all, and buttons simply stop arriving
+ * with no visible cause. */
+static void input_drop_slot(int i)
+{
+    if (input_debug)
+        fprintf(stderr, "[input] %s went away, releasing slot\n", input_names[i]);
+    close(input_fds[i]);
+    for (int j = i; j < input_count - 1; j++) {
+        input_fds[j]        = input_fds[j + 1];
+        input_swap_ab[j]    = input_swap_ab[j + 1];
+        input_is_virtual[j] = input_is_virtual[j + 1];
+        memcpy(input_names[j], input_names[j + 1], sizeof(input_names[0]));
+    }
+    input_count--;
+}
 
 static void input_drain(void)
 {
@@ -831,7 +905,12 @@ static int input_poll(void)
     struct input_event ev;
     int mask = stdin_poll() | script_poll();
     for (int i = 0; i < input_count; i++) {
-        while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+        /* Reading a removed device fails with ENODEV; that's how a
+         * disconnect is noticed, since evdev has no other notification.
+         * Dropping the slot here is what lets the same pad be picked up
+         * again by the next rescan. */
+        ssize_t got;
+        while ((got = read(input_fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
             /* Press edges only. Releases don't need tracking here: auto-repeat
              * reads the device's real current state instead of reconstructing
              * it from edges (see input_repeat). The kernel's own key repeat
@@ -859,6 +938,10 @@ static int input_poll(void)
                     code != KEY_UP && code != KEY_DOWN &&
                     code != KEY_LEFT && code != KEY_RIGHT &&
                     code != KEY_ENTER && code != KEY_ESC && code != KEY_BACK) {
+                    if (input_debug)
+                        fprintf(stderr, "[input] %s EV_KEY code=%d val=%d -> DROPPED "
+                                        "(not trusted from MiSTer virtual input)\n",
+                                input_names[i], code, ev.value);
                     continue;
                 }
                 int bit = 0;
@@ -884,8 +967,16 @@ static int input_poll(void)
                 case BTN_TL: case KEY_PAGEUP:    bit = INP_L;     break;
                 case BTN_TR: case KEY_PAGEDOWN:  bit = INP_R;     break;
                 }
+                if (input_debug)
+                    fprintf(stderr, "[input] %s EV_KEY code=%d val=%d -> %s\n",
+                            input_names[i], code, ev.value,
+                            bit ? inp_bit_name(bit) : "unmapped");
                 mask |= bit;
             } else if (ev.type == EV_ABS) {
+                if (input_debug && (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y))
+                    fprintf(stderr, "[input] %s EV_ABS %s value=%d\n",
+                            input_names[i],
+                            ev.code == ABS_HAT0X ? "HAT0X" : "HAT0Y", ev.value);
                 if (ev.code == ABS_HAT0Y) {
                     if (ev.value == -1) mask |= INP_UP;
                     if (ev.value ==  1) mask |= INP_DOWN;
@@ -895,6 +986,10 @@ static int input_poll(void)
                     if (ev.value ==  1) mask |= INP_RIGHT;
                 }
             }
+        }
+        if (got < 0 && (errno == ENODEV || errno == EBADF)) {
+            input_drop_slot(i);
+            i--;            /* the slot now holds the next device */
         }
     }
     return mask;
@@ -936,13 +1031,6 @@ static void input_repeat_reset(void)
      * lets go of everything. */
     repeat_suppressed = 1;
 }
-
-/* Bit-array helpers for the evdev state ioctls below (linux/input.h returns
- * these as an array of unsigned long). */
-#define INPUT_BITS_PER_LONG  (8 * (int)sizeof(unsigned long))
-#define INPUT_NLONGS(n)      (((n) + INPUT_BITS_PER_LONG - 1) / INPUT_BITS_PER_LONG)
-#define INPUT_TEST_BIT(arr, bit) \
-    ((arr)[(bit) / INPUT_BITS_PER_LONG] & (1UL << ((bit) % INPUT_BITS_PER_LONG)))
 
 /* Asks each device what it is ACTUALLY holding right now, via EVIOCGKEY /
  * EVIOCGABS, rather than reconstructing it from the press/release stream.
@@ -3688,6 +3776,10 @@ static int    g_submenu_tab        = SUBMENU_TAB_SUBS;
 static int    g_submenu_sub_sel    = 0;   /* 0 = Off, i+1 = g_info_item.subs[i] */
 static int    g_submenu_audio_sel  = 0;   /* index into g_info_item.audio[] */
 static int    g_submenu_was_paused = 0;   /* pause state before the menu opened, to restore on close */
+/* When the menu was opened, so a duplicate of the opening press can't close
+ * it again — see the close handling in the main loop. */
+static double g_submenu_opened_at = 0.0;
+#define SUBMENU_IGNORE_CLOSE_SEC 0.30
 
 /* Which audio track the server would pick if we said nothing — used to show
  * a meaningful "current" marker before the user has chosen anything, and as
@@ -3776,6 +3868,7 @@ static void submenu_open(FBDev *fb)
         g_submenu_tab = SUBMENU_TAB_AUDIO;
 
     g_submenu_was_paused = g_paused;
+    g_submenu_opened_at  = now_sec();
     if (!g_paused) player_pause_toggle();
     submenu_bg_capture(fb);
     memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
@@ -4893,8 +4986,22 @@ int main(int argc, char **argv)
              * silent no-op before (it only opens from the STATE_PLAYING
              * switch below, which this block's own `continue` never
              * reaches while visible), so a second SELECT looked like "the
-             * menu doesn't open". B still means an explicit cancel too. */
-            if (inp & (INP_B | INP_SELECT)) { submenu_close(); input_drain(); continue; }
+             * menu doesn't open". B still means an explicit cancel too.
+             *
+             * Ignored for a moment after opening, though. The press that
+             * opens this menu can be reported twice — a pad that enumerates
+             * as several event nodes, or MiSTer's own OSD echoing physical
+             * input onto a second virtual device, both do that — and if the
+             * duplicate lands in a later poll than the original it arrives
+             * here and closes the menu immediately. Draining on open only
+             * discards what was already queued at that instant, so a
+             * duplicate a few milliseconds behind still gets through; the
+             * menu then flickers open and shut and reads as "the button
+             * doesn't reliably work". */
+            if ((inp & (INP_B | INP_SELECT)) &&
+                loop_now - g_submenu_opened_at > SUBMENU_IGNORE_CLOSE_SEC) {
+                submenu_close(); input_drain(); continue;
+            }
             /* Redraw every single frame, unconditionally — mplayer writes
              * video frames directly to fb->mem (bypassing our fb->back
              * entirely) and was confirmed on hardware to still do so
@@ -5152,7 +5259,7 @@ int main(int argc, char **argv)
                 state = STATE_BROWSE;
                 draw_browse(&fb);
             } else if (g_paused) {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
                 if (inp & INP_A) player_pause_toggle();
@@ -5171,7 +5278,7 @@ int main(int argc, char **argv)
                  * to actually fire the restart. */
                 draw_paused(&fb, g_info_item.name, seek_pending_target());
             } else {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
                 if (inp & INP_A) player_pause_toggle();
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
