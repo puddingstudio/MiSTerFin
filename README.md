@@ -133,6 +133,10 @@ Quick Connect must be enabled server-side (Dashboard → General → Quick Conne
 
 **TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
 
+**Transcode profile** is also optional, and likewise recognised wherever it appears — `WxH` or `WxH@BITRATE`, e.g. `640x480@12000000`. It sets what the server is asked to transcode video down to before mplayer scales it back up to fill the screen; the default is `480x270@8000000`. The active profile is shown on the pause screen so you can confirm which one is in effect.
+
+Raising it is the main lever on picture quality, and the main way to run out of CPU. Total pixel count is what costs decode time on this hardware — bitrate is close to free (2 Mbps and 8 Mbps both measured ~34% CPU with no A/V drift), while `720x576` was confirmed unsustainable: A/V desync grew continuously and the CPU saturated. `480x270` is the known-good default. Anything in between is unmeasured, so if you raise it, watch for audio drifting out of sync — that's the symptom that appears first.
+
 ### Using an API key instead
 
 Still supported, and unchanged if you already have one set up:

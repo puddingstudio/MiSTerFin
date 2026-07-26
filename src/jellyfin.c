@@ -605,6 +605,10 @@ static void jf_post_json(const JfConfig *cfg, const char *path, const char *json
 int jf_config_load(JfConfig *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->profile_width   = JF_PROFILE_DEFAULT_W;
+    cfg->profile_height  = JF_PROFILE_DEFAULT_H;
+    cfg->profile_bitrate = JF_PROFILE_DEFAULT_RATE;
+
     const char *paths[] = {
         "/media/fat/misterfin/jellyfin.conf",
         "./jellyfin.conf",
@@ -619,6 +623,29 @@ int jf_config_load(JfConfig *cfg)
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         if (line[0] == '\0' || line[0] == '#') continue;
+
+        /* An optional transcode profile, "WxH" or "WxH@BITRATE" (e.g.
+         * "640x480@12000000"). Matched by shape rather than by position for
+         * the same reason as PAL/NTSC below — and the shape is unambiguous:
+         * a server URL contains "://", and no API key or username is two
+         * integers joined by an 'x'. sscanf's %n confirms the whole line was
+         * consumed, so "480x270junk" is not silently accepted. */
+        {
+            int w = 0, h = 0, rate = 0, used = 0;
+            if ((sscanf(line, "%dx%d@%d%n", &w, &h, &rate, &used) == 3 && !line[used]) ||
+                (sscanf(line, "%dx%d%n", &w, &h, &used) == 2 && !line[used])) {
+                if (w >= JF_PROFILE_MIN_W && w <= JF_PROFILE_MAX_W &&
+                    h >= JF_PROFILE_MIN_H && h <= JF_PROFILE_MAX_H) {
+                    cfg->profile_width  = w;
+                    cfg->profile_height = h;
+                    if (rate >= JF_PROFILE_MIN_RATE && rate <= JF_PROFILE_MAX_RATE)
+                        cfg->profile_bitrate = rate;
+                }
+                /* Consumed either way — a malformed profile line must not
+                 * fall through and be read as an API key. */
+                continue;
+            }
+        }
 
         /* PAL/NTSC is recognised wherever it appears rather than strictly as
          * the 4th line. The file is positional and blank lines are skipped,

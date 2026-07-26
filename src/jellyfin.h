@@ -196,6 +196,15 @@ typedef struct {
      * take turns kicking one another out indefinitely. The API key path
      * creates no session, which is why this was harmless before. */
     char device_id[64];
+    /* Transcode resolution/bitrate requested for video, overridable from the
+     * config file (see jf_config_load). Configurable because the useful
+     * resolution ceiling on this hardware is an open question that can only
+     * be answered by measuring on a real MiSTer — and rebuilding and
+     * reflashing for each data point makes that experiment tedious enough
+     * that it doesn't get done. */
+    int  profile_width;
+    int  profile_height;
+    int  profile_bitrate;
 } JfConfig;
 
 /* One in-flight Quick Connect request. */
@@ -390,6 +399,26 @@ typedef struct {
     int max_height;
     int video_bitrate;   /* bits/sec */
 } JfStreamProfile;
+
+/* What the client asks the server to transcode down to, before mplayer scales
+ * it back up to fill the framebuffer. Deliberately small: this device decodes
+ * in scalar C with no NEON path, and total pixel count is what costs CPU —
+ * confirmed on hardware that bitrate barely matters (2Mbps and 8Mbps both sat
+ * at ~34% utime with no A/V drift) while 720x576 pegged the CPU and drifted
+ * continuously. */
+#define JF_PROFILE_DEFAULT_W    480
+#define JF_PROFILE_DEFAULT_H    270
+#define JF_PROFILE_DEFAULT_RATE 8000000
+
+/* Bounds for a profile read from the config file. Wide enough not to get in
+ * the way of experimenting, narrow enough that a typo can't ask the server
+ * for something absurd. */
+#define JF_PROFILE_MIN_W     160
+#define JF_PROFILE_MAX_W    1920
+#define JF_PROFILE_MIN_H     120
+#define JF_PROFILE_MAX_H    1080
+#define JF_PROFILE_MIN_RATE   100000
+#define JF_PROFILE_MAX_RATE 50000000
 
 /* Builds a server-transcoded progressive stream URL for direct HTTP playback
  * (mplayer opens this URL as-is — ApiKey is passed as a query param here

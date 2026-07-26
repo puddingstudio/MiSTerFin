@@ -27,6 +27,9 @@ test:
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_subtitles \
 		tests/test_subtitles.c src/subtitles.c src/jellyfin.c src/json.c
 	@/tmp/misterfin_test_subtitles
+	$(CC) $(CFLAGS) -o /tmp/misterfin_test_config \
+		tests/test_config.c src/jellyfin.c src/json.c
+	@mkdir -p /tmp/misterfin_test_cfgdir && cd /tmp/misterfin_test_cfgdir && /tmp/misterfin_test_config
 
 # -lm: stb_image needs pow(), the Toasty sprite paths need sinf/sincosf. The
 # ARM build gets libm folded into libc by zig's target libc, so only the host

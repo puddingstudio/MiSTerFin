@@ -3337,6 +3337,8 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
     draw_text(fb, (fb->width - text_width(fb, label, 1)) / 2, y + 10, label, 1, COL_ITEM);
 }
 
+static JfStreamProfile stream_profile(void);   /* forward decl — defined with the playback code */
+
 static void draw_paused(FBDev *fb, const char *name, double pos)
 {
     memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
@@ -3351,14 +3353,29 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
     snprintf(nbuf, sizeof(nbuf), "%.60s", name);
     draw_text(fb, (fb->width - text_width(fb, nbuf, 1)) / 2, cy + 20, nbuf, 1, COL_ITEM);
 
+    /* The transcode actually in effect. Shown because it's configurable now
+     * and the whole reason it is configurable is to be swept on hardware —
+     * having to infer which profile is live from a config file you edited
+     * three reboots ago is exactly how that measurement goes wrong. */
+    {
+        JfStreamProfile p = stream_profile();
+        char pbuf[48];
+        snprintf(pbuf, sizeof(pbuf), "%dx%d @ %.1f Mbps",
+                 p.max_width, p.max_height, p.video_bitrate / 1000000.0);
+        draw_text(fb, (fb->width - text_width(fb, pbuf, 1)) / 2, cy + 32, pbuf, 1, COL_HINT);
+    }
+
     /* -20 leaves only ~2px between the timeline's time label and the hint
      * row below on PAL too (same formula), but it's only been reported as
      * too tight on NTSC — leaving PAL's spacing exactly as-is per instr. */
     draw_timeline(fb, fb->height - 8 - SAFE_Y_BOT - (fb->height == 288 ? 20 : 28), pos,
                   (double)g_info_item.runtime_ticks / 10000000.0);
 
-    const char *hint = (g_info_item.sub_count > 0)
-        ? "B:resume  A:stop  L/R:vsync  SELECT:subs"
+    /* SELECT now opens a picker with an audio tab as well, so it's worth
+     * offering on a title that has alternate audio but no subtitles at all —
+     * the old condition hid it in exactly that case. */
+    const char *hint = (g_info_item.sub_count > 0 || g_info_item.audio_count > 1)
+        ? "B:resume  A:stop  L/R:vsync  SELECT:tracks"
         : "B:resume  A:stop  L/R:vsync";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
@@ -3428,7 +3445,18 @@ static double   g_vu_level_l = 0.0, g_vu_level_r = 0.0;   /* attack/decay state,
  * ~34-35% avg utime, A-V desync stayed at 0.000 either way); resolution is
  * what actually costs CPU (see the native-PAL note above), so there's no
  * real reason not to spend the extra bitrate on quality here. */
-static const JfStreamProfile g_stream_profile = { .max_width = 480, .max_height = 270, .video_bitrate = 8000000 };
+/* Assembled from the config each time rather than being a constant, so a
+ * resolution can be tried on hardware by editing jellyfin.conf instead of
+ * rebuilding and reflashing per data point. Defaults to the values above when
+ * the config says nothing. */
+static JfStreamProfile stream_profile(void)
+{
+    JfStreamProfile p;
+    p.max_width     = g_cfg.profile_width;
+    p.max_height    = g_cfg.profile_height;
+    p.video_bitrate = g_cfg.profile_bitrate;
+    return p;
+}
 
 static void mp_cmd(const char *cmd)
 {
@@ -4024,7 +4052,8 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
 
     char url[700];
-    jf_stream_url(&g_cfg, item_id, &g_stream_profile, start_ticks, g_play_session_id,
+    const JfStreamProfile profile = stream_profile();
+    jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
                   g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
 
     char delay_arg[16];
