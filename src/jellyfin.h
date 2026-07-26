@@ -17,6 +17,10 @@
  * scrolled to. The client keeps ONE such page loaded at a time and slides it
  * (see jf_list_items' start_index). */
 #define JF_PAGE_SIZE   128
+/* Upper bound applied to a server-reported TotalRecordCount before it reaches
+ * the client's window arithmetic. Far beyond any real library, but finite:
+ * the alternative is trusting a remote integer not to overflow int math. */
+#define JF_MAX_TOTAL_ITEMS 100000000
 #define JF_ID_LEN      40
 #define JF_NAME_LEN    256
 #define JF_OVERVIEW_LEN 1024
@@ -110,6 +114,12 @@ typedef struct {
     char       collection_type[16];  /* CollectionType — "movies"/"tvshows"/"music"/...,
                                        * library views only (jf_list_views), empty otherwise */
     JfItemType type;
+    /* Non-zero only for the client's own synthetic home-screen entries (see
+     * JF_SYNTH_*). parse_item_fields memsets, so anything that came from the
+     * server always reads 0 — which is the point: identifying these by id
+     * alone let a hostile server return an item with that id and shadow a
+     * real library into being unreachable. */
+    int        synthetic;
     int64_t    runtime_ticks;          /* RunTimeTicks, 0 if unknown */
     int        child_count;            /* ChildCount — track count for a MusicAlbum
                                          * (jf_list_items only requests this field);
@@ -299,7 +309,12 @@ int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *i
  * start_index — one window of a potentially much longer list. Writes the
  * server's untruncated TotalRecordCount to *total_out (may be NULL), which
  * is what lets the caller know there's more to page to; without it a client
- * cannot tell "that's the whole library" from "that's all that fit". */
+ * cannot tell "that's the whole library" from "that's all that fit".
+ *
+ * Returns the number of items, or -1 if the request itself failed. That's a
+ * distinct value from 0 on purpose: a caller sliding a window has to roll
+ * back to the page it already had rather than commit an empty one, and an
+ * empty page is a legitimate answer it must not confuse with a dead network. */
 int jf_list_items(const JfConfig *cfg, const char *parent_id, int start_index,
                    JfItem *out, int max, int64_t *total_out);
 
@@ -325,6 +340,11 @@ int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *ou
  * filenames). */
 #define JF_VIEW_RESUME  "misterfin-resume"
 #define JF_VIEW_NEXTUP  "misterfin-nextup"
+
+/* Values for JfItem.synthetic. The ids above remain as grid-cache keys; these
+ * are what the code actually branches on. */
+#define JF_SYNTH_RESUME 1
+#define JF_SYNTH_NEXTUP 2
 
 /* Partly-watched items across the whole library, most recently played first
  * (Jellyfin's "Continue Watching"). Returns movies and episodes together.

@@ -6,6 +6,9 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/wait.h>
 #include <time.h>
 
 #ifndef APP_VERSION
@@ -441,15 +444,92 @@ static void jf_response_free(JfResponse *r)
     r->text = NULL;
 }
 
-/* Runs `curl -H "Authorization: ..." <url>` and returns its entire stdout as
- * a NUL-terminated heap buffer (caller frees), or NULL on failure.
+/* Runs curl with an explicit argument vector and NO SHELL, optionally
+ * capturing stdout into a NUL-terminated heap buffer (caller frees).
+ * Returns the buffer when capture is set and something was read, else NULL;
+ * *exit_ok (may be NULL) reports whether curl itself exited 0.
  *
- * Grows to fit rather than reading into a fixed buffer. The previous fixed
- * 256KB cap was a silent data-loss bug: a response larger than the cap was
- * cut mid-JSON and the old scanner simply stopped at the first malformed
- * object, presenting a truncated library as a complete one. Now the response
- * is always read in full, and if it somehow still can't be, parsing rejects
- * it outright instead of half-accepting it. */
+ * The absence of a shell is the entire point. Every one of these arguments —
+ * the Authorization header, the URL — carries data that ultimately came from
+ * the server, and with popen()/system() that data was being parsed by /bin/sh.
+ * A hostile server answering Quick Connect with
+ *     {"AccessToken":"x' ; <command> ; '"}
+ * got that command executed as root, on every launch thereafter, because the
+ * token is saved to disk. Confirmed by reproduction, not theory. Note the
+ * escape: Jellyfin encodes an apostrophe as ', so decoding escapes
+ * correctly (which this client now does) is what turns a quoted string into
+ * a quote-breaking one. execvp takes argv straight to the kernel — there is
+ * no parser between us and exec, so no quoting to escape from.
+ *
+ * The capture path grows to fit rather than reading into a fixed buffer: the
+ * old 256KB cap silently truncated large responses mid-JSON. */
+static char *jf_curl_run(char *const argv[], int capture, int *exit_ok)
+{
+    if (exit_ok) *exit_ok = 0;
+
+    int pfd[2];
+    if (capture && pipe(pfd) != 0) return NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (capture) { close(pfd[0]); close(pfd[1]); }
+        return NULL;
+    }
+
+    if (pid == 0) {
+        if (capture) {
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[0]);
+            close(pfd[1]);
+        }
+        /* curl's own diagnostics would otherwise land in the middle of the
+         * framebuffer UI on the console. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            if (!capture) dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+        execvp("curl", argv);
+        _exit(127);
+    }
+
+    char *buf = NULL;
+    size_t len = 0;
+    if (capture) {
+        close(pfd[1]);
+        size_t cap = 64 * 1024;
+        buf = (char *)malloc(cap);
+        if (buf) {
+            for (;;) {
+                if (len + 1 >= cap) {
+                    size_t ncap = cap * 2;
+                    char *grown = (char *)realloc(buf, ncap);
+                    if (!grown) { free(buf); buf = NULL; len = 0; break; }
+                    buf = grown;
+                    cap = ncap;
+                }
+                ssize_t got = read(pfd[0], buf + len, cap - len - 1);
+                if (got <= 0) break;
+                len += (size_t)got;
+            }
+        }
+        /* Drain anything left so curl never blocks on a full pipe while we're
+         * waiting for it to exit. */
+        if (!buf) { char sink[4096]; while (read(pfd[0], sink, sizeof(sink)) > 0) {} }
+        close(pfd[0]);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (exit_ok) *exit_ok = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    if (!capture) { free(buf); return NULL; }
+    if (!buf || len == 0) { free(buf); return NULL; }
+    buf[len] = '\0';
+    return buf;
+}
+
 static char *jf_request_alloc(const JfConfig *cfg, const char *method,
                                const char *path_and_query, const char *body_file,
                                int timeout_secs)
@@ -457,46 +537,36 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
     char auth[320];
     jf_auth_header(cfg, auth, sizeof(auth));
 
-    /* Assembled as optional fragments rather than branching over whole
-     * command lines — the four combinations of {GET, POST} × {body, no body}
-     * are otherwise four near-identical format strings to keep in step. */
-    char method_arg[24] = "";
-    if (method) snprintf(method_arg, sizeof(method_arg), "-X %s ", method);
+    char timeout[16];
+    snprintf(timeout, sizeof(timeout), "%d", timeout_secs);
 
-    char body_arg[128] = "";
-    if (body_file)
-        snprintf(body_arg, sizeof(body_arg),
-                 "-H 'Content-Type: application/json' --data-binary @%s ", body_file);
+    char url[1024];
+    snprintf(url, sizeof(url), "%s%s", cfg->server, path_and_query);
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "curl -sfk --max-time %d %s-H '%s' %s'%s%s' 2>/dev/null",
-        timeout_secs, method_arg, auth, body_arg, cfg->server, path_and_query);
+    char body_arg[128];
+    if (body_file) snprintf(body_arg, sizeof(body_arg), "@%s", body_file);
 
-    FILE *f = popen(cmd, "r");
-    if (!f) return NULL;
-
-    size_t cap = 64 * 1024, len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) { pclose(f); return NULL; }
-
-    for (;;) {
-        if (len + 1 >= cap) {
-            size_t ncap = cap * 2;
-            char *grown = (char *)realloc(buf, ncap);
-            if (!grown) { free(buf); pclose(f); return NULL; }
-            buf = grown;
-            cap = ncap;
-        }
-        size_t got = fread(buf + len, 1, cap - len - 1, f);
-        if (got == 0) break;
-        len += got;
+    /* Built as a plain argv. Each element reaches curl exactly as written,
+     * with no quoting, escaping or word splitting anywhere in between. */
+    const char *argv[20];
+    int n = 0;
+    argv[n++] = "curl";
+    argv[n++] = "-sfk";
+    argv[n++] = "--max-time";
+    argv[n++] = timeout;
+    if (method) { argv[n++] = "-X"; argv[n++] = method; }
+    argv[n++] = "-H";
+    argv[n++] = auth;
+    if (body_file) {
+        argv[n++] = "-H";
+        argv[n++] = "Content-Type: application/json";
+        argv[n++] = "--data-binary";
+        argv[n++] = body_arg;
     }
-    pclose(f);
+    argv[n++] = url;
+    argv[n]   = NULL;
 
-    if (len == 0) { free(buf); return NULL; }
-    buf[len] = '\0';
-    return buf;
+    return jf_curl_run((char *const *)argv, 1, NULL);
 }
 
 /* Fetch + parse in one step. Returns 1 on success, with *r owning both the
@@ -523,18 +593,10 @@ static void jf_post_json(const JfConfig *cfg, const char *path, const char *json
     fputs(json_body, f);
     fclose(f);
 
-    char auth[320];
-    jf_auth_header(cfg, auth, sizeof(auth));
-
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-        "curl -sfk --max-time 5 -X POST "
-        "-H '%s' "
-        "-H 'Content-Type: application/json' "
-        "--data-binary @%s "
-        "'%s%s' >/dev/null 2>&1",
-        auth, tmp_path, cfg->server, path);
-    system(cmd);
+    /* Reuses the same no-shell path as every other request — see
+     * jf_curl_run. The response is discarded, but the arguments still carry
+     * the server-issued token. */
+    free(jf_request_alloc(cfg, "POST", path, tmp_path, 5));
     unlink(tmp_path);
 }
 
@@ -605,6 +667,16 @@ int jf_config_load(JfConfig *cfg)
 int jf_has_credential(const JfConfig *cfg)
 {
     return cfg && cfg->token[0] != '\0';
+}
+
+/* Rejects control characters (and DEL) anywhere in a credential. Empty is
+ * fine — callers check that separately where it matters. */
+static int jf_credential_is_sane(const char *s)
+{
+    if (!s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p < 0x20 || *p == 0x7F) return 0;
+    return 1;
 }
 
 /* ── device identity ──────────────────────────────────────────────────────── */
@@ -830,6 +902,18 @@ int jf_quick_connect_authenticate(JfConfig *cfg, const JfQuickConnect *qc)
 
     if (!token[0] || !user_id[0]) return 0;
 
+    /* A credential is opaque to us, so there's nothing to validate about its
+     * content — except that it must not contain control characters. token.conf
+     * is line-oriented, and a newline inside the token (which the server can
+     * send as
+, and which this client now decodes faithfully) would
+     * write a file that reloads as a different, truncated credential: a
+     * permanent self-inflicted lockout. Rejecting outright beats storing
+     * something that silently means something else. */
+    if (!jf_credential_is_sane(token) || !jf_credential_is_sane(user_id) ||
+        !jf_credential_is_sane(username))
+        return 0;
+
     strncpy(cfg->token,   token,   sizeof(cfg->token) - 1);
     strncpy(cfg->user_id, user_id, sizeof(cfg->user_id) - 1);
     /* Whoever approved the request IS the user — no /Users lookup needed, and
@@ -948,7 +1032,7 @@ int jf_list_items(const JfConfig *cfg, const char *parent_id, int start_index,
         cfg->user_id, safe_parent, start_index, max);
 
     JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
+    if (!jf_fetch(cfg, path, &r)) return -1;   /* transport/parse failure, not an empty page */
     int n = parse_item_list(&r.doc, out, max);
     parse_total_count(&r.doc, total_out);
     jf_response_free(&r);
@@ -1023,7 +1107,7 @@ int jf_list_resume(const JfConfig *cfg, JfItem *out, int max, int64_t *total_out
         cfg->user_id, max);
 
     JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
+    if (!jf_fetch(cfg, path, &r)) return -1;   /* transport/parse failure, not an empty page */
     int n = parse_item_list(&r.doc, out, max);
     parse_total_count(&r.doc, total_out);
     jf_response_free(&r);
@@ -1042,7 +1126,7 @@ int jf_list_nextup(const JfConfig *cfg, JfItem *out, int max, int64_t *total_out
         cfg->user_id, max);
 
     JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
+    if (!jf_fetch(cfg, path, &r)) return -1;   /* see jf_list_items */
     int n = parse_item_list(&r.doc, out, max);
     parse_total_count(&r.doc, total_out);
     /* NextUp returns episodes by definition, but says so only via each item's
@@ -1108,7 +1192,7 @@ int jf_list_episodes(const JfConfig *cfg, const char *series_id, const char *sea
         safe_series, safe_season, cfg->user_id, start_index, max);
 
     JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
+    if (!jf_fetch(cfg, path, &r)) return -1;   /* see jf_list_items */
     int n = parse_item_list(&r.doc, out, max);
     parse_total_count(&r.doc, total_out);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_EPISODE;
@@ -1147,10 +1231,13 @@ int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char 
     char url[512];
     if (!jf_item_image_url(cfg, item_id, image_type, tag, max_width, url, sizeof(url))) return 0;
 
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-        "curl -sfLk --max-time 15 '%s' -o '%s' 2>/dev/null", url, dest_path);
-    return system(cmd) == 0;
+    /* No shell — see jf_curl_run. The URL embeds an image tag that came
+     * from server JSON. */
+    const char *argv[] = { "curl", "-sfLk", "--max-time", "15",
+                           url, "-o", dest_path, NULL };
+    int ok = 0;
+    jf_curl_run((char *const *)argv, 0, &ok);
+    return ok;
 }
 
 int jf_image_url(const JfConfig *cfg, const JfItem *item, char *out, int outlen)
@@ -1261,14 +1348,18 @@ int jf_download_subtitle(const JfConfig *cfg, const char *item_id,
     jf_sanitize_id(item_id, safe_id, sizeof(safe_id));
     jf_sanitize_id(media_source_id, safe_msid, sizeof(safe_msid));
 
-    char url[384];
+    /* Sized for a full server URL plus a 191-byte token: 384 bytes could
+     * truncate the ApiKey, which showed up as subtitles silently failing to
+     * load rather than as any visible error. */
+    char url[768];
     snprintf(url, sizeof(url), "%s/Videos/%s/%s/Subtitles/%d/Stream.srt?ApiKey=%s",
               cfg->server, safe_id, safe_msid, sub_index, cfg->token);
 
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-        "curl -sfLk --max-time 15 '%s' -o '%s' 2>/dev/null", url, dest_path);
-    return system(cmd) == 0;
+    const char *argv[] = { "curl", "-sfLk", "--max-time", "15",
+                           url, "-o", dest_path, NULL };
+    int ok = 0;
+    jf_curl_run((char *const *)argv, 0, &ok);
+    return ok;
 }
 
 void jf_make_play_session_id(char *out, int outlen)

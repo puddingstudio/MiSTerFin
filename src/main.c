@@ -1176,9 +1176,9 @@ static const char *collection_item_type(const char *collection_type)
  * they aren't libraries — no ParentId to list, no collection type, and their
  * contents change every time something is watched. Everything that would
  * normally reach for the server via a view id has to route around them. */
-static int view_is_resume(const JfItem *v) { return !strcmp(v->id, JF_VIEW_RESUME); }
-static int view_is_nextup(const JfItem *v) { return !strcmp(v->id, JF_VIEW_NEXTUP); }
-static int view_is_synthetic(const JfItem *v) { return view_is_resume(v) || view_is_nextup(v); }
+static int view_is_resume(const JfItem *v) { return v->synthetic == JF_SYNTH_RESUME; }
+static int view_is_nextup(const JfItem *v) { return v->synthetic == JF_SYNTH_NEXTUP; }
+static int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
 
 /* Episodes in these rows arrive out of context — the row mixes shows, so a
  * name like "Episode 03" identifies nothing. Fold the series name and season/
@@ -1206,11 +1206,24 @@ static void home_row_label_episodes(void)
 /* Loads the window of the current frame's list that starts at start_index.
  * Only the list itself moves — the frame stack, and which frame is current,
  * are untouched, so this is equally the "open this frame" path (start 0) and
- * the "scroll past the end of what's loaded" path. */
-static void fetch_frame_window(int start_index)
+ * the "scroll past the end of what's loaded" path.
+ *
+ * Returns 1 on success, 0 if the fetch failed — in which case the previously
+ * loaded window is left intact. */
+static int fetch_frame_window(int start_index)
 {
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
     if (start_index < 0) start_index = 0;
+
+    /* Saved so a failed fetch can put the window back exactly as it was —
+     * committing the new start and a recomputed total on failure left the
+     * cursor pointing into a list that had just been emptied, which rendered
+     * a perfectly healthy library as "Nothing here". */
+    const int     prev_window_start = g_window_start;
+    const int64_t prev_total_count  = g_total_count;
+    const int     prev_item_count   = g_item_count;
+
+    int paginated = 0;   /* only these kinds have more rows than one fetch returns */
 
     g_window_start = start_index;
     g_total_count  = -1;
@@ -1233,9 +1246,9 @@ static void fetch_frame_window(int start_index)
          * "Continue...". The full name is used for the frame title once you
          * drill in (see the STATE_BROWSE handler), where there's room. */
         int n_synth = 0;
-        static const struct { const char *id, *name; } synth[] = {
-            { JF_VIEW_RESUME, "Continue" },
-            { JF_VIEW_NEXTUP, "Next Up" },
+        static const struct { const char *id, *name; int kind; } synth[] = {
+            { JF_VIEW_RESUME, "Continue", JF_SYNTH_RESUME },
+            { JF_VIEW_NEXTUP, "Next Up",  JF_SYNTH_NEXTUP },
         };
         for (int s = 0; s < 2; s++) {
             JfItem probe[1];
@@ -1250,6 +1263,7 @@ static void fetch_frame_window(int start_index)
             strncpy(card->id,   synth[s].id,   sizeof(card->id) - 1);
             strncpy(card->name, synth[s].name, sizeof(card->name) - 1);
             card->type = JF_TYPE_FOLDER;
+            card->synthetic = synth[s].kind;
             card->index_number = -1;
             g_view_counts[n_synth] = total;
             n_synth++;
@@ -1281,6 +1295,7 @@ static void fetch_frame_window(int start_index)
          * could be drawn. They now ride along on the listing itself as
          * RecursiveItemCount, which the server computes for the whole
          * result set in a single batched query. See JfItem's own comment. */
+        paginated = 1;
         g_item_count = jf_list_items(&g_cfg, f->parent_id, start_index,
                                       g_items, JF_PAGE_SIZE, &g_total_count);
         break;
@@ -1289,14 +1304,30 @@ static void fetch_frame_window(int start_index)
         g_item_count = jf_list_seasons(&g_cfg, f->series_id, g_items, JF_MAX_ITEMS);
         break;
     case FRAME_EPISODES:
+        paginated = 1;
         g_item_count = jf_list_episodes(&g_cfg, f->series_id, f->season_id, start_index,
                                          g_items, JF_PAGE_SIZE, &g_total_count);
         break;
     }
-    /* No TotalRecordCount came back (older server, or an endpoint that
-     * doesn't report one) — treat what's loaded as the whole list, which is
-     * the pre-pagination behavior and degrades safely. */
-    if (g_total_count < 0) g_total_count = g_window_start + g_item_count;
+    if (g_item_count < 0) {
+        /* The request failed (as opposed to legitimately returning nothing).
+         * Restore the window we already had rather than commit an empty one. */
+        g_window_start = prev_window_start;
+        g_total_count  = prev_total_count;
+        g_item_count   = prev_item_count;
+        return 0;
+    }
+
+    /* For everything that isn't paginated, what's loaded IS the whole list —
+     * overwrite rather than fall back. The home rows ask the server for a
+     * total and then cap the fetch at HOME_ROW_MAX, so on an account with
+     * more than that the total legitimately exceeds what's loaded; leaving it
+     * in place made browse_move_sel think there was another page, and it
+     * re-fetched the same rows on every keypress. With auto-repeat that is a
+     * blocking HTTP request every 45ms for as long as DOWN is held. */
+    if (!paginated || g_total_count < 0)
+        g_total_count = g_window_start + g_item_count;
+    return 1;
 }
 
 static void fetch_frame(void)
@@ -1400,6 +1431,9 @@ static int browse_move_sel(FBDev *fb, int delta)
 {
     if (delta == 0) return 0;
 
+    /* Clamped on ingest: TotalRecordCount is server-supplied, and an absurd
+     * value would otherwise reach the signed arithmetic below. */
+    if (g_total_count > JF_MAX_TOTAL_ITEMS) g_total_count = JF_MAX_TOTAL_ITEMS;
     int total = (int)g_total_count;
     if (total <= 0) total = g_item_count;
     if (total <= 0) return 0;
@@ -1411,11 +1445,24 @@ static int browse_move_sel(FBDev *fb, int delta)
     if (new_abs == abs_sel) return 0;
 
     if (new_abs < g_window_start || new_abs >= g_window_start + g_item_count) {
-        fetch_frame_window((new_abs / JF_PAGE_SIZE) * JF_PAGE_SIZE);
-        g_scroll = 0;   /* old window's scroll offset means nothing now */
-        if (g_item_count <= 0) return 0;   /* fetch failed — leave the cursor put */
+        int target_start = (new_abs / JF_PAGE_SIZE) * JF_PAGE_SIZE;
+
+        /* Only fetch if that's genuinely a different window. The destination
+         * can land outside the loaded rows while still belonging to the page
+         * we already have — a list shorter than JF_PAGE_SIZE whose reported
+         * total is larger does exactly that at its last row. Re-fetching there
+         * meant one blocking request per keypress, and with auto-repeat, per
+         * repeat tick. */
+        if (target_start != g_window_start) {
+            if (!fetch_frame_window(target_start)) return 0;   /* window left intact */
+            g_scroll = 0;   /* old window's scroll offset means nothing now */
+        }
+
+        if (g_item_count <= 0) return 0;
         if (new_abs >= g_window_start + g_item_count)
             new_abs = g_window_start + g_item_count - 1;
+        if (new_abs < g_window_start) new_abs = g_window_start;
+        if (new_abs == abs_sel) return 0;   /* clamped back to where we started */
     }
 
     g_sel = new_abs - g_window_start;
@@ -2106,13 +2153,19 @@ static void *quick_connect_thread(void *arg)
     g_qc_state = QC_WAITING;
     pthread_mutex_unlock(&g_qc_mutex);
 
-    int elapsed = 0, consecutive_errors = 0;
-    while (elapsed < QC_TIMEOUT_SEC && g_running) {
-        sleep(QC_POLL_INTERVAL_SEC);
+    int elapsed = 0, consecutive_errors = 0, approved = 0;
+    while (g_running) {
+        /* Slept in short slices rather than one long sleep so quitting is
+         * responsive: the app can exit while this is waiting, and a 3-second
+         * sleep meant up to 3 seconds of a detached thread still running
+         * against a torn-down process. */
+        for (int slept = 0; slept < QC_POLL_INTERVAL_SEC * 10 && g_running; slept++)
+            usleep(100 * 1000);
+        if (!g_running) return NULL;
         elapsed += QC_POLL_INTERVAL_SEC;
 
         int poll = jf_quick_connect_poll(&g_cfg, &qc);
-        if (poll == 1) break;
+        if (poll == 1) { approved = 1; break; }
         if (poll < 0) {
             /* A poll failure is ambiguous — the request really being gone
              * looks the same as the wifi hiccupping. Tolerate a couple before
@@ -2122,8 +2175,14 @@ static void *quick_connect_thread(void *arg)
         } else {
             consecutive_errors = 0;
         }
+
+        /* Checked AFTER the poll, not before it. Testing first meant the
+         * final poll never ran, so an approval given in the last few seconds
+         * was discarded — and it's single-use, so the user's code was burned
+         * for nothing. */
+        if (elapsed >= QC_TIMEOUT_SEC) break;
     }
-    if (elapsed >= QC_TIMEOUT_SEC) { qc_set_state(QC_FAILED); return NULL; }
+    if (!approved) { qc_set_state(QC_FAILED); return NULL; }
     if (!g_running) return NULL;
 
     if (!jf_quick_connect_authenticate(&g_cfg, &qc)) { qc_set_state(QC_FAILED); return NULL; }
@@ -2491,7 +2550,11 @@ static int grid_cache_load_from_disk(GridLibCache *gc, const JfItem *view, const
         int32_t w = 0, h = 0;
         size_t need;
         if (fread(&w, sizeof(w), 1, f) != 1 || fread(&h, sizeof(h), 1, f) != 1 ||
-            w <= 0 || h <= 0 || (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
+            /* Bounded individually before multiplying: size_t is 32-bit on
+             * the ARM target, so w*h*4 can wrap and slip under the 4MB guard
+             * on a corrupted cache file. */
+            w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
+            (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
             fclose(f);
             for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
             gc->count = 0;
@@ -2569,7 +2632,10 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
     } else {
         if (grid_cache_load_from_disk(gc, view, item_type)) {
             grid_cell_order_shuffle(gc);
-            gc->ready = 1;
+            /* Release: everything written above must be visible to any
+             * thread that observes ready == 1. See the acquire in
+             * draw_grid_background. */
+            __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
             return;
         }
         n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
@@ -2590,7 +2656,7 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
         int64_t count = jf_count_items(&g_cfg, view->id, item_type);
         if (count >= 0) grid_cache_save_to_disk(gc, view->id, count);
     }
-    gc->ready = 1;
+    __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
 }
 
 /* Already-cached libraries (checked here under g_grid_mutex) return
@@ -2663,7 +2729,7 @@ static void draw_grid_background(FBDev *fb)
 {
     if (g_grid_active < 0) return;
     GridLibCache *gc = &g_grid_cache[g_grid_active];
-    if (!gc->ready || gc->count == 0) return;
+    if (!__atomic_load_n(&gc->ready, __ATOMIC_ACQUIRE) || gc->count == 0) return;
     int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
     for (int row = 0; row < GRID_ROWS; row++) {
         for (int col = 0; col < GRID_COLS; col++) {
@@ -5124,6 +5190,12 @@ int main(int argc, char **argv)
             usleep(16000);
         }
     }
+
+    /* The Quick Connect thread can still be polling when the user quits. It
+     * checks g_running in 100ms slices, so this waits well under a second —
+     * but without it, main() returning would run glibc's exit-time FILE
+     * cleanup underneath a thread that is mid-read on a curl pipe. */
+    if (qc_running) { pthread_join(qc_tid, NULL); qc_running = 0; }
 
     player_stop();
     info_assets_free();
