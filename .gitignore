@@ -3,6 +3,8 @@ misterfin-arm
 misterfin-preview
 mplayer-arm
 jellyfin.conf
+token.conf
+device.conf
 crash.log
 __pycache__/
 *.pyc

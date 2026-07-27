@@ -48,11 +48,71 @@ static void fpga_wait_vsync(void)
 }
 /* -------------------------------------------------------------------------- */
 
+/* Desktop/headless backend — fabricates an FBDev backed by plain malloc'd
+ * buffers so the whole app can run without a real /dev/fb0 (which needs
+ * fbdev ioctls a desktop Linux X/Wayland session doesn't provide). This is
+ * exactly what run_preview_browse() in main.c used to hand-roll for itself;
+ * having it here means the ordinary startup path works too, so the real UI
+ * can be driven end-to-end off-hardware.
+ *
+ * Deliberately gated on MISTERFIN_FB being set rather than falling back
+ * automatically when the real open fails: on the MiSTer a failed /dev/fb0
+ * open is a genuine error worth reporting, and silently substituting an
+ * invisible buffer would turn that into a mystery "app runs but nothing
+ * appears" instead. */
+static int fb_open_headless(FBDev *fb, const char *spec)
+{
+    int w = 0, h = 0;
+    if (sscanf(spec, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0) {
+        fprintf(stderr, "MISTERFIN_FB: expected WxH (e.g. 640x288), got \"%s\"\n", spec);
+        return -1;
+    }
+
+    fb->fd        = -1;
+    fb->width     = w;
+    fb->height    = h;
+    fb->stride    = w * 4;
+    fb->n_pages   = 1;
+    fb->mmap_size = (size_t)fb->stride * fb->height;
+    fb->headless  = 1;
+
+    fb->mem  = (uint8_t *)calloc(1, fb->mmap_size);
+    fb->back = (uint8_t *)calloc(1, fb->mmap_size);
+    if (!fb->mem || !fb->back) {
+        free(fb->mem); free(fb->back);
+        fb->mem = fb->back = NULL;
+        perror("alloc headless framebuffer");
+        return -1;
+    }
+    return 0;
+}
+
+/* Raw BGRX dump of the visible buffer, written on every fb_flip when
+ * MISTERFIN_FRAME_OUT names a path. Always overwrites, so the file simply
+ * holds the latest frame at all times — tools/raw_to_png.py turns it into
+ * something viewable (stdlib zlib only, no image library needed). Headless
+ * only: on real hardware this would be a per-frame disk write to the SD
+ * card for no benefit. */
+static void fb_dump_frame(const FBDev *fb)
+{
+    const char *out = getenv("MISTERFIN_FRAME_OUT");
+    if (!out || !*out) return;
+    FILE *f = fopen(out, "wb");
+    if (!f) return;
+    fwrite(fb->mem, 1, (size_t)fb->stride * fb->height, f);
+    fclose(f);
+}
+
 int fb_open(FBDev *fb, const char *path)
 {
-    fb->fd   = -1;
-    fb->mem  = NULL;
-    fb->back = NULL;
+    fb->fd       = -1;
+    fb->mem      = NULL;
+    fb->back     = NULL;
+    fb->headless = 0;
+
+    const char *headless_spec = getenv("MISTERFIN_FB");
+    if (headless_spec && *headless_spec)
+        return fb_open_headless(fb, headless_spec);
 
     fb->fd = open(path, O_RDWR);
     if (fb->fd < 0) { perror("open framebuffer"); return -1; }
@@ -98,7 +158,8 @@ void fb_close(FBDev *fb)
 {
     if (fb->back) { free(fb->back); fb->back = NULL; }
     if (fb->mem && fb->mem != MAP_FAILED) {
-        munmap(fb->mem, fb->mmap_size);
+        if (fb->headless) free(fb->mem);
+        else              munmap(fb->mem, fb->mmap_size);
         fb->mem = NULL;
     }
     if (fb->fd >= 0) { close(fb->fd); fb->fd = -1; }
@@ -118,13 +179,17 @@ void fb_flip(FBDev *fb)
      * at all — only mplayer's own separately-patched vo_fbdev had its own
      * wait — so anything drawing multiple fb_flip()s in quick succession
      * (the carousel's slide animation, in particular) tore visibly. */
-    uint32_t dummy = 0;
-    ioctl(fb->fd, FBIO_WAITFORVSYNC, &dummy);
+    if (!fb->headless) {
+        uint32_t dummy = 0;
+        ioctl(fb->fd, FBIO_WAITFORVSYNC, &dummy);
+    }
     memcpy(fb->mem, fb->back, (size_t)fb->stride * fb->height);
+    if (fb->headless) fb_dump_frame(fb);
 }
 
 void fb_wait_vsync(FBDev *fb)
 {
+    if (fb->headless) return;   /* no display to sync to */
     uint32_t dummy = 0;
     ioctl(fb->fd, FBIO_WAITFORVSYNC, &dummy);
 }

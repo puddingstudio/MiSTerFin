@@ -1,13 +1,42 @@
 # MiSTerFin config — copy to /media/fat/misterfin/jellyfin.conf and fill in.
-# 4 lines, in order. Lines starting with # and blank lines are ignored.
+# Lines starting with # and blank lines are ignored.
 #
-# 1) Jellyfin server URL (no trailing slash)
-# 2) API key — Jellyfin admin dashboard -> Advanced -> API Keys -> +
-# 3) Your Jellyfin username (resolved to the real user id at startup —
-#    the raw id isn't easily findable in the Jellyfin UI, your username is)
-# 4) TV mode — PAL or NTSC (optional, defaults to PAL)
+# The server URL is the only line you need. On first launch MiSTerFin shows a
+# Quick Connect code: open Jellyfin on any device you're already signed in on,
+# go to your user menu -> Quick Connect, and enter it. The login is saved to
+# token.conf next to this file, so it only has to be done once.
+#
+# PAL or NTSC is optional (defaults to PAL) and is recognised on whichever
+# line it appears, so it doesn't have to sit below anything.
+#
+# So is the transcode profile: "WxH" or "WxH@BITRATE", e.g. 640x480@12000000.
+# It's what the server is asked to scale video down to before mplayer scales
+# it back up; the default is 480x270@8000000. Raising it is the main lever on
+# picture quality and the main way to run out of CPU — 720x576 is confirmed
+# unsustainable on this hardware (audio drifts out of sync and keeps
+# drifting). The pause screen shows which profile is actually in effect.
 
 http://192.168.2.10:8096
-your-api-key-here
-your-username-here
 PAL
+
+
+# ── Using an API key instead ────────────────────────────────────────────────
+# Still supported. Replace the two lines above with the four below:
+#
+#   1) Jellyfin server URL (no trailing slash)
+#   2) API key — Jellyfin admin dashboard -> Advanced -> API Keys -> +
+#   3) Your Jellyfin username (resolved to the real user id at startup —
+#      the raw id isn't easily findable in the Jellyfin UI, your username is)
+#   4) TV mode — PAL or NTSC (optional, defaults to PAL)
+#
+# http://192.168.2.10:8096
+# your-api-key-here
+# your-username-here
+# PAL
+#
+# Quick Connect is preferable where you have the choice. An API key isn't
+# scoped to a user: it authenticates as the server, and the username on line 3
+# only decides which account this client writes watch state to. That works,
+# but the same key can read and write any account on the server — a much
+# broader credential than the job needs — and creating one needs admin
+# dashboard access. A Quick Connect token simply is the user.

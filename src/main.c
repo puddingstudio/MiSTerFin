@@ -7,10 +7,12 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
 #include <linux/kd.h>
+#include <termios.h>
 #include <time.h>
 #include <ctype.h>
 #include <pthread.h>
@@ -28,6 +30,8 @@
 #include "stb_image.h"
 #include "ddr.h"
 #include "jellyfin.h"
+#include "json.h"
+#include "subtitles.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
@@ -137,31 +141,93 @@ static pthread_mutex_t g_upd_mutex = PTHREAD_MUTEX_INITIALIZER;
  * APP_VERSION. No-op-safe if that repo doesn't exist yet (this project is
  * local-only for now) — the request just fails and the About screen shows
  * no update line, same as any other network hiccup. */
+/* Runs a command with an explicit argv and NO SHELL, optionally capturing
+ * stdout. Same reasoning as jf_curl_run in jellyfin.c: the update path
+ * interpolates a GitHub-supplied release tag, and with a shell that tag is
+ * parsed by /bin/sh. Returns 1 if the command exited 0. */
+static int run_no_shell(char *const argv[], char *out, int outlen)
+{
+    if (out && outlen > 0) out[0] = '\0';
+
+    int pfd[2];
+    if (out && pipe(pfd) != 0) return 0;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (out) { close(pfd[0]); close(pfd[1]); }
+        return 0;
+    }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (out) { dup2(pfd[1], STDOUT_FILENO); close(pfd[0]); close(pfd[1]); }
+        else if (devnull >= 0) dup2(devnull, STDOUT_FILENO);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    if (out) {
+        close(pfd[1]);
+        int len = 0;
+        for (;;) {
+            ssize_t got = read(pfd[0], out + len, (size_t)(outlen - 1 - len));
+            if (got <= 0) break;
+            len += (int)got;
+            if (len >= outlen - 1) break;
+        }
+        out[len] = '\0';
+        close(pfd[0]);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* A release tag is pasted into a download URL and a filename, so it gets a
+ * strict allowlist rather than being trusted. Real tags look like "v0.9.3".
+ * Returns 1 if the tag is safe to use. */
+static int update_tag_is_sane(const char *tag)
+{
+    if (!tag || !tag[0] || strlen(tag) > 24) return 0;
+    for (const char *p = tag; *p; p++) {
+        int ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                 (*p >= '0' && *p <= '9') || *p == '.' || *p == '-' || *p == '_';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* Deliberately WITHOUT -k, unlike requests to the user's own Jellyfin server.
+ * A self-signed certificate is normal for a home media server, so verification
+ * is relaxed there; github.com has a valid certificate and there is no reason
+ * to accept anything else. It matters more here than anywhere else in the app:
+ * this path decides which binary gets written over misterfin-arm and run at
+ * next launch, so accepting a substituted response is accepting a substituted
+ * executable. No amount of quoting downstream fixes that. */
 static void *update_check_thread(void *arg)
 {
     (void)arg;
-    FILE *f = popen(
-        "curl -sfk --max-time 8 "
-        "https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest "
-        "2>/dev/null", "r");
-    if (!f) {
-        pthread_mutex_lock(&g_upd_mutex);
-        g_upd_state = UPD_FAILED;
-        pthread_mutex_unlock(&g_upd_mutex);
-        return NULL;
-    }
-    char buf[4096] = {0};
-    fread(buf, 1, sizeof(buf) - 1, f);
-    pclose(f);
 
-    char *p = strstr(buf, "\"tag_name\"");
-    if (!p) goto fail;
-    p = strchr(p, ':'); if (!p) goto fail;
-    p++;
-    while (*p == ' ' || *p == '"') p++;
+    char *const argv[] = {
+        (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
+        (char *)"--tlsv1.2", (char *)"--max-time", (char *)"8",
+        (char *)"https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest",
+        NULL
+    };
+
+    char buf[8192];
+    if (!run_no_shell(argv, buf, sizeof(buf))) goto fail;
+
+    /* Parsed properly rather than scanned for — the same reason every other
+     * response in this app is. */
+    JsonDoc doc;
+    if (!json_parse(&doc, buf)) goto fail;
     char tag[32] = {0};
-    int i = 0;
-    while (*p && *p != '"' && i < 31) tag[i++] = *p++;
+    json_copy_str(&doc, NULL, "tag_name", tag, sizeof(tag));
+    json_free(&doc);
+
+    if (!update_tag_is_sane(tag)) goto fail;
 
     pthread_mutex_lock(&g_upd_mutex);
     strncpy(g_upd_latest, tag, sizeof(g_upd_latest) - 1);
@@ -175,8 +241,6 @@ fail:
     pthread_mutex_unlock(&g_upd_mutex);
     return NULL;
 }
-
-/* ── Install ──────────────────────────────────────────────────────────────── */
 
 typedef enum { INST_IDLE, INST_DOWNLOADING, INST_DONE, INST_FAILED } InstallState;
 
@@ -204,22 +268,55 @@ static void *install_thread(void *arg)
     tag[sizeof(tag) - 1] = '\0';
     pthread_mutex_unlock(&g_upd_mutex);
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "curl -Lsk --max-time 120 "
-        "https://github.com/puddingstudio/MiSTerFin/releases/download/%s/misterfin-%s.zip "
-        "-o /tmp/misterfin-update.zip 2>/dev/null",
-        tag, tag);
-    if (system(cmd) != 0) { set_inst(INST_FAILED); return NULL; }
+    /* Re-checked here, not just where it was parsed: the tag crosses a mutex
+     * and a thread boundary in between, and this is the point where it turns
+     * into a URL. */
+    if (!update_tag_is_sane(tag)) { set_inst(INST_FAILED); return NULL; }
 
-    system("rm -rf /tmp/misterfin-update/");
-    if (system("unzip -q -o /tmp/misterfin-update.zip -d /tmp/misterfin-update/ 2>/dev/null") != 0)
-        { set_inst(INST_FAILED); return NULL; }
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://github.com/puddingstudio/MiSTerFin/releases/download/%s/misterfin-%s.zip",
+             tag, tag);
 
-    system("cp -r /tmp/misterfin-update/misterfin/font/.    /media/fat/misterfin/font/    2>/dev/null");
-    system("cp -r /tmp/misterfin-update/misterfin/subfont/. /media/fat/misterfin/subfont/ 2>/dev/null");
-    system("cp -r /tmp/misterfin-update/misterfin/toasty/.  /media/fat/misterfin/toasty/  2>/dev/null");
-    system("cp    /tmp/misterfin-update/misterfin/about.png /media/fat/misterfin/about.png 2>/dev/null");
+    {
+        char *const argv[] = {
+            (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
+            (char *)"--tlsv1.2", (char *)"--max-time", (char *)"120",
+            url, (char *)"-o", (char *)"/tmp/misterfin-update.zip", NULL
+        };
+        if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
+    }
+
+    {
+        char *const argv[] = { (char *)"rm", (char *)"-rf",
+                               (char *)"/tmp/misterfin-update/", NULL };
+        run_no_shell(argv, NULL, 0);
+    }
+    {
+        /* -qq quiet, -o overwrite. Info-ZIP refuses absolute and ../ paths by
+         * default, so a crafted archive can't escape the destination. */
+        char *const argv[] = { (char *)"unzip", (char *)"-qq", (char *)"-o",
+                               (char *)"/tmp/misterfin-update.zip",
+                               (char *)"-d", (char *)"/tmp/misterfin-update/", NULL };
+        if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
+    }
+
+    static const char *const asset_copies[][3] = {
+        { "-r", "/tmp/misterfin-update/misterfin/font/.",    "/media/fat/misterfin/font/"    },
+        { "-r", "/tmp/misterfin-update/misterfin/subfont/.", "/media/fat/misterfin/subfont/" },
+        { "-r", "/tmp/misterfin-update/misterfin/toasty/.",  "/media/fat/misterfin/toasty/"  },
+        { NULL, "/tmp/misterfin-update/misterfin/about.png", "/media/fat/misterfin/about.png" },
+    };
+    for (size_t i = 0; i < sizeof(asset_copies) / sizeof(asset_copies[0]); i++) {
+        char *argv[6];
+        int n = 0;
+        argv[n++] = (char *)"cp";
+        if (asset_copies[i][0]) argv[n++] = (char *)asset_copies[i][0];
+        argv[n++] = (char *)asset_copies[i][1];
+        argv[n++] = (char *)asset_copies[i][2];
+        argv[n]   = NULL;
+        run_no_shell(argv, NULL, 0);
+    }
 
     FILE *f = fopen("/tmp/misterfin_apply_update.sh", "w");
     if (f) {
@@ -248,8 +345,18 @@ static void about_start_install(void)
     pthread_detach(tid);
 }
 
+/* Set from fb.headless right after fb_open — see the MISTERFIN_FB comment in
+ * fb.c. Guards the handful of places that touch real console/FPGA hardware
+ * with no meaningful desktop equivalent. */
+static int g_headless = 0;
+
 static void cursor_hide(void)
 {
+    /* Off-hardware the "console" this would grab is the developer's own
+     * terminal emulator — KD_GRAPHICS is a harmless ENOTTY there, but the
+     * clear-screen write is not, and it fights the raw-mode stdin backend
+     * for the same tty. */
+    if (g_headless) return;
     const char *ttys[] = { "/dev/tty0", "/dev/tty1", "/dev/tty", "/dev/console", NULL };
     for (int i = 0; ttys[i]; i++) {
         int fd = open(ttys[i], O_RDWR | O_NONBLOCK);
@@ -265,6 +372,7 @@ static void cursor_hide(void)
 
 static void cursor_show(void)
 {
+    if (g_headless) return;   /* see cursor_hide() */
     const char *ttys[] = { "/dev/tty0", "/dev/tty1", "/dev/tty", "/dev/console", NULL };
     for (int i = 0; ttys[i]; i++) {
         int fd = open(ttys[i], O_RDWR | O_NONBLOCK);
@@ -403,12 +511,34 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
 
 /* ── input (evdev gamepad, same model as MiSTerDVD) ─────────────────────── */
 
-#define MAX_INPUT_FDS 8
+/* Bit-array helpers for the evdev state ioctls below (linux/input.h returns
+ * these as an array of unsigned long). */
+#define INPUT_BITS_PER_LONG  (8 * (int)sizeof(unsigned long))
+#define INPUT_NLONGS(n)      (((n) + INPUT_BITS_PER_LONG - 1) / INPUT_BITS_PER_LONG)
+#define INPUT_TEST_BIT(arr, bit) \
+    ((arr)[(bit) / INPUT_BITS_PER_LONG] & (1UL << ((bit) % INPUT_BITS_PER_LONG)))
+
+/* Was 8. A MiSTer has well over that many /dev/input/event* nodes once
+ * keyboards, mice, the MiSTer virtual input device and a pad or two are
+ * present — and a single pad often exposes several. With a hard cap and no
+ * eviction, which devices got opened came down to readdir order, which is
+ * filesystem order rather than anything meaningful. */
+#define MAX_INPUT_FDS 32
 static int  input_fds[MAX_INPUT_FDS];
 static int  input_swap_ab[MAX_INPUT_FDS];
 static int  input_is_virtual[MAX_INPUT_FDS];
 static char input_names[MAX_INPUT_FDS][32];   /* e.g. "event0" — see input_open() */
 static int  input_count = 0;
+/* MISTERFIN_INPUT_DEBUG=1 — prints every incoming event with its device, raw
+ * code, and what it mapped to (or why it was dropped). MiSTer's input routing
+ * is genuinely unusual: it grabs directly-wired USB pads exclusively and
+ * re-emits them on a synthetic "MiSTer virtual input" device, so which button
+ * arrives on which node, under which code, varies by pad and by connection
+ * type. Guessing at that from a bug report is hopeless; this makes it a
+ * two-minute answer. Output goes to stderr, so run over SSH — it doesn't
+ * touch the framebuffer UI. */
+static int  input_debug = 0;
+
 
 /* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
  * report their printed A/B buttons as BTN_SOUTH/BTN_EAST swapped relative to
@@ -447,12 +577,37 @@ static int device_is_mister_virtual(const char *name)
 #define INP_L      0x100
 #define INP_R      0x200
 
+static const char *inp_bit_name(int bit)
+{
+    switch (bit) {
+    case INP_UP: return "UP";       case INP_DOWN:  return "DOWN";
+    case INP_LEFT: return "LEFT";   case INP_RIGHT: return "RIGHT";
+    case INP_A: return "A";         case INP_B:     return "B";
+    case INP_START: return "START"; case INP_SELECT: return "SELECT";
+    case INP_L: return "L";         case INP_R:      return "R";
+    default: return "?";
+    }
+}
+
 /* Safe to call repeatedly (see the periodic re-scan in the main loop) —
  * skips any /dev/input/eventN already tracked, only opening ones that are
  * new since the last call (a reconnected wireless pad, for example, can
  * come back as a fresh node with a different number). */
+static void stdin_input_open(void);   /* forward decls — desktop backends, defined below */
+static void script_open(void);
+static void stdin_input_restore(void);
+static void stdin_input_drain(void);
+
 static void input_open(void)
 {
+    /* Desktop backends come up alongside (not instead of) evdev — both are
+     * no-ops unless their own env var asked for them, so this stays exactly
+     * the old behavior on real hardware. Safe to call repeatedly, same as
+     * the evdev scan below (see this function's own header comment). */
+    if (getenv("MISTERFIN_STDIN")) stdin_input_open();
+    if (getenv("MISTERFIN_INPUT_DEBUG")) input_debug = 1;
+    script_open();
+
     DIR *d = opendir("/dev/input");
     if (!d) return;
     struct dirent *e;
@@ -469,14 +624,55 @@ static void input_open(void)
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
 
+        /* Skip anything with neither buttons nor axes. A system has plenty of
+         * such nodes (power buttons, lid switches, accelerometers, the
+         * console's own pseudo-devices) and every one of them used to occupy
+         * a slot that a real controller then couldn't have. */
+        unsigned long evbits[INPUT_NLONGS(EV_MAX + 1)];
+        memset(evbits, 0, sizeof(evbits));
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0 ||
+            (!INPUT_TEST_BIT(evbits, EV_KEY) && !INPUT_TEST_BIT(evbits, EV_ABS))) {
+            close(fd);
+            continue;
+        }
+
         char name[128] = "";
         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
         input_swap_ab[input_count]    = device_needs_ab_swap(name);
         input_is_virtual[input_count] = device_is_mister_virtual(name);
         strncpy(input_names[input_count], e->d_name, sizeof(input_names[0]) - 1);
         input_fds[input_count++] = fd;
+        if (input_debug)
+            fprintf(stderr, "[input] opened %s \"%s\"%s (%d tracked)\n",
+                    e->d_name, name,
+                    device_is_mister_virtual(name) ? " [MiSTer virtual]" : "",
+                    input_count);
     }
     closedir(d);
+}
+
+static void input_repeat_reset(void);   /* forward decl — defined with the repeat logic below */
+
+/* Drops a device that has disappeared, compacting the parallel arrays.
+ *
+ * Without this, a controller that disconnects and comes back — which is
+ * routine for anything wireless, and is exactly what happens after a pad
+ * freezes and gets reconnected — leaves its dead entry holding a slot
+ * forever while the live node needs a new one. Slots leak on every reconnect
+ * until nothing new can be opened at all, and buttons simply stop arriving
+ * with no visible cause. */
+static void input_drop_slot(int i)
+{
+    if (input_debug)
+        fprintf(stderr, "[input] %s went away, releasing slot\n", input_names[i]);
+    close(input_fds[i]);
+    for (int j = i; j < input_count - 1; j++) {
+        input_fds[j]        = input_fds[j + 1];
+        input_swap_ab[j]    = input_swap_ab[j + 1];
+        input_is_virtual[j] = input_is_virtual[j + 1];
+        memcpy(input_names[j], input_names[j + 1], sizeof(input_names[0]));
+    }
+    input_count--;
 }
 
 static void input_drain(void)
@@ -484,20 +680,243 @@ static void input_drain(void)
     struct input_event ev;
     for (int i = 0; i < input_count; i++)
         while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {}
+    input_repeat_reset();
+    stdin_input_drain();
 }
 
 static void input_close(void)
 {
     for (int i = 0; i < input_count; i++) close(input_fds[i]);
     input_count = 0;
+    stdin_input_restore();
+}
+
+/* ── desktop keyboard backend (stdin, raw mode) ──────────────────────────
+ * Off-hardware there are no /dev/input/eventN gamepads to read, so the same
+ * INP_* masks are sourced from the controlling terminal instead. Enabled by
+ * MISTERFIN_STDIN=1 (interactive) or implicitly by MISTERFIN_KEYS (scripted,
+ * below) — never on the MiSTer, where the evdev path above is the real one.
+ *
+ * Terminals do their own key repeat when a key is held, so this backend gets
+ * auto-repeat for free and doesn't participate in the evdev held-state
+ * repeat logic. */
+static int  stdin_enabled = 0;
+static struct termios stdin_saved_termios;
+static int  stdin_termios_saved = 0;
+
+static void stdin_input_restore(void)
+{
+    if (!stdin_termios_saved) return;
+    tcsetattr(STDIN_FILENO, TCSANOW, &stdin_saved_termios);
+    stdin_termios_saved = 0;
+}
+
+static void stdin_input_open(void)
+{
+    if (stdin_enabled || !isatty(STDIN_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &stdin_saved_termios) != 0) return;
+
+    struct termios raw = stdin_saved_termios;
+    raw.c_lflag &= ~(unsigned)(ICANON | ECHO);   /* byte-at-a-time, no local echo */
+    raw.c_cc[VMIN]  = 0;                          /* fully non-blocking reads */
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+
+    stdin_termios_saved = 1;
+    stdin_enabled       = 1;
+    atexit(stdin_input_restore);   /* also covers the on_fatal/_exit paths' terminal state */
+    fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
+}
+
+/* Discards buffered keystrokes typed while a blocking operation was running,
+ * matching what input_drain() does for the evdev queues. Scripted playback
+ * is deliberately unaffected — it's paced off the wall clock rather than
+ * buffered, so there's nothing to drop. */
+static void stdin_input_drain(void)
+{
+    if (!stdin_enabled) return;
+    unsigned char buf[64];
+    while (read(STDIN_FILENO, buf, sizeof(buf)) > 0) {}
+}
+
+/* Maps one already-decoded terminal key to an INP_* bit. Escape sequences
+ * (arrows, PageUp/Down, Home) are decoded by the caller and passed in as the
+ * synthetic codes below, which are deliberately outside the ASCII range so
+ * they can't collide with a real typed character. */
+#define TK_UP     0x100
+#define TK_DOWN   0x101
+#define TK_LEFT   0x102
+#define TK_RIGHT  0x103
+#define TK_PGUP   0x104
+#define TK_PGDN   0x105
+#define TK_HOME   0x106
+#define TK_ESC    0x107
+
+static int stdin_key_to_mask(int key)
+{
+    switch (key) {
+    case TK_UP:                 return INP_UP;
+    case TK_DOWN:               return INP_DOWN;
+    case TK_LEFT:               return INP_LEFT;
+    case TK_RIGHT:              return INP_RIGHT;
+    /* Same pairing the evdev path uses: Enter/X confirm, Esc/Z back. */
+    case '\r': case '\n':
+    case 'x': case 'X':         return INP_A;
+    case TK_ESC:
+    case 0x7f: case '\b':
+    case 'z': case 'Z':         return INP_B;
+    case '\t':                  return INP_SELECT;
+    case TK_HOME: case 'p':     return INP_START;
+    case TK_PGUP: case '[':     return INP_L;
+    case TK_PGDN: case ']':     return INP_R;
+    default:                    return 0;
+    }
+}
+
+/* Decodes whatever bytes are pending on stdin into an INP_* mask. 'q' quits
+ * outright — there's no window manager to close off-hardware, and Esc is
+ * already spoken for as "back". */
+static int stdin_poll(void)
+{
+    if (!stdin_enabled) return 0;
+
+    unsigned char buf[64];
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    if (n <= 0) return 0;
+
+    int mask = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        int key = buf[i];
+        if (key == 'q') { g_running = 0; continue; }
+
+        /* CSI sequences arrive as one contiguous burst in the same read, so
+         * looking ahead within this buffer is enough — a bare ESC (nothing
+         * following it) is a real Esc keypress. */
+        if (key == 0x1b) {
+            if (i + 2 < n && buf[i + 1] == '[') {
+                unsigned char c = buf[i + 2];
+                i += 2;
+                switch (c) {
+                case 'A': key = TK_UP;    break;
+                case 'B': key = TK_DOWN;  break;
+                case 'C': key = TK_RIGHT; break;
+                case 'D': key = TK_LEFT;  break;
+                case 'H': key = TK_HOME;  break;
+                /* "5~"/"6~"/"1~" — swallow the trailing '~' too */
+                case '5': key = TK_PGUP; if (i + 1 < n && buf[i+1] == '~') i++; break;
+                case '6': key = TK_PGDN; if (i + 1 < n && buf[i+1] == '~') i++; break;
+                case '1': key = TK_HOME; if (i + 1 < n && buf[i+1] == '~') i++; break;
+                default:  continue;   /* some other CSI sequence — ignore it */
+                }
+            } else {
+                key = TK_ESC;
+            }
+        }
+        mask |= stdin_key_to_mask(key);
+    }
+    return mask;
+}
+
+/* ── scripted key playback (MISTERFIN_KEYS) ──────────────────────────────
+ * A comma-separated list of key names, each optionally followed by ":<ms>"
+ * for how long to wait after it before the next one (default SCRIPT_STEP_MS)
+ * — e.g. MISTERFIN_KEYS="right,right,a:800,down,down".
+ *
+ * Reproducible screenshots without a human at the keyboard: pair it with
+ * MISTERFIN_FRAME_OUT and the raw file holds whatever was on screen when the
+ * script finished. The app quits once the queue drains (that's the point —
+ * it's for automation), unless MISTERFIN_KEYS_HOLD=1 asks it to stay up. */
+#define SCRIPT_MAX      256
+#define SCRIPT_STEP_MS  400
+
+typedef struct { int mask; int delay_ms; } ScriptKey;
+static ScriptKey script_keys[SCRIPT_MAX];
+static int    script_count = 0, script_pos = 0;
+static double script_next_at = 0.0;
+static int    script_hold = 0;
+
+static int script_name_to_mask(const char *name)
+{
+    if (!strcmp(name, "up"))     return INP_UP;
+    if (!strcmp(name, "down"))   return INP_DOWN;
+    if (!strcmp(name, "left"))   return INP_LEFT;
+    if (!strcmp(name, "right"))  return INP_RIGHT;
+    if (!strcmp(name, "a"))      return INP_A;
+    if (!strcmp(name, "b"))      return INP_B;
+    if (!strcmp(name, "select")) return INP_SELECT;
+    if (!strcmp(name, "start"))  return INP_START;
+    if (!strcmp(name, "l"))      return INP_L;
+    if (!strcmp(name, "r"))      return INP_R;
+    if (!strcmp(name, "wait"))   return 0;   /* pure delay, no button */
+    fprintf(stderr, "MISTERFIN_KEYS: unknown key \"%s\"\n", name);
+    return 0;
+}
+
+/* input_open() re-runs every few seconds to pick up hotplugged pads, so this
+ * has to be idempotent — without the latch, each rescan would re-parse the
+ * script and rewind it to the start, looping forever. */
+static void script_open(void)
+{
+    static int script_loaded = 0;
+    if (script_loaded) return;
+    script_loaded = 1;
+
+    const char *spec = getenv("MISTERFIN_KEYS");
+    if (!spec || !*spec) return;
+    const char *hold = getenv("MISTERFIN_KEYS_HOLD");
+    script_hold = (hold && *hold && strcmp(hold, "0") != 0);
+
+    char list[1024];
+    strncpy(list, spec, sizeof(list) - 1);
+    list[sizeof(list) - 1] = '\0';
+
+    for (char *tok = strtok(list, ","); tok && script_count < SCRIPT_MAX;
+         tok = strtok(NULL, ",")) {
+        while (*tok == ' ') tok++;
+        int delay = SCRIPT_STEP_MS;
+        char *colon = strchr(tok, ':');
+        if (colon) { *colon = '\0'; delay = atoi(colon + 1); }
+        script_keys[script_count].mask     = script_name_to_mask(tok);
+        script_keys[script_count].delay_ms = delay > 0 ? delay : SCRIPT_STEP_MS;
+        script_count++;
+    }
+    /* First key fires after one step, so the startup fetch has a moment to
+     * land before the script starts pressing things. */
+    if (script_count > 0) script_next_at = now_sec() + SCRIPT_STEP_MS / 1000.0;
+}
+
+static int script_poll(void)
+{
+    if (script_count == 0) return 0;
+    double t = now_sec();
+    if (t < script_next_at) return 0;
+
+    if (script_pos >= script_count) {
+        if (!script_hold) g_running = 0;
+        return 0;
+    }
+    ScriptKey *k = &script_keys[script_pos++];
+    script_next_at = t + k->delay_ms / 1000.0;
+    return k->mask;
 }
 
 static int input_poll(void)
 {
     struct input_event ev;
-    int mask = 0;
+    int mask = stdin_poll() | script_poll();
     for (int i = 0; i < input_count; i++) {
-        while (read(input_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+        /* Reading a removed device fails with ENODEV; that's how a
+         * disconnect is noticed, since evdev has no other notification.
+         * Dropping the slot here is what lets the same pad be picked up
+         * again by the next rescan. */
+        ssize_t got;
+        while ((got = read(input_fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
+            /* Press edges only. Releases don't need tracking here: auto-repeat
+             * reads the device's real current state instead of reconstructing
+             * it from edges (see input_repeat). The kernel's own key repeat
+             * (value 2) is ignored too — it only fires for real keyboards,
+             * never for a gamepad button or D-pad hat, and runs at whatever
+             * rate the console is configured for. */
             if (ev.type == EV_KEY && ev.value == 1) {
                 int code = ev.code;
                 if (input_swap_ab[i]) {
@@ -519,31 +938,45 @@ static int input_poll(void)
                     code != KEY_UP && code != KEY_DOWN &&
                     code != KEY_LEFT && code != KEY_RIGHT &&
                     code != KEY_ENTER && code != KEY_ESC && code != KEY_BACK) {
+                    if (input_debug)
+                        fprintf(stderr, "[input] %s EV_KEY code=%d val=%d -> DROPPED "
+                                        "(not trusted from MiSTer virtual input)\n",
+                                input_names[i], code, ev.value);
                     continue;
                 }
+                int bit = 0;
                 switch (code) {
-                case BTN_EAST:               mask |= INP_A;      break;
-                case BTN_SOUTH:              mask |= INP_B;      break;
+                case BTN_EAST:               bit = INP_A;      break;
+                case BTN_SOUTH:              bit = INP_B;      break;
                 /* Enter/Esc are the intuitive confirm/cancel pair; X/Z are
                  * the de facto SNES-emulator standard (RetroArch/SNES9x
                  * default keyboard mapping) matching the SNES pad's A
                  * (right) / B (bottom) positions — both work. */
                 case KEY_ENTER:
-                case KEY_X:                  mask |= INP_A;      break;
+                case KEY_X:                  bit = INP_A;      break;
                 case KEY_ESC:
                 case KEY_BACK:
                 case KEY_BACKSPACE:
-                case KEY_Z:                  mask |= INP_B;      break;
-                case BTN_START: case KEY_PAUSE: case KEY_HOME: mask |= INP_START;  break;
-                case BTN_SELECT: case KEY_TAB:  mask |= INP_SELECT; break;
-                case KEY_UP:                     mask |= INP_UP;    break;
-                case KEY_DOWN:                   mask |= INP_DOWN;  break;
-                case KEY_LEFT:                   mask |= INP_LEFT;  break;
-                case KEY_RIGHT:                  mask |= INP_RIGHT; break;
-                case BTN_TL: case KEY_PAGEUP:    mask |= INP_L;     break;
-                case BTN_TR: case KEY_PAGEDOWN:  mask |= INP_R;     break;
+                case KEY_Z:                  bit = INP_B;      break;
+                case BTN_START: case KEY_PAUSE: case KEY_HOME: bit = INP_START;  break;
+                case BTN_SELECT: case KEY_TAB:  bit = INP_SELECT; break;
+                case KEY_UP:                     bit = INP_UP;    break;
+                case KEY_DOWN:                   bit = INP_DOWN;  break;
+                case KEY_LEFT:                   bit = INP_LEFT;  break;
+                case KEY_RIGHT:                  bit = INP_RIGHT; break;
+                case BTN_TL: case KEY_PAGEUP:    bit = INP_L;     break;
+                case BTN_TR: case KEY_PAGEDOWN:  bit = INP_R;     break;
                 }
+                if (input_debug)
+                    fprintf(stderr, "[input] %s EV_KEY code=%d val=%d -> %s\n",
+                            input_names[i], code, ev.value,
+                            bit ? inp_bit_name(bit) : "unmapped");
+                mask |= bit;
             } else if (ev.type == EV_ABS) {
+                if (input_debug && (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y))
+                    fprintf(stderr, "[input] %s EV_ABS %s value=%d\n",
+                            input_names[i],
+                            ev.code == ABS_HAT0X ? "HAT0X" : "HAT0Y", ev.value);
                 if (ev.code == ABS_HAT0Y) {
                     if (ev.value == -1) mask |= INP_UP;
                     if (ev.value ==  1) mask |= INP_DOWN;
@@ -554,14 +987,138 @@ static int input_poll(void)
                 }
             }
         }
+        if (got < 0 && (errno == ENODEV || errno == EBADF)) {
+            input_drop_slot(i);
+            i--;            /* the slot now holds the next device */
+        }
     }
     return mask;
 }
 
+/* ── navigation auto-repeat ──────────────────────────────────────────────────
+ * Holding a direction should keep scrolling instead of demanding one press
+ * per row — a library of any size was otherwise a genuine repetitive-strain
+ * hazard to get through.
+ *
+ * Deliberately NOT folded into input_poll()'s return value: repeats are only
+ * wanted where the action is "move a cursor". Applying them everywhere would
+ * make a held UP skip through music tracks at ten a second on the now-playing
+ * screen, and a held LEFT pile up an enormous accumulated video seek. Callers
+ * that want repeat OR this in explicitly; everything else keeps seeing clean
+ * press edges only.
+ *
+ * Two rates: a slower one to start with (so a deliberate single-row nudge
+ * doesn't overshoot), then faster once it's clear the direction is being held
+ * on purpose, which is what makes crossing a few hundred rows bearable. */
+#define REPEAT_DELAY_SEC  0.35   /* hold this long before repeating at all */
+#define REPEAT_SLOW_SEC   0.11
+#define REPEAT_FAST_SEC   0.045
+#define REPEAT_RAMP_AFTER 6      /* repeats at the slow rate before speeding up */
+
+static int    repeat_mask  = 0;      /* direction currently repeating, 0 = none */
+static double repeat_next  = 0.0;
+static int    repeat_count = 0;
+static int    repeat_suppressed = 0; /* see input_repeat_reset */
+
+static void input_repeat_reset(void)
+{
+    repeat_mask  = 0;
+    repeat_next  = 0.0;
+    repeat_count = 0;
+    /* Called from input_drain, i.e. right after a screen change. Whatever is
+     * physically held at that moment shouldn't immediately start scrolling
+     * the screen you just arrived at, so repeat stays parked until the user
+     * lets go of everything. */
+    repeat_suppressed = 1;
+}
+
+/* Asks each device what it is ACTUALLY holding right now, via EVIOCGKEY /
+ * EVIOCGABS, rather than reconstructing it from the press/release stream.
+ *
+ * This is a correctness fix, not an optimisation. Reconstructing held state
+ * from edges means a single missed release leaves a direction stuck "down"
+ * forever — which showed up on hardware as auto-repeat that wouldn't stop
+ * until the button was pressed again. There are several ways to miss one
+ * here: input_drain() deliberately discards pending events at every screen
+ * change, a hotplugged pad can be reopened under a new event node mid-press
+ * leaving a stale entry nothing ever clears, and MiSTer's OSD echoes pad
+ * input onto a second virtual device whose event pairing this code does not
+ * control. Reading the state directly makes all of those unrepresentable:
+ * there is no accumulated state to go wrong, and a device that has gone away
+ * simply fails the ioctl and contributes nothing. */
+static int input_nav_held(void)
+{
+    int mask = 0;
+    for (int i = 0; i < input_count; i++) {
+        unsigned long keys[INPUT_NLONGS(KEY_MAX + 1)];
+        memset(keys, 0, sizeof(keys));
+        if (ioctl(input_fds[i], EVIOCGKEY(sizeof(keys)), keys) >= 0) {
+            if (INPUT_TEST_BIT(keys, KEY_UP))    mask |= INP_UP;
+            if (INPUT_TEST_BIT(keys, KEY_DOWN))  mask |= INP_DOWN;
+            if (INPUT_TEST_BIT(keys, KEY_LEFT))  mask |= INP_LEFT;
+            if (INPUT_TEST_BIT(keys, KEY_RIGHT)) mask |= INP_RIGHT;
+        }
+        /* D-pads arrive as a hat axis rather than as keys. A device without
+         * these axes just fails the ioctl or reports 0, both of which mean
+         * "nothing held" — no need to probe capabilities first. */
+        struct input_absinfo abs;
+        if (ioctl(input_fds[i], EVIOCGABS(ABS_HAT0Y), &abs) >= 0) {
+            if (abs.value < 0) mask |= INP_UP;
+            if (abs.value > 0) mask |= INP_DOWN;
+        }
+        if (ioctl(input_fds[i], EVIOCGABS(ABS_HAT0X), &abs) >= 0) {
+            if (abs.value < 0) mask |= INP_LEFT;
+            if (abs.value > 0) mask |= INP_RIGHT;
+        }
+    }
+    return mask;
+}
+
+/* Returns the nav bits that should act as though freshly pressed this tick
+ * because they're being held down. Call once per main-loop iteration. */
+static int input_repeat(void)
+{
+    int held = input_nav_held();
+
+    if (repeat_suppressed) {
+        if (held) return 0;      /* still held over from before the screen change */
+        repeat_suppressed = 0;   /* released — normal service resumes */
+    }
+
+    double t = now_sec();
+
+    /* Any change in which direction is held restarts the delay — including
+     * releasing one of two simultaneously held directions, which is the
+     * right call: the surviving direction is then effectively a new press. */
+    if (held != repeat_mask) {
+        repeat_mask  = held;
+        repeat_count = 0;
+        repeat_next  = held ? t + REPEAT_DELAY_SEC : 0.0;
+        return 0;
+    }
+    if (!held || t < repeat_next) return 0;
+
+    repeat_next = t + (repeat_count >= REPEAT_RAMP_AFTER ? REPEAT_FAST_SEC : REPEAT_SLOW_SEC);
+    repeat_count++;
+    return held;
+}
+
 /* ── app state ────────────────────────────────────────────────────────────── */
 
-typedef enum { STATE_CONFIG_ERROR, STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO } AppState;
-typedef enum { FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES } FrameKind;
+typedef enum {
+    STATE_CONFIG_ERROR, STATE_QUICK_CONNECT,
+    STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO
+} AppState;
+typedef enum {
+    FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES,
+    FRAME_RESUME,   /* Continue Watching — see JF_VIEW_RESUME */
+    FRAME_NEXTUP    /* Next Up          — see JF_VIEW_NEXTUP */
+} FrameKind;
+
+/* Rows fetched for each home row. Both are "what to watch next" lists rather
+ * than libraries to browse — past a couple of screenfuls nobody scrolls, so
+ * they're capped instead of paginated. */
+#define HOME_ROW_MAX 24
 
 #define MAX_STACK 8
 
@@ -580,6 +1137,18 @@ static int         g_stack_depth = 0;
 static JfItem g_items[JF_MAX_ITEMS];
 static int    g_item_count = 0;
 static int    g_sel = 0, g_scroll = 0;
+/* g_items[] holds one window of the current frame's list rather than the
+ * whole thing — libraries can be far larger than any buffer we'd want to
+ * keep resident, and the previous fixed Limit=JF_MAX_ITEMS silently
+ * presented a truncated library as if it were complete.
+ *
+ * g_window_start is the absolute index of g_items[0]; g_sel and g_scroll
+ * stay window-relative (so every existing g_items[g_sel] use is unchanged),
+ * and absolute position is g_window_start + g_sel. g_total_count is the
+ * server's TotalRecordCount, or -1 when unknown — in which case the loaded
+ * window is all there is, as far as anything here can tell. */
+static int    g_window_start = 0;
+static int64_t g_total_count = -1;
 static double g_marquee_px = 0.0;         /* scroll offset for an over-long title, see draw_browse */
 static char   g_marquee_title[128] = "";  /* last title drawn — reset the offset when it changes */
 /* Per-library item counts for the root carousel (see draw_browse_carousel),
@@ -588,15 +1157,6 @@ static char   g_marquee_title[128] = "";  /* last title drawn — reset the offs
  * (3 small Limit=0 count requests for this user's library, one per view).
  * -1 = fetch failed, caller just omits the count line for that card. */
 static int64_t g_view_counts[JF_MAX_ITEMS];
-/* Episode count per row, parallel to g_items[], only meaningful for
- * JF_TYPE_SERIES rows in a FRAME_ITEMS listing (a TV library's series
- * list) — fetched alongside the listing itself in fetch_frame(). Season
- * count needs no such array: it's it->child_count, already free on the
- * same request (confirmed on a real server that a Series' ChildCount is
- * its season count, unlike a top-level library view's — see
- * jf_count_items's own comment for that distinction). -1 = fetch failed or
- * not a series, caller omits the episode part of the line. */
-static int64_t g_series_episode_counts[JF_MAX_ITEMS];
 /* Root screen (FRAME_VIEWS) rendering mode — 0 = carousel (default),
  * 1 = classic list, toggled by SELECT (see the STATE_BROWSE input handling
  * below). Persists for the whole app session, not just this one visit to
@@ -795,30 +1355,168 @@ static const char *collection_item_type(const char *collection_type)
     return NULL;
 }
 
-static void fetch_frame(void)
+/* The two home rows are presented as extra cards on the library carousel, but
+ * they aren't libraries — no ParentId to list, no collection type, and their
+ * contents change every time something is watched. Everything that would
+ * normally reach for the server via a view id has to route around them. */
+static int view_is_resume(const JfItem *v) { return v->synthetic == JF_SYNTH_RESUME; }
+static int view_is_nextup(const JfItem *v) { return v->synthetic == JF_SYNTH_NEXTUP; }
+static int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
+
+/* Episodes in these rows arrive out of context — the row mixes shows, so a
+ * name like "Episode 03" identifies nothing. Fold the series name and season/
+ * episode numbers into the display name, which keeps draw_browse unchanged
+ * (it just draws whatever name it's given). The info screen re-fetches by id
+ * and so still shows the clean title. */
+static void home_row_label_episodes(void)
+{
+    for (int i = 0; i < g_item_count; i++) {
+        JfItem *it = &g_items[i];
+        if (it->type != JF_TYPE_EPISODE || !it->series_name[0]) continue;
+
+        char combined[JF_NAME_LEN];
+        if (it->parent_index_number > 0 && it->index_number > 0)
+            snprintf(combined, sizeof(combined), "%s - S%dE%02d %s",
+                     it->series_name, it->parent_index_number, it->index_number, it->name);
+        else
+            snprintf(combined, sizeof(combined), "%s - %s", it->series_name, it->name);
+
+        strncpy(it->name, combined, sizeof(it->name) - 1);
+        it->name[sizeof(it->name) - 1] = '\0';
+    }
+}
+
+/* Loads the window of the current frame's list that starts at start_index.
+ * Only the list itself moves — the frame stack, and which frame is current,
+ * are untouched, so this is equally the "open this frame" path (start 0) and
+ * the "scroll past the end of what's loaded" path.
+ *
+ * Returns 1 on success, 0 if the fetch failed — in which case the previously
+ * loaded window is left intact. */
+static int fetch_frame_window(int start_index)
 {
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
+    if (start_index < 0) start_index = 0;
+
+    /* Saved so a failed fetch can put the window back exactly as it was —
+     * committing the new start and a recomputed total on failure left the
+     * cursor pointing into a list that had just been emptied, which rendered
+     * a perfectly healthy library as "Nothing here". */
+    const int     prev_window_start = g_window_start;
+    const int64_t prev_total_count  = g_total_count;
+    const int     prev_item_count   = g_item_count;
+
+    int paginated = 0;   /* only these kinds have more rows than one fetch returns */
+
+    g_window_start = start_index;
+    g_total_count  = -1;
+
     switch (f->kind) {
-    case FRAME_VIEWS:
-        g_item_count = jf_list_views(&g_cfg, g_items, JF_MAX_ITEMS);
-        for (int i = 0; i < g_item_count; i++) {
-            const char *item_type = collection_item_type(g_items[i].collection_type);
-            g_view_counts[i] = jf_count_items(&g_cfg, g_items[i].id, item_type);
+    case FRAME_VIEWS: {
+        /* Library views are a handful of entries by definition — no paging. */
+        g_window_start = 0;
+
+        /* Continue Watching and Next Up go in front of the real libraries:
+         * they're what someone opening the app usually wants, and putting
+         * them first means the carousel starts there. Each is added only when
+         * it actually has something in it — an empty "Continue Watching" card
+         * is worse than no card, and both are empty on a fresh install.
+         *
+         * Probed with Limit=1 rather than fetched in full: all that's needed
+         * here is the count for the card, and drilling in re-fetches anyway. */
+        /* Card labels are short because the carousel draws them at double
+         * size and clips to CAROUSEL_CARD_W — "Continue Watching" came out as
+         * "Continue...". The full name is used for the frame title once you
+         * drill in (see the STATE_BROWSE handler), where there's room. */
+        int n_synth = 0;
+        static const struct { const char *id, *name; int kind; } synth[] = {
+            { JF_VIEW_RESUME, "Continue", JF_SYNTH_RESUME },
+            { JF_VIEW_NEXTUP, "Next Up",  JF_SYNTH_NEXTUP },
+        };
+        for (int s = 0; s < 2; s++) {
+            JfItem probe[1];
+            int64_t total = 0;
+            int got = (s == 0) ? jf_list_resume(&g_cfg, probe, 1, &total)
+                                : jf_list_nextup(&g_cfg, probe, 1, &total);
+            if (got <= 0) continue;
+            if (total <= 0) total = got;
+
+            JfItem *card = &g_items[n_synth];
+            memset(card, 0, sizeof(*card));
+            strncpy(card->id,   synth[s].id,   sizeof(card->id) - 1);
+            strncpy(card->name, synth[s].name, sizeof(card->name) - 1);
+            card->type = JF_TYPE_FOLDER;
+            card->synthetic = synth[s].kind;
+            card->index_number = -1;
+            g_view_counts[n_synth] = total;
+            n_synth++;
         }
+
+        int n_views = jf_list_views(&g_cfg, g_items + n_synth, JF_MAX_ITEMS - n_synth);
+        for (int i = 0; i < n_views; i++) {
+            JfItem *v = &g_items[n_synth + i];
+            g_view_counts[n_synth + i] =
+                jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
+        }
+        g_item_count = n_synth + n_views;
+        break;
+    }
+    case FRAME_RESUME:
+        g_window_start = 0;
+        g_item_count = jf_list_resume(&g_cfg, g_items, HOME_ROW_MAX, &g_total_count);
+        home_row_label_episodes();
+        break;
+    case FRAME_NEXTUP:
+        g_window_start = 0;
+        g_item_count = jf_list_nextup(&g_cfg, g_items, HOME_ROW_MAX, &g_total_count);
+        home_row_label_episodes();
         break;
     case FRAME_ITEMS:
-        g_item_count = jf_list_items(&g_cfg, f->parent_id, g_items, JF_MAX_ITEMS);
-        for (int i = 0; i < g_item_count; i++)
-            g_series_episode_counts[i] = (g_items[i].type == JF_TYPE_SERIES)
-                ? jf_count_items(&g_cfg, g_items[i].id, "Episode") : -1;
+        /* Episode counts for series rows used to be fetched here with one
+         * extra recursive count request PER ROW — so opening a 200-series
+         * TV library meant 200 sequential curl invocations before anything
+         * could be drawn. They now ride along on the listing itself as
+         * RecursiveItemCount, which the server computes for the whole
+         * result set in a single batched query. See JfItem's own comment. */
+        paginated = 1;
+        g_item_count = jf_list_items(&g_cfg, f->parent_id, start_index,
+                                      g_items, JF_PAGE_SIZE, &g_total_count);
         break;
     case FRAME_SEASONS:
+        g_window_start = 0;   /* a series' season list is always short */
         g_item_count = jf_list_seasons(&g_cfg, f->series_id, g_items, JF_MAX_ITEMS);
         break;
     case FRAME_EPISODES:
-        g_item_count = jf_list_episodes(&g_cfg, f->series_id, f->season_id, g_items, JF_MAX_ITEMS);
+        paginated = 1;
+        g_item_count = jf_list_episodes(&g_cfg, f->series_id, f->season_id, start_index,
+                                         g_items, JF_PAGE_SIZE, &g_total_count);
         break;
     }
+    if (g_item_count < 0) {
+        /* The request failed (as opposed to legitimately returning nothing).
+         * Restore the window we already had rather than commit an empty one. */
+        g_window_start = prev_window_start;
+        g_total_count  = prev_total_count;
+        g_item_count   = prev_item_count;
+        return 0;
+    }
+
+    /* For everything that isn't paginated, what's loaded IS the whole list —
+     * overwrite rather than fall back. The home rows ask the server for a
+     * total and then cap the fetch at HOME_ROW_MAX, so on an account with
+     * more than that the total legitimately exceeds what's loaded; leaving it
+     * in place made browse_move_sel think there was another page, and it
+     * re-fetched the same rows on every keypress. With auto-repeat that is a
+     * blocking HTTP request every 45ms for as long as DOWN is held. */
+    if (!paginated || g_total_count < 0)
+        g_total_count = g_window_start + g_item_count;
+    return 1;
+}
+
+static void fetch_frame(void)
+{
+    fetch_frame_window(0);
+    BrowseFrame *f = &g_stack[g_stack_depth - 1];
     g_sel = 0; g_scroll = 0;
     /* Returning to the root screen (B all the way back out of a library)
      * should land on whichever library you drilled into, not always snap
@@ -899,6 +1597,66 @@ static int visible_rows(FBDev *fb)
      * NTSC, using it directly here reclaims that space as an extra visible
      * row instead of leaving it as unused slack. */
     return (fb->height - (8 + SAFE_Y_BOT) - (SAFE_Y + 24)) / ROW_H;
+}
+
+/* Moves the browse-list cursor by delta rows, clamping to the list and
+ * pulling the scroll window along with it. Single-stepping (UP/DOWN) and
+ * whole-page jumps (LEFT/RIGHT, L/R) are the same operation with a different
+ * delta, so they share this rather than each maintaining g_scroll their own
+ * way. Returns 1 if anything actually moved.
+ *
+ * Movement is computed in ABSOLUTE list coordinates, so it doesn't care
+ * whether the destination happens to be in the currently loaded window — if
+ * it isn't, the window is re-fetched around it first. Windows are aligned to
+ * JF_PAGE_SIZE boundaries rather than centred on the cursor so that scrolling
+ * back and forth across one boundary can't thrash a re-fetch per row. */
+static int browse_move_sel(FBDev *fb, int delta)
+{
+    if (delta == 0) return 0;
+
+    /* Clamped on ingest: TotalRecordCount is server-supplied, and an absurd
+     * value would otherwise reach the signed arithmetic below. */
+    if (g_total_count > JF_MAX_TOTAL_ITEMS) g_total_count = JF_MAX_TOTAL_ITEMS;
+    int total = (int)g_total_count;
+    if (total <= 0) total = g_item_count;
+    if (total <= 0) return 0;
+
+    int abs_sel = g_window_start + g_sel;
+    int new_abs = abs_sel + delta;
+    if (new_abs < 0) new_abs = 0;
+    if (new_abs > total - 1) new_abs = total - 1;
+    if (new_abs == abs_sel) return 0;
+
+    if (new_abs < g_window_start || new_abs >= g_window_start + g_item_count) {
+        int target_start = (new_abs / JF_PAGE_SIZE) * JF_PAGE_SIZE;
+
+        /* Only fetch if that's genuinely a different window. The destination
+         * can land outside the loaded rows while still belonging to the page
+         * we already have — a list shorter than JF_PAGE_SIZE whose reported
+         * total is larger does exactly that at its last row. Re-fetching there
+         * meant one blocking request per keypress, and with auto-repeat, per
+         * repeat tick. */
+        if (target_start != g_window_start) {
+            if (!fetch_frame_window(target_start)) return 0;   /* window left intact */
+            g_scroll = 0;   /* old window's scroll offset means nothing now */
+        }
+
+        if (g_item_count <= 0) return 0;
+        if (new_abs >= g_window_start + g_item_count)
+            new_abs = g_window_start + g_item_count - 1;
+        if (new_abs < g_window_start) new_abs = g_window_start;
+        if (new_abs == abs_sel) return 0;   /* clamped back to where we started */
+    }
+
+    g_sel = new_abs - g_window_start;
+
+    int vis = visible_rows(fb);
+    if (g_sel < g_scroll)              g_scroll = g_sel;
+    if (g_sel >= g_scroll + vis)       g_scroll = g_sel - vis + 1;
+    if (g_scroll > g_item_count - vis) g_scroll = g_item_count - vis;
+    if (g_scroll < 0)                  g_scroll = 0;
+
+    return 1;
 }
 
 /* Simple "flying through stars" background for the About screen — each
@@ -1524,6 +2282,175 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
     fb_flip(fb);
 }
 
+/* ── Quick Connect ────────────────────────────────────────────────────────── */
+
+typedef enum {
+    QC_STARTING,     /* asking the server to open a request */
+    QC_WAITING,      /* code on screen, waiting for the user to approve it */
+    QC_AUTHENTICATED,
+    QC_UNAVAILABLE,  /* server has Quick Connect switched off */
+    QC_FAILED        /* request expired, denied, or the server went away */
+} QcState;
+
+static pthread_mutex_t g_qc_mutex = PTHREAD_MUTEX_INITIALIZER;
+static QcState  g_qc_state = QC_STARTING;
+static char     g_qc_code[16] = "";
+
+static QcState qc_get_state(char *code_out, int code_len)
+{
+    pthread_mutex_lock(&g_qc_mutex);
+    QcState s = g_qc_state;
+    if (code_out) {
+        strncpy(code_out, g_qc_code, (size_t)code_len - 1);
+        code_out[code_len - 1] = '\0';
+    }
+    pthread_mutex_unlock(&g_qc_mutex);
+    return s;
+}
+
+static void qc_set_state(QcState s)
+{
+    pthread_mutex_lock(&g_qc_mutex);
+    g_qc_state = s;
+    pthread_mutex_unlock(&g_qc_mutex);
+}
+
+/* Runs the whole handshake off the main thread: the polling below waits on a
+ * person walking to another device, which can be minutes. Blocking the main
+ * loop for that would freeze the starfield and stop the screen responding to
+ * a cancel press. */
+#define QC_POLL_INTERVAL_SEC 3
+#define QC_TIMEOUT_SEC       300
+
+static void *quick_connect_thread(void *arg)
+{
+    (void)arg;
+
+    if (!jf_quick_connect_enabled(&g_cfg)) { qc_set_state(QC_UNAVAILABLE); return NULL; }
+
+    JfQuickConnect qc;
+    if (!jf_quick_connect_initiate(&g_cfg, &qc)) { qc_set_state(QC_FAILED); return NULL; }
+
+    pthread_mutex_lock(&g_qc_mutex);
+    strncpy(g_qc_code, qc.code, sizeof(g_qc_code) - 1);
+    g_qc_state = QC_WAITING;
+    pthread_mutex_unlock(&g_qc_mutex);
+
+    int elapsed = 0, consecutive_errors = 0, approved = 0;
+    while (g_running) {
+        /* Slept in short slices rather than one long sleep so quitting is
+         * responsive: the app can exit while this is waiting, and a 3-second
+         * sleep meant up to 3 seconds of a detached thread still running
+         * against a torn-down process. */
+        for (int slept = 0; slept < QC_POLL_INTERVAL_SEC * 10 && g_running; slept++)
+            usleep(100 * 1000);
+        if (!g_running) return NULL;
+        elapsed += QC_POLL_INTERVAL_SEC;
+
+        int poll = jf_quick_connect_poll(&g_cfg, &qc);
+        if (poll == 1) { approved = 1; break; }
+        if (poll < 0) {
+            /* A poll failure is ambiguous — the request really being gone
+             * looks the same as the wifi hiccupping. Tolerate a couple before
+             * concluding the request is dead, so a blip doesn't throw away a
+             * code the user is halfway through typing. */
+            if (++consecutive_errors >= 3) { qc_set_state(QC_FAILED); return NULL; }
+        } else {
+            consecutive_errors = 0;
+        }
+
+        /* Checked AFTER the poll, not before it. Testing first meant the
+         * final poll never ran, so an approval given in the last few seconds
+         * was discarded — and it's single-use, so the user's code was burned
+         * for nothing. */
+        if (elapsed >= QC_TIMEOUT_SEC) break;
+    }
+    if (!approved) { qc_set_state(QC_FAILED); return NULL; }
+    if (!g_running) return NULL;
+
+    if (!jf_quick_connect_authenticate(&g_cfg, &qc)) { qc_set_state(QC_FAILED); return NULL; }
+
+    jf_token_save(&g_cfg);   /* so this is a one-time step, not a per-launch one */
+    qc_set_state(QC_AUTHENTICATED);
+    return NULL;
+}
+
+static void draw_quick_connect(FBDev *fb)
+{
+    fb_clear(fb);
+    draw_starfield(fb);
+
+    char code[16];
+    QcState state = qc_get_state(code, sizeof(code));
+
+    const int ts = 2, s1 = 1;
+    const int tch = 8 * ts, sch = 8 * s1, lsp = 6;
+
+    /* Laid out from the vertical centre outwards rather than from the top,
+     * so it sits right at both PAL's 288 lines and NTSC's 240 without a
+     * per-resolution case. */
+    int cur_y = fb->height / 2 - 58;
+
+    static const char title[] = "Quick Connect";
+    draw_text(fb, (fb->width - text_width(fb, title, ts)) / 2, cur_y, title, ts, COL_TITLE);
+    cur_y += tch + lsp * 2;
+
+    switch (state) {
+    case QC_STARTING: {
+        const char *msg = "Contacting server...";
+        draw_text(fb, (fb->width - text_width(fb, msg, s1)) / 2, cur_y, msg, s1, COL_HINT);
+        break;
+    }
+    case QC_WAITING: {
+        const char *l1 = "In Jellyfin, open your user menu and";
+        const char *l2 = "choose Quick Connect, then enter:";
+        draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
+        cur_y += sch + lsp;
+        draw_text(fb, (fb->width - text_width(fb, l2, s1)) / 2, cur_y, l2, s1, COL_HINT);
+        cur_y += sch + lsp * 3;
+
+        /* The code is the one thing being read off a CRT from across a room,
+         * so it gets the largest text on screen by some margin. */
+        draw_text(fb, (fb->width - text_width(fb, code, 3)) / 2, cur_y, code, 3, COL_SEL_FG);
+        cur_y += 8 * 3 + lsp * 3;
+
+        const char *l3 = "Waiting for approval...";
+        draw_text(fb, (fb->width - text_width(fb, l3, s1)) / 2, cur_y, l3, s1, COL_ITEM);
+        break;
+    }
+    case QC_AUTHENTICATED: {
+        const char *msg = "Signed in. Starting...";
+        draw_text(fb, (fb->width - text_width(fb, msg, s1)) / 2, cur_y, msg, s1, COL_WATCHED);
+        break;
+    }
+    case QC_UNAVAILABLE: {
+        const char *l1 = "Quick Connect is disabled on this server.";
+        const char *l2 = "Enable it in Dashboard > General, or put an";
+        const char *l3 = "API key on line 2 of jellyfin.conf.";
+        draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_ERR);
+        cur_y += sch + lsp * 2;
+        draw_text(fb, (fb->width - text_width(fb, l2, s1)) / 2, cur_y, l2, s1, COL_HINT);
+        cur_y += sch + lsp;
+        draw_text(fb, (fb->width - text_width(fb, l3, s1)) / 2, cur_y, l3, s1, COL_HINT);
+        break;
+    }
+    case QC_FAILED: {
+        const char *l1 = "Quick Connect failed or timed out.";
+        const char *l2 = "B: try again";
+        draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_ERR);
+        cur_y += sch + lsp * 2;
+        draw_text(fb, (fb->width - text_width(fb, l2, s1)) / 2, cur_y, l2, s1, COL_ITEM);
+        break;
+    }
+    }
+
+    const char *hint = "A: exit";
+    draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
 /* NOT a literal aspect-ratio box — blit_fit_centered's 5/3 pixel-aspect
  * correction means a typical portrait poster actually wants a box WIDER
  * than naive square-pixel math would suggest to look right on the real
@@ -1669,7 +2596,9 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
     if (count >= 0) {
         const char *ct = it->collection_type;
         char cbuf[32];
-        if (!strcmp(ct, "movies"))
+        if (view_is_synthetic(it))
+            snprintf(cbuf, sizeof(cbuf), "%lld item%s", (long long)count, count == 1 ? "" : "s");
+        else if (!strcmp(ct, "movies"))
             snprintf(cbuf, sizeof(cbuf), "%lld movie%s", (long long)count, count == 1 ? "" : "s");
         else if (!strcmp(ct, "tvshows"))
             snprintf(cbuf, sizeof(cbuf), "%lld series", (long long)count);
@@ -1804,7 +2733,11 @@ static int grid_cache_load_from_disk(GridLibCache *gc, const JfItem *view, const
         int32_t w = 0, h = 0;
         size_t need;
         if (fread(&w, sizeof(w), 1, f) != 1 || fread(&h, sizeof(h), 1, f) != 1 ||
-            w <= 0 || h <= 0 || (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
+            /* Bounded individually before multiplying: size_t is 32-bit on
+             * the ARM target, so w*h*4 can wrap and slip under the 4MB guard
+             * on a corrupted cache file. */
+            w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
+            (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
             fclose(f);
             for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
             gc->count = 0;
@@ -1866,14 +2799,30 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
                                  const char *dest_path, FBDev *fb_show_ui)
 {
     const char *item_type = collection_item_type(view->collection_type);
-    if (grid_cache_load_from_disk(gc, view, item_type)) {
-        grid_cell_order_shuffle(gc);
-        gc->ready = 1;
-        return;
-    }
-
     JfItem grid_items[GRID_FETCH_MAX];
-    int n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
+    int n;
+
+    if (view_is_synthetic(view)) {
+        /* No ParentId to list under — the covers are just the row's own
+         * items. Deliberately not disk-cached either: the whole point of
+         * these rows is that they change as things get watched, so a cache
+         * keyed on a total that barely moves would show stale art for ages
+         * (see grid_cache_load_from_disk's own staleness check). They're only
+         * ever a couple of items, so re-fetching is cheap. */
+        n = view_is_resume(view)
+              ? jf_list_resume(&g_cfg, grid_items, GRID_FETCH_MAX, NULL)
+              : jf_list_nextup(&g_cfg, grid_items, GRID_FETCH_MAX, NULL);
+    } else {
+        if (grid_cache_load_from_disk(gc, view, item_type)) {
+            grid_cell_order_shuffle(gc);
+            /* Release: everything written above must be visible to any
+             * thread that observes ready == 1. See the acquire in
+             * draw_grid_background. */
+            __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
+            return;
+        }
+        n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
+    }
 
     int spinner_frame = 0;
     for (int i = 0; i < n && gc->count < GRID_FETCH_MAX; i++) {
@@ -1886,9 +2835,11 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
         }
     }
     grid_cell_order_shuffle(gc);
-    int64_t count = jf_count_items(&g_cfg, view->id, item_type);
-    if (count >= 0) grid_cache_save_to_disk(gc, view->id, count);
-    gc->ready = 1;
+    if (!view_is_synthetic(view)) {
+        int64_t count = jf_count_items(&g_cfg, view->id, item_type);
+        if (count >= 0) grid_cache_save_to_disk(gc, view->id, count);
+    }
+    __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
 }
 
 /* Already-cached libraries (checked here under g_grid_mutex) return
@@ -1961,7 +2912,7 @@ static void draw_grid_background(FBDev *fb)
 {
     if (g_grid_active < 0) return;
     GridLibCache *gc = &g_grid_cache[g_grid_active];
-    if (!gc->ready || gc->count == 0) return;
+    if (!__atomic_load_n(&gc->ready, __ATOMIC_ACQUIRE) || gc->count == 0) return;
     int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
     for (int row = 0; row < GRID_ROWS; row++) {
         for (int col = 0; col < GRID_COLS; col++) {
@@ -2191,16 +3142,16 @@ static void draw_browse(FBDev *fb)
                 snprintf(line2, sizeof(line2), "%d album%s",
                          it->child_count, it->child_count == 1 ? "" : "s");
         } else if (it->type == JF_TYPE_SERIES) {
-            /* Season count is it->child_count — free on the same request,
-             * confirmed a Series' own ChildCount means exactly this (unlike
-             * a top-level library view's, see jf_count_items's comment).
-             * Episode count needs its own recursive query per series, done
-             * once in fetch_frame() and cached in g_series_episode_counts. */
-            int64_t ep = g_series_episode_counts[i];
+            /* Both counts ride along on the listing request itself — season
+             * count as ChildCount (confirmed a Series' own ChildCount means
+             * exactly this, unlike a top-level library view's, see
+             * jf_count_items's comment), episode count as RecursiveItemCount.
+             * Neither costs an extra round-trip any more. */
+            int ep = it->recursive_item_count;
             if (it->child_count > 0 && ep > 0)
-                snprintf(line2, sizeof(line2), "%d season%s - %lld episode%s",
+                snprintf(line2, sizeof(line2), "%d season%s - %d episode%s",
                          it->child_count, it->child_count == 1 ? "" : "s",
-                         (long long)ep, ep == 1 ? "" : "s");
+                         ep, ep == 1 ? "" : "s");
             else if (it->child_count > 0)
                 snprintf(line2, sizeof(line2), "%d season%s",
                          it->child_count, it->child_count == 1 ? "" : "s");
@@ -2231,9 +3182,14 @@ static void draw_browse(FBDev *fb)
         }
     }
 
-    if (g_item_count > visible) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d/%d", g_sel+1, g_item_count);
+    /* Absolute position in the whole list, not position within the loaded
+     * window — the window is an implementation detail and showing "3/128"
+     * partway through a 500-item library would be actively misleading. */
+    int64_t total_rows = g_total_count > 0 ? g_total_count : g_item_count;
+    if (total_rows > visible) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%d/%lld",
+                 g_window_start + g_sel + 1, (long long)total_rows);
         draw_text(fb, fb->width - text_width(fb, buf,1) - SAFE_X,
                   fb->height - 8 - SAFE_Y_BOT, buf, 1, COL_HINT);
     }
@@ -2469,6 +3425,8 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
     draw_text(fb, (fb->width - text_width(fb, label, 1)) / 2, y + 10, label, 1, COL_ITEM);
 }
 
+static JfStreamProfile stream_profile(void);   /* forward decl — defined with the playback code */
+
 static void draw_paused(FBDev *fb, const char *name, double pos)
 {
     memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
@@ -2483,14 +3441,29 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
     snprintf(nbuf, sizeof(nbuf), "%.60s", name);
     draw_text(fb, (fb->width - text_width(fb, nbuf, 1)) / 2, cy + 20, nbuf, 1, COL_ITEM);
 
+    /* The transcode actually in effect. Shown because it's configurable now
+     * and the whole reason it is configurable is to be swept on hardware —
+     * having to infer which profile is live from a config file you edited
+     * three reboots ago is exactly how that measurement goes wrong. */
+    {
+        JfStreamProfile p = stream_profile();
+        char pbuf[48];
+        snprintf(pbuf, sizeof(pbuf), "%dx%d @ %.1f Mbps",
+                 p.max_width, p.max_height, p.video_bitrate / 1000000.0);
+        draw_text(fb, (fb->width - text_width(fb, pbuf, 1)) / 2, cy + 32, pbuf, 1, COL_HINT);
+    }
+
     /* -20 leaves only ~2px between the timeline's time label and the hint
      * row below on PAL too (same formula), but it's only been reported as
      * too tight on NTSC — leaving PAL's spacing exactly as-is per instr. */
     draw_timeline(fb, fb->height - 8 - SAFE_Y_BOT - (fb->height == 288 ? 20 : 28), pos,
                   (double)g_info_item.runtime_ticks / 10000000.0);
 
-    const char *hint = (g_info_item.sub_count > 0)
-        ? "B:resume  A:stop  L/R:vsync  SELECT:subs"
+    /* SELECT now opens a picker with an audio tab as well, so it's worth
+     * offering on a title that has alternate audio but no subtitles at all —
+     * the old condition hid it in exactly that case. */
+    const char *hint = (g_info_item.sub_count > 0 || g_info_item.audio_count > 1)
+        ? "B:resume  A:stop  L/R:vsync  SELECT:tracks"
         : "B:resume  A:stop  L/R:vsync";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
@@ -2523,6 +3496,13 @@ static int     g_current_sub_index = -1;
  * seek-triggered ones, so the burn-in survives seeks the same way
  * g_current_sub_index already does for client-rendered tracks. */
 static int     g_burned_in_sub_index = -1;
+/* -1 = let the server choose the source's default, otherwise the
+ * JfAudioTrack.index baked into the playing stream's URL. Unlike a text
+ * subtitle this can't be switched client-side — the server transcodes one
+ * chosen audio stream into the container it sends, so changing it is a
+ * stream restart (see submenu_confirm). Read by play() on every (re)start so
+ * the choice survives seeks, same as the two subtitle variables above. */
+static int     g_current_audio_index = -1;
 /* Seek is a full stop+restart (network stream isn't byte-range seekable —
  * see player_seek) which takes a couple of seconds; accumulate repeated
  * presses into one seek instead of firing a restart per press, same as
@@ -2553,7 +3533,18 @@ static double   g_vu_level_l = 0.0, g_vu_level_r = 0.0;   /* attack/decay state,
  * ~34-35% avg utime, A-V desync stayed at 0.000 either way); resolution is
  * what actually costs CPU (see the native-PAL note above), so there's no
  * real reason not to spend the extra bitrate on quality here. */
-static const JfStreamProfile g_stream_profile = { .max_width = 480, .max_height = 270, .video_bitrate = 8000000 };
+/* Assembled from the config each time rather than being a constant, so a
+ * resolution can be tried on hardware by editing jellyfin.conf instead of
+ * rebuilding and reflashing per data point. Defaults to the values above when
+ * the config says nothing. */
+static JfStreamProfile stream_profile(void)
+{
+    JfStreamProfile p;
+    p.max_width     = g_cfg.profile_width;
+    p.max_height    = g_cfg.profile_height;
+    p.video_bitrate = g_cfg.profile_bitrate;
+    return p;
+}
 
 static void mp_cmd(const char *cmd)
 {
@@ -2668,37 +3659,6 @@ static void player_seek(FBDev *fb, double delta)
  * sub_select in slave mode) and Jellyfin serves the raw .srt directly
  * (confirmed: no transcode needed for a text subtitle codec) — so we just
  * download the chosen track and hand it to mplayer, no restart at all. */
-/* Our bitmap OSD font (same one mplayer's classic subtitle renderer falls
- * back to without FreeType — see -subpos comment in play()) only covers the
- * ASCII range MiSTerDVD's menus ever needed. A downloaded .srt can contain
- * anything — checked a real subtitle file and it was otherwise completely
- * ordinary English text except for a single "♪" (U+266A) used to mark
- * background music with no dialogue — that one non-ASCII character has no
- * glyph in this font and renders as garbage. Blanking any byte >= 0x80
- * drops it (and would drop accented characters in a non-English subtitle
- * too, which is a real loss, but showing garbage is worse and this font
- * can't render them either way). */
-static void sanitize_srt_ascii(const char *path)
-{
-    FILE *f = fopen(path, "r+b");
-    if (!f) return;
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    if (len <= 0 || len > 2 * 1024 * 1024) { fclose(f); return; }
-    fseek(f, 0, SEEK_SET);
-
-    char *buf = malloc((size_t)len);
-    if (!buf) { fclose(f); return; }
-    size_t got = fread(buf, 1, (size_t)len, f);
-    for (size_t i = 0; i < got; i++)
-        if ((unsigned char)buf[i] >= 0x80) buf[i] = ' ';
-
-    fseek(f, 0, SEEK_SET);
-    fwrite(buf, 1, got, f);
-    fclose(f);
-    free(buf);
-}
-
 /* The .srt has timestamps absolute to the ORIGINAL movie (e.g. 47:32), but
  * mplayer's own clock starts at ~0 for whatever point we asked Jellyfin to
  * start the transcode at (startTimeTicks) — confirmed via the server's own
@@ -2745,7 +3705,7 @@ static void subtitle_load_client(int new_index)
      * selected instead of silently ending up with none. */
     if (!jf_download_subtitle(&g_cfg, g_info_item.id, g_info_item.id, new_index, SUB_LOCAL_PATH))
         return;
-    sanitize_srt_ascii(SUB_LOCAL_PATH);
+    subtitles_sanitize_srt(SUB_LOCAL_PATH);
 
     mp_cmd("pausing_keep sub_remove\n");
     char cmd[112];
@@ -2795,77 +3755,271 @@ static void subtitle_apply(FBDev *fb, int new_index)
     subtitle_load_client(new_index);
 }
 
-/* Cycling with an immediate apply per SELECT press caused a cascade when
- * the old burn-in restart was still in play (each press interrupted the
- * previous restart before it connected, showing as a freeze) — kept the
- * menu even after switching to client-side rendering since a menu is still
- * nicer than blind cycling, though apply is instant now either way. */
+/* Track picker, opened with SELECT during playback.
+ *
+ * Two tabs, because audio and subtitles are genuinely different operations
+ * rather than two lists of the same kind: a text subtitle is rendered
+ * client-side and switches instantly, whereas the audio track is baked into
+ * the server's transcode and switching it costs a stream restart. Splitting
+ * them also keeps each list short enough to fit a 240-line NTSC screen,
+ * which one combined list of up to 17 rows would not.
+ *
+ * Cycling with an immediate apply per SELECT press was tried first and caused
+ * a cascade when a burn-in restart was still in flight (each press interrupted
+ * the previous restart before it connected, showing as a freeze) — hence a
+ * menu with an explicit apply, even though a text-subtitle change is instant. */
+#define SUBMENU_TAB_AUDIO 0
+#define SUBMENU_TAB_SUBS  1
+
 static int    g_submenu_visible    = 0;
-static int    g_submenu_sel        = 0;   /* 0 = Off, i+1 = g_info_item.subs[i] */
+static int    g_submenu_tab        = SUBMENU_TAB_SUBS;
+static int    g_submenu_sub_sel    = 0;   /* 0 = Off, i+1 = g_info_item.subs[i] */
+static int    g_submenu_audio_sel  = 0;   /* index into g_info_item.audio[] */
 static int    g_submenu_was_paused = 0;   /* pause state before the menu opened, to restore on close */
+/* When the menu was opened, so a duplicate of the opening press can't close
+ * it again — see the close handling in the main loop. */
+static double g_submenu_opened_at = 0.0;
+#define SUBMENU_IGNORE_CLOSE_SEC 0.30
+
+/* Which audio track the server would pick if we said nothing — used to show
+ * a meaningful "current" marker before the user has chosen anything, and as
+ * the starting value for g_current_audio_index. */
+static int default_audio_index(void)
+{
+    for (int i = 0; i < g_info_item.audio_count; i++)
+        if (g_info_item.audio[i].is_default) return g_info_item.audio[i].index;
+    return g_info_item.audio_count > 0 ? g_info_item.audio[0].index : -1;
+}
+
+/* Position in subs[]/audio[] for a given MediaStreams index, or -1.
+ *
+ * These two are NOT interchangeable: stream indices are assigned by the
+ * server across ALL streams of the file, so the first subtitle of a
+ * video+audio+2×subtitle file is index 2, not 0. Conflating them is why the
+ * "currently active" marker used to point at the wrong row (or at no row at
+ * all) for any file whose subtitle streams didn't happen to start at 0. */
+static int sub_pos_for_index(int index)
+{
+    for (int i = 0; i < g_info_item.sub_count; i++)
+        if (g_info_item.subs[i].index == index) return i;
+    return -1;
+}
+
+static int audio_pos_for_index(int index)
+{
+    for (int i = 0; i < g_info_item.audio_count; i++)
+        if (g_info_item.audio[i].index == index) return i;
+    return -1;
+}
+
+/* Rows in the currently shown tab. */
+static int submenu_option_count(void)
+{
+    if (g_submenu_tab == SUBMENU_TAB_AUDIO)
+        return g_info_item.audio_count;      /* no "off" — video always has audio */
+    return g_info_item.sub_count + 1;        /* + "Off" */
+}
+
+/* The frame the menu is drawn over, captured once when it opens.
+ *
+ * draw_submenu runs every tick and composites into fb->back, which is never
+ * otherwise reset — so each frame paints over the last one's leftovers. That
+ * goes unnoticed while the box keeps the same dimensions, but the two tabs
+ * are different sizes (the audio tab has no sync line, and the lists differ
+ * in length), so switching from the taller one left its extra rows stranded
+ * on screen outside the new, shorter box: dead text with nothing behind it.
+ * Restoring this backdrop before each draw makes every frame a clean
+ * composite rather than an accumulation. */
+static uint8_t *g_submenu_bg = NULL;
+static size_t   g_submenu_bg_size = 0;
+
+static void submenu_bg_capture(FBDev *fb)
+{
+    size_t sz = (size_t)fb->stride * fb->height;
+    if (g_submenu_bg_size != sz) {
+        free(g_submenu_bg);
+        g_submenu_bg = malloc(sz);
+        g_submenu_bg_size = g_submenu_bg ? sz : 0;
+    }
+    if (g_submenu_bg) memcpy(g_submenu_bg, fb->mem, sz);
+}
+
+static void submenu_bg_restore(FBDev *fb)
+{
+    if (g_submenu_bg && g_submenu_bg_size == (size_t)fb->stride * fb->height)
+        memcpy(fb->back, g_submenu_bg, g_submenu_bg_size);
+}
 
 static void submenu_open(FBDev *fb)
 {
-    g_submenu_visible    = 1;
-    g_submenu_sel         = g_current_sub_index < 0 ? 0 : g_current_sub_index + 1;
-    g_submenu_was_paused  = g_paused;
+    g_submenu_visible = 1;
+
+    int sub_pos = sub_pos_for_index(g_current_sub_index);
+    g_submenu_sub_sel = (g_current_sub_index < 0 || sub_pos < 0) ? 0 : sub_pos + 1;
+
+    int audio_pos = audio_pos_for_index(g_current_audio_index);
+    g_submenu_audio_sel = audio_pos < 0 ? 0 : audio_pos;
+
+    /* Open on whichever tab is actually useful. Subtitles stay the default
+     * (that's what SELECT has always opened), but on a title with no subtitle
+     * tracks at all and a real choice of audio, opening on an empty list
+     * would look broken. */
+    if (g_info_item.sub_count == 0 && g_info_item.audio_count > 1)
+        g_submenu_tab = SUBMENU_TAB_AUDIO;
+
+    g_submenu_was_paused = g_paused;
+    g_submenu_opened_at  = now_sec();
     if (!g_paused) player_pause_toggle();
+    submenu_bg_capture(fb);
     memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
 }
 
 static void submenu_close(void)
 {
     g_submenu_visible = 0;
+    free(g_submenu_bg);
+    g_submenu_bg = NULL;
+    g_submenu_bg_size = 0;
     if (!g_submenu_was_paused && g_paused) player_pause_toggle();
+}
+
+static void submenu_switch_tab(int tab)
+{
+    if (tab == g_submenu_tab) return;
+    g_submenu_tab = tab;
 }
 
 static void draw_submenu(FBDev *fb)
 {
-    int n_opts = g_info_item.sub_count + 1;   /* JF_MAX_SUBS+1 = 9 max */
+    /* Start from the captured backdrop every time — see g_submenu_bg. */
+    submenu_bg_restore(fb);
 
-    int box_w = 280;
-    /* Must exactly match every increment below (header, n_opts rows, sync
-     * line, gap, 3 hint lines, padding) — computed directly from those same
-     * numbers instead of separately, so it can't drift out of sync with the
-     * actual content again like it did before (text drawn past the box's
-     * own bottom edge). */
-    int box_h = 10 + 15 + n_opts * 15 + 15 + 8 + 3 * 12 + 8;
+    int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
+    int n_opts   = submenu_option_count();
+    int sel      = is_audio ? g_submenu_audio_sel : g_submenu_sub_sel;
+
+    /* At least one row of vertical space even when a tab has no tracks, so
+     * the "none" message below has somewhere to go. */
+    int n_rows   = n_opts > 0 ? n_opts : 1;
+    /* The sync readout is subtitle-only — it adjusts subtitle timing, and
+     * there's no audio equivalent worth the row. */
+    int extra_rows = is_audio ? 0 : 1;
+
+    /* Wide enough for a full server-composed audio DisplayTitle — "English -
+     * Dolby Digital 5.1 - Default" is 37 characters, and at 8px per glyph
+     * plus the box's own margins that needs ~340. Anything narrower truncates
+     * exactly the suffix that distinguishes a commentary track from the main
+     * mix, which is the whole reason for showing DisplayTitle rather than a
+     * bare language. Still leaves a comfortable margin at 640 wide. */
+    int box_w = 360;
+
+    /* Everything in the box that isn't a track row: tab header, optional sync
+     * line, gap, 3 hint lines, padding. Kept as one expression so the height
+     * below can't drift out of sync with what's actually drawn — which it did
+     * once before, spilling text past the box's own bottom edge. */
+    int chrome_h = 10 + 15 + extra_rows * 15 + 8 + 3 * 12 + 8;
+
+    /* The full list doesn't always fit. Eight subtitle tracks plus "Off" is
+     * JF_MAX_SUBS's worst case, and at NTSC's 240 lines that box overflows
+     * the overscan-safe area at both ends — on a real CRT the first and last
+     * rows would simply be off the tube. Cap the rows to what fits inside the
+     * safe area and scroll the list instead, so no row is ever undisplayable. */
+    int avail_h  = fb->height - 2 * SAFE_Y;
+    int max_rows = (avail_h - chrome_h) / 15;
+    if (max_rows < 1) max_rows = 1;
+    int shown = n_rows < max_rows ? n_rows : max_rows;
+
+    /* Scroll offset per tab, nudged just far enough to keep the selection on
+     * screen — same minimal-movement behaviour as the browse list, rather
+     * than re-centring on every keypress. */
+    static int submenu_scroll[2] = { 0, 0 };
+    int *scroll = &submenu_scroll[g_submenu_tab];
+    if (sel < *scroll)          *scroll = sel;
+    if (sel >= *scroll + shown) *scroll = sel - shown + 1;
+    if (*scroll > n_opts - shown) *scroll = n_opts - shown;
+    if (*scroll < 0)              *scroll = 0;
+
+    int box_h = chrome_h + shown * 15;
     int box_x = (fb->width - box_w) / 2, box_y = fb->height / 2 - box_h / 2;
     fb_fill_rect_alpha(fb, box_x, box_y, box_w, box_h, 0, 0, 0, 225);
 
     int list_x = box_x + 12, list_y = box_y + 10;
     int label_max_w = box_w - 24;   /* box_w minus left/right margin, for truncation below */
-    draw_text(fb, list_x, list_y, "SUBTITLES", 1, COL_HINT);
-    list_y += 15;
 
-    for (int i = 0; i < n_opts; i++) {
-        int is_off  = (i == 0);
-        int active  = is_off ? (g_current_sub_index < 0) : (g_current_sub_index == i - 1);
-        const char *label = is_off ? "Off" : g_info_item.subs[i - 1].label;
-        if (!label || !label[0]) label = "Unknown";
+    /* Tab header — the inactive tab stays visible (dimmed) rather than being
+     * hidden, so there's something on screen telling you the other one is
+     * there and that L/R reaches it. */
+    {
+        const char *audio_label = "AUDIO";
+        const char *subs_label  = "SUBTITLES";
+        int gap = 3 * 8;
+        int audio_x = list_x;
+        int subs_x  = audio_x + text_width(fb, audio_label, 1) + gap;
+        if (is_audio) {
+            draw_text(fb, audio_x, list_y, audio_label, 1, COL_TITLE);
+            draw_text(fb, subs_x,  list_y, subs_label,  1, COL_HINT);
+        } else {
+            draw_text(fb, audio_x, list_y, audio_label, 1, COL_HINT);
+            draw_text(fb, subs_x,  list_y, subs_label,  1, COL_TITLE);
+        }
+        /* Only when some of the list is off-screen — otherwise it's noise. */
+        if (shown < n_opts) {
+            char pos[16];
+            snprintf(pos, sizeof(pos), "%d/%d", sel + 1, n_opts);
+            draw_text(fb, box_x + box_w - 12 - text_width(fb, pos, 1),
+                      list_y, pos, 1, COL_HINT);
+        }
+        list_y += 15;
+    }
 
-        if (i == g_submenu_sel)
+    if (n_opts == 0) {
+        draw_text(fb, list_x, list_y, "  (no tracks)", 1, COL_HINT);
+        list_y += 15;
+    }
+
+    for (int i = *scroll; i < n_opts && i < *scroll + shown; i++) {
+        const char *label;
+        int active;
+
+        if (is_audio) {
+            const JfAudioTrack *a = &g_info_item.audio[i];
+            label  = a->label[0] ? a->label : "Unknown";
+            active = (g_current_audio_index == a->index);
+        } else {
+            int is_off = (i == 0);
+            label  = is_off ? "Off" : g_info_item.subs[i - 1].label;
+            active = is_off ? (g_current_sub_index < 0)
+                            : (g_current_sub_index == g_info_item.subs[i - 1].index);
+            if (!label || !label[0]) label = "Unknown";
+        }
+
+        if (i == sel)
             fb_fill_rect_alpha(fb, box_x + 4, list_y - 2, box_w - 8, 14, COL_SEL_BG, 220);
 
-        char line[56];
+        char line[80];
         snprintf(line, sizeof(line), "%s%s", active ? "> " : "  ", label);
-        /* A long DisplayTitle from the server (seen in practice: things
-         * like "Undefined - SUBRIP - External") drawn past the box's own
-         * width made the text stick out past the dark background behind
-         * it — clip it to fit instead. */
+        /* A long DisplayTitle from the server (seen in practice: things like
+         * "Undefined - SUBRIP - External", or "English - Dolby Digital 5.1 -
+         * Default" for audio) drawn past the box's own width made the text
+         * stick out past the dark background behind it — clip it to fit. */
         truncate_to_width(fb, line, 1, label_max_w);
         if (active) draw_text(fb, list_x, list_y, line, 1, COL_RESUME);
         else        draw_text(fb, list_x, list_y, line, 1, COL_ITEM);
         list_y += 15;
     }
 
-    char syncline[32];
-    snprintf(syncline, sizeof(syncline), "Sync: %+.1fs", g_sub_delay_extra);
-    draw_text(fb, list_x, list_y, syncline, 1, COL_ITEM);
-    list_y += 15 + 8;   /* + gap before the hint block */
+    if (!is_audio) {
+        char syncline[32];
+        snprintf(syncline, sizeof(syncline), "Sync: %+.1fs", g_sub_delay_extra);
+        draw_text(fb, list_x, list_y, syncline, 1, COL_ITEM);
+        list_y += 15;
+    }
+    list_y += 8;   /* gap before the hint block */
 
-    const char *hint1 = "UP/DOWN: select subtitle";
-    const char *hint2 = "LEFT/RIGHT: adjust subtitle offset";
+    const char *hint1 = is_audio ? "UP/DOWN: select audio track"
+                                  : "UP/DOWN: select subtitle";
+    const char *hint2 = is_audio ? "L/R: switch tab"
+                                  : "L/R: switch tab   LEFT/RIGHT: sync";
     const char *hint3 = "B: apply    A: cancel";
     draw_text(fb, box_x + (box_w - text_width(fb, hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
     list_y += 12;
@@ -2878,10 +4032,35 @@ static void draw_submenu(FBDev *fb)
 
 static void submenu_confirm(FBDev *fb)
 {
-    int new_index = g_submenu_sel == 0 ? -1 : g_info_item.subs[g_submenu_sel - 1].index;
+    int new_sub = (g_submenu_sub_sel == 0 || g_info_item.sub_count == 0)
+                    ? -1 : g_info_item.subs[g_submenu_sub_sel - 1].index;
+    int new_audio = (g_info_item.audio_count > 0)
+                    ? g_info_item.audio[g_submenu_audio_sel].index
+                    : g_current_audio_index;
+
     submenu_close();
-    if (new_index == g_current_sub_index) return;   /* no actual change */
-    subtitle_apply(fb, new_index);
+
+    /* An audio change can only be applied by rebuilding the stream URL, so it
+     * subsumes any subtitle change made in the same visit — both get baked
+     * into the one restart rather than restarting twice. */
+    if (new_audio != g_current_audio_index) {
+        double pos = play_position();
+        g_current_audio_index = new_audio;
+
+        int new_burn_in = -1;
+        if (new_sub >= 0) {
+            const JfSubtitle *s = find_sub(new_sub);
+            if (s && !jf_subtitle_is_text(s->codec)) new_burn_in = new_sub;
+        }
+        g_burned_in_sub_index = new_burn_in;
+        g_current_sub_index   = new_sub;
+
+        player_stop();
+        play(fb, g_info_item.id, pos);   /* re-loads a client-side subtitle itself */
+        return;
+    }
+
+    if (new_sub != g_current_sub_index) subtitle_apply(fb, new_sub);
 }
 
 /* play_position() plus whatever seek is currently accumulating but hasn't
@@ -2965,9 +4144,10 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     int64_t start_ticks = (int64_t)(offset_secs * 10000000.0);
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
 
-    char url[600];
-    jf_stream_url(&g_cfg, item_id, &g_stream_profile, start_ticks, g_play_session_id,
-                  g_burned_in_sub_index, url, sizeof(url));
+    char url[700];
+    const JfStreamProfile profile = stream_profile();
+    jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
+                  g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
 
     char delay_arg[16];
     snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
@@ -3151,7 +4331,7 @@ static void play_audio(FBDev *fb, int queue_pos)
     unlink(AF_EXPORT_PATH);   /* don't let the visualizer read a stale previous track's data */
 
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
-    char url[600];
+    char url[700];
     jf_audio_stream_url(&g_cfg, it->id, g_play_session_id, url, sizeof(url));
 
     g_play_offset     = 0.0;
@@ -3447,6 +4627,57 @@ static int run_preview_browse(int sel, int list_mode)
     return 0;
 }
 
+/* Dev tool for the track picker's layout. The picker only ever appears over
+ * live playback, which needs a real framebuffer for mplayer to write into and
+ * so can't be reached off-hardware at all — without this there is no way to
+ * look at it short of deploying to a MiSTer and starting a film. Fetches one
+ * real item's streams from the server, draws the menu over a blank frame, and
+ * dumps it for tools/raw_to_png.py.
+ *
+ * Honours MISTERFIN_FB for geometry (see fb.c), so the same item can be
+ * checked at PAL's 288 lines and NTSC's 240 — the box is sized from its
+ * content and the shorter frame is where it would overflow first. */
+static int run_preview_submenu(const char *item_id, int tab)
+{
+    FBDev fb;
+    if (fb_open(&fb, "/dev/fb0") < 0) { fprintf(stderr, "no framebuffer\n"); return 1; }
+    SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
+
+    if (!jf_config_load(&g_cfg))          { fprintf(stderr, "jellyfin.conf not found\n"); return 1; }
+    if (jf_resolve_user_id(&g_cfg) != 1)  { fprintf(stderr, "user resolve failed\n"); return 1; }
+    if (!jf_get_item_details(&g_cfg, item_id, &g_info_item)) {
+        fprintf(stderr, "could not fetch item %s\n", item_id);
+        return 1;
+    }
+
+    fprintf(stderr, "%s: %d audio track(s), %d subtitle track(s)\n",
+            g_info_item.name, g_info_item.audio_count, g_info_item.sub_count);
+
+    g_current_audio_index = default_audio_index();
+    g_current_sub_index   = g_info_item.sub_count > 0 ? g_info_item.subs[0].index : -1;
+    g_submenu_visible     = 1;
+    g_submenu_audio_sel   = 0;
+    g_submenu_sub_sel     = 0;
+
+    fb_clear(&fb);
+    memcpy(fb.mem, fb.back, (size_t)fb.stride * fb.height);
+    submenu_bg_capture(&fb);
+
+    /* Draw the OTHER tab first and only then the requested one, so what gets
+     * dumped is a frame that has been switched to rather than opened on. The
+     * two tabs are different sizes, so this is the path where the taller
+     * box's leftovers used to survive around the shorter one — rendering a
+     * single tab in isolation would never show it. */
+    g_submenu_tab = (tab == SUBMENU_TAB_AUDIO) ? SUBMENU_TAB_SUBS : SUBMENU_TAB_AUDIO;
+    draw_submenu(&fb);
+    g_submenu_tab = tab;
+    draw_submenu(&fb);
+
+    printf("%d %d %d\n", fb.width, fb.height, fb.stride);
+    fb_close(&fb);
+    return 0;
+}
+
 /* Restores whatever screen was behind the About overlay once it closes —
  * previously this only handled STATE_BROWSE, so closing About from the info
  * screen or the now-playing screen left the last About frame frozen on
@@ -3473,20 +4704,75 @@ static void redraw_current_screen(FBDev *fb, AppState state)
  * the screen just goes black-to-browse same as before — no flash. */
 #define STARTUP_PENDING -2
 #define STARTUP_CONFIG_MISSING -3
+#define STARTUP_NEED_QUICK_CONNECT -4
 static pthread_mutex_t g_startup_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_startup_result = STARTUP_PENDING;
+
+/* Loads the library listing once a credential is known good. Shared by the
+ * normal startup path and by the Quick Connect one, which reaches this point
+ * minutes later and from a different thread. */
+static void startup_enter_browse(void)
+{
+    push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+}
+
+/* Kicks off the background cover-grid prefetch. Deliberately not started
+ * unconditionally at launch: it needs a resolved user and a working
+ * credential, and starting it from the setup or Quick Connect screens meant
+ * firing a /UserViews with an empty userId and no token — harmless against a
+ * permissive server, a guaranteed 401 against a real one, and a confusing
+ * entry in the log for anyone debugging why their client won't connect.
+ * Called from both paths that reach a signed-in library. */
+static void start_grid_prefetch(void)
+{
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, grid_prefetch_thread, NULL);
+    pthread_attr_destroy(&attr);
+}
 
 static void *startup_resolve_thread(void *arg)
 {
     (void)arg;
     int result;
+
     if (!jf_config_load(&g_cfg)) {
-        result = STARTUP_CONFIG_MISSING;
-    } else {
-        result = jf_resolve_user_id(&g_cfg);
-        if (result == 1)
-            push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
+        pthread_mutex_lock(&g_startup_mutex);
+        g_startup_result = STARTUP_CONFIG_MISSING;
+        pthread_mutex_unlock(&g_startup_mutex);
+        return NULL;
     }
+
+    /* Before any request: this goes in every Authorization header, and must
+     * be identical between authenticating and using the resulting token. */
+    jf_device_id_init(&g_cfg);
+
+    if (jf_token_load(&g_cfg) && jf_credential_works(&g_cfg)) {
+        /* A previously earned Quick Connect token, still accepted. Checked
+         * before the config's API key so that re-authenticating once sticks
+         * even if a stale key is left in the file. */
+        result = 1;
+        startup_enter_browse();
+    } else if (g_cfg.api_key[0] && g_cfg.username[0]) {
+        /* Classic path: an admin-issued API key plus a username to resolve.
+         * jf_token_load may have overwritten the credential with a dead
+         * token, so put the key back first. */
+        strncpy(g_cfg.token, g_cfg.api_key, sizeof(g_cfg.token) - 1);
+        g_cfg.user_id[0] = '\0';
+        result = jf_resolve_user_id(&g_cfg);
+        if (result == 1) startup_enter_browse();
+    } else {
+        /* No usable credential — a saved token that no longer works ends up
+         * here too, which is what makes a revoked or expired login recover by
+         * itself instead of showing an error nobody can act on. */
+        jf_token_clear();
+        g_cfg.token[0] = '\0';
+        g_cfg.user_id[0] = '\0';
+        result = STARTUP_NEED_QUICK_CONNECT;
+    }
+
     pthread_mutex_lock(&g_startup_mutex);
     g_startup_result = result;
     pthread_mutex_unlock(&g_startup_mutex);
@@ -3500,6 +4786,10 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "--preview-browse") == 0)
         return run_preview_browse(argc > 2 ? atoi(argv[2]) : -1,
                                    argc > 3 && strcmp(argv[3], "list") == 0);
+    if (argc > 1 && strcmp(argv[1], "--preview-submenu") == 0)
+        return run_preview_submenu(argc > 2 ? argv[2] : "",
+                                    (argc > 3 && strcmp(argv[3], "audio") == 0)
+                                        ? SUBMENU_TAB_AUDIO : SUBMENU_TAB_SUBS);
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
 
@@ -3515,6 +4805,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Cannot open /dev/fb0\n");
         return 1;
     }
+    g_headless = fb.headless;   /* see g_headless' own comment */
     /* SAFE_Y as a plain pixel count made the top/bottom margin look
      * noticeably BIGGER than the left/right margin on real hardware, even
      * though 20 < 24 — because our pixels aren't square. Physically,
@@ -3551,11 +4842,19 @@ int main(int argc, char **argv)
     pthread_join(startup_tid, NULL);
 
     AppState state;
+    pthread_t qc_tid;
+    int qc_running = 0;
     int resolved = g_startup_result;
     if (resolved == STARTUP_CONFIG_MISSING) {
         state = STATE_CONFIG_ERROR;
         snprintf(g_setup_reason, sizeof(g_setup_reason), "jellyfin.conf not found or incomplete");
         draw_setup_screen(&fb, g_setup_reason);
+    } else if (resolved == STARTUP_NEED_QUICK_CONNECT) {
+        state = STATE_QUICK_CONNECT;
+        qc_set_state(QC_STARTING);
+        pthread_create(&qc_tid, NULL, quick_connect_thread, NULL);
+        qc_running = 1;
+        draw_quick_connect(&fb);
     } else if (resolved == 1) {
         state = STATE_BROWSE;
     } else {
@@ -3595,15 +4894,15 @@ int main(int argc, char **argv)
     /* Silently pre-fetch every library's grid background in the
      * background, so switching to one the user hasn't visited yet this
      * session doesn't show a blank/dim background while it fetches — see
-     * grid_prefetch_thread's own comment. */
-    {
-        pthread_t grid_tid;
-        pthread_attr_t grid_attr;
-        pthread_attr_init(&grid_attr);
-        pthread_attr_setdetachstate(&grid_attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&grid_tid, &grid_attr, grid_prefetch_thread, NULL);
-        pthread_attr_destroy(&grid_attr);
-    }
+     * grid_prefetch_thread's own comment.
+     *
+     * Only once there's actually a session to fetch with. It used to start
+     * unconditionally, which meant the setup and Quick Connect screens each
+     * fired a /UserViews with an empty userId and no credential — harmless
+     * against a permissive server, but a guaranteed 401 against a real one,
+     * and a confusing entry in the server log for anyone debugging why their
+     * client won't connect. */
+    if (state == STATE_BROWSE) start_grid_prefetch();
 
     int playing = 0;
     int spinner_frame_ctr = 0;
@@ -3614,6 +4913,10 @@ int main(int argc, char **argv)
     double last_input_rescan = 0.0;
     while (g_running) {
         int inp = input_poll();
+        /* Must be called every tick (it drives the repeat timers), but only
+         * OR'd in by the screens that want held-to-scroll — see
+         * input_repeat()'s own comment for why it isn't just part of inp. */
+        int nav_repeat = input_repeat();
         double loop_now = now_sec();
 
         /* Re-scan /dev/input every few seconds — a wireless pad that idles
@@ -3652,27 +4955,53 @@ int main(int argc, char **argv)
 
         if (g_submenu_visible) {
             static double last_nav_press = 0.0;
-            int n_opts = g_info_item.sub_count + 1;
-            if ((inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
+            int n_opts   = submenu_option_count();
+            int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
+            int *sel     = is_audio ? &g_submenu_audio_sel : &g_submenu_sub_sel;
+
+            /* Shoulder buttons switch tabs, leaving LEFT/RIGHT free for
+             * subtitle sync (which needs to stay a fine repeated nudge, and
+             * has no audio equivalent to share the keys with). */
+            if (inp & INP_L) submenu_switch_tab(SUBMENU_TAB_AUDIO);
+            if (inp & INP_R) submenu_switch_tab(SUBMENU_TAB_SUBS);
+
+            int menu_inp = inp | nav_repeat;   /* held UP/DOWN walks the list, held LEFT/RIGHT keeps nudging sync */
+            if ((menu_inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
                 loop_now - last_nav_press > 0.15) {
                 last_nav_press = loop_now;
-                if (inp & INP_UP)    { if (g_submenu_sel > 0) g_submenu_sel--; }
-                if (inp & INP_DOWN)  { if (g_submenu_sel < n_opts - 1) g_submenu_sel++; }
+                if (menu_inp & INP_UP)    { if (*sel > 0) (*sel)--; }
+                if (menu_inp & INP_DOWN)  { if (*sel < n_opts - 1) (*sel)++; }
                 /* Live-tunable on top of the fixed baseline (AUDIO_DELAY_SEC
                  * + SUBTITLE_SYNC_FUDGE_SEC + g_play_offset) — for whatever
                  * that fixed default doesn't cover on a specific subtitle
                  * file. Applies immediately if a subtitle is already
-                 * loaded. */
-                if (inp & INP_LEFT)  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
-                if (inp & INP_RIGHT) { g_sub_delay_extra += 0.1; sub_delay_send(); }
+                 * loaded. Subtitle tab only: there's nothing for it to mean
+                 * on the audio tab, and silently changing subtitle timing
+                 * from a screen not showing it would be a surprise. */
+                if (!is_audio && (menu_inp & INP_LEFT))  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
+                if (!is_audio && (menu_inp & INP_RIGHT)) { g_sub_delay_extra += 0.1; sub_delay_send(); }
             }
             if (inp & INP_A) { submenu_confirm(&fb); input_drain(); continue; }
             /* SELECT also closes — a SELECT press while already open was a
              * silent no-op before (it only opens from the STATE_PLAYING
              * switch below, which this block's own `continue` never
              * reaches while visible), so a second SELECT looked like "the
-             * menu doesn't open". B still means an explicit cancel too. */
-            if (inp & (INP_B | INP_SELECT)) { submenu_close(); input_drain(); continue; }
+             * menu doesn't open". B still means an explicit cancel too.
+             *
+             * Ignored for a moment after opening, though. The press that
+             * opens this menu can be reported twice — a pad that enumerates
+             * as several event nodes, or MiSTer's own OSD echoing physical
+             * input onto a second virtual device, both do that — and if the
+             * duplicate lands in a later poll than the original it arrives
+             * here and closes the menu immediately. Draining on open only
+             * discards what was already queued at that instant, so a
+             * duplicate a few milliseconds behind still gets through; the
+             * menu then flickers open and shut and reads as "the button
+             * doesn't reliably work". */
+            if ((inp & (INP_B | INP_SELECT)) &&
+                loop_now - g_submenu_opened_at > SUBMENU_IGNORE_CLOSE_SEC) {
+                submenu_close(); input_drain(); continue;
+            }
             /* Redraw every single frame, unconditionally — mplayer writes
              * video frames directly to fb->mem (bypassing our fb->back
              * entirely) and was confirmed on hardware to still do so
@@ -3698,10 +5027,49 @@ int main(int argc, char **argv)
             draw_setup_screen(&fb, g_setup_reason);   /* redrawn every frame for the starfield */
             break;
 
+        case STATE_QUICK_CONNECT: {
+            QcState qc = qc_get_state(NULL, 0);
+
+            if (qc == QC_AUTHENTICATED) {
+                /* The handshake thread has the token; loading the library is
+                 * a few blocking round-trips, so do it here on the main
+                 * thread with the "Signed in" frame already on screen. */
+                pthread_join(qc_tid, NULL);
+                qc_running = 0;
+                startup_enter_browse();
+                state = STATE_BROWSE;
+                start_grid_prefetch();   /* skipped at launch — see its comment */
+                draw_browse(&fb);
+                input_drain();
+                break;
+            }
+
+            /* B retries a dead request rather than making the user relaunch —
+             * a code expiring while you walk to another room is the normal
+             * way this fails, not an exceptional one. */
+            if ((inp & INP_B) && (qc == QC_FAILED || qc == QC_UNAVAILABLE)) {
+                if (qc_running) { pthread_join(qc_tid, NULL); qc_running = 0; }
+                qc_set_state(QC_STARTING);
+                pthread_create(&qc_tid, NULL, quick_connect_thread, NULL);
+                qc_running = 1;
+                input_drain();
+                break;
+            }
+            if (inp & INP_A) { g_running = 0; break; }
+
+            draw_quick_connect(&fb);   /* every frame, for the starfield */
+            break;
+        }
+
         case STATE_BROWSE: {
             int nav = 0;
             int at_root      = (g_stack[g_stack_depth - 1].kind == FRAME_VIEWS);
             int is_carousel  = at_root && !g_root_list_mode;
+            /* Browsing is exactly the case auto-repeat exists for. Safe to
+             * fold straight into inp: input_repeat() only ever returns
+             * direction bits, so the A/B/SELECT handling further down still
+             * sees nothing but real press edges. */
+            inp |= nav_repeat;
 
             if (g_confirm_exit) {
                 /* Dialog eats all other input while open. */
@@ -3761,16 +5129,17 @@ int main(int argc, char **argv)
                     nav = 1;
                 }
             } else {
-                if (inp & INP_UP && g_item_count > 0) {
-                    if (g_sel > 0) g_sel--;
-                    if (g_sel < g_scroll) g_scroll = g_sel;
-                    nav = 1;
-                }
-                if (inp & INP_DOWN && g_item_count > 0) {
-                    if (g_sel < g_item_count - 1) g_sel++;
-                    if (g_sel >= g_scroll + visible_rows(&fb)) g_scroll = g_sel - visible_rows(&fb) + 1;
-                    nav = 1;
-                }
+                /* LEFT/RIGHT have nothing else to do in a plain list, so
+                 * they're the whole-page jump — the fast way through a long
+                 * library. The shoulder buttons do the same thing for pads
+                 * where reaching a D-pad direction and a face button at once
+                 * is awkward, and because PageUp/PageDown is what a keyboard
+                 * user will reach for. */
+                int page = visible_rows(&fb);
+                if (inp & INP_UP)                   nav |= browse_move_sel(&fb, -1);
+                if (inp & INP_DOWN)                 nav |= browse_move_sel(&fb, +1);
+                if (inp & (INP_LEFT  | INP_L))      nav |= browse_move_sel(&fb, -page);
+                if (inp & (INP_RIGHT | INP_R))      nav |= browse_move_sel(&fb, +page);
             }
             if (at_root) g_root_sel = g_sel;   /* see g_root_sel's own comment */
             if (inp & INP_A && g_item_count > 0) {
@@ -3779,7 +5148,14 @@ int main(int argc, char **argv)
                 switch (it->type) {
                 case JF_TYPE_FOLDER:
                 case JF_TYPE_ARTIST:
-                    push_frame(FRAME_ITEMS, it->name, it->id, NULL, NULL);
+                    /* The two home rows look like folders but have no parent
+                     * to list — they're their own kind of frame. */
+                    if (view_is_resume(it))
+                        push_frame(FRAME_RESUME, "Continue Watching", NULL, NULL, NULL);
+                    else if (view_is_nextup(it))
+                        push_frame(FRAME_NEXTUP, "Next Up", NULL, NULL, NULL);
+                    else
+                        push_frame(FRAME_ITEMS, it->name, it->id, NULL, NULL);
                     nav = 1;
                     break;
                 case JF_TYPE_ALBUM: {
@@ -3850,6 +5226,10 @@ int main(int argc, char **argv)
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
                 g_burned_in_sub_index = -1;
+                /* Start on whatever the source marks as default, so the track
+                 * picker can show a meaningful "current" row before any
+                 * choice has been made. */
+                g_current_audio_index = default_audio_index();
                 play(&fb, g_info_item.id, offset);
                 input_drain();
             } else if ((inp & INP_SELECT) && g_info_item.resume_ticks > 0 && !g_info_item.played) {
@@ -3858,6 +5238,7 @@ int main(int argc, char **argv)
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
                 g_burned_in_sub_index = -1;
+                g_current_audio_index = default_audio_index();
                 play(&fb, g_info_item.id, 0.0);
                 input_drain();
             }
@@ -3878,7 +5259,7 @@ int main(int argc, char **argv)
                 state = STATE_BROWSE;
                 draw_browse(&fb);
             } else if (g_paused) {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
                 if (inp & INP_A) player_pause_toggle();
@@ -3897,7 +5278,7 @@ int main(int argc, char **argv)
                  * to actually fire the restart. */
                 draw_paused(&fb, g_info_item.name, seek_pending_target());
             } else {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); continue; }
+                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
                 if (inp & INP_A) player_pause_toggle();
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
@@ -4041,12 +5422,25 @@ int main(int argc, char **argv)
         }
     }
 
+    /* The Quick Connect thread can still be polling when the user quits. It
+     * checks g_running in 100ms slices, so this waits well under a second —
+     * but without it, main() returning would run glibc's exit-time FILE
+     * cleanup underneath a thread that is mid-read on a curl pipe. */
+    if (qc_running) { pthread_join(qc_tid, NULL); qc_running = 0; }
+
     player_stop();
     info_assets_free();
     ddr_close();
     cursor_show();
-    fb_clear(&fb);
-    fb_flip(&fb);
+    /* Blanking on the way out leaves the MiSTer showing an empty screen
+     * rather than a frozen UI. Headless there's no screen to leave in any
+     * state — and doing it anyway would overwrite the final MISTERFIN_FRAME_OUT
+     * dump with an all-black frame, i.e. destroy the screenshot the run was
+     * for. */
+    if (!fb.headless) {
+        fb_clear(&fb);
+        fb_flip(&fb);
+    }
     fb_close(&fb);
     input_close();
     return 0;

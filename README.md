@@ -12,12 +12,15 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 ## Features
 
+- **Quick Connect sign-in** — no API key, no admin dashboard, no password typed on a gamepad. First launch shows a code; approve it from any device already signed into Jellyfin and the login is saved. A revoked login is detected and re-requested automatically. API keys still work for existing setups
+- **Continue Watching and Next Up** appear as the first two cards on the home screen, ahead of the libraries, and only when they have something in them. Episodes there show which series and which episode they are, since a row called "Episode 03" out of context identifies nothing
 - **Home screen** is a horizontal library carousel — name + item count per library, the active one centered, with a dimmed cover-art mosaic from that library filling the background. Every library gets its own slot along the strip (extras simply run off-screen rather than being hidden), and LEFT/RIGHT slides between them with the background fading through black. SELECT swaps to a classic list view instead, if you prefer that; either way, the selected library is remembered when you back out of one. B opens an exit-confirm dialog instead of quitting immediately, so a stray press can't silently close the app
 - **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - **Info screen** with cover art, description, year, and status
 - **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
-- **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show
+- **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
+- **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
 - **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art) — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
 - **About screen** with a GitHub-releases update check and one-button in-app update (A installs, applied on next launch); the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
@@ -70,6 +73,23 @@ make deploy
 
 If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enable-fbdev --enable-alsa` and the vsync patch in `docker/vo_fbdev.c` applied will work — that's exactly what `docker/build-mplayer.sh` automates.
 
+### Running it on a desktop
+
+`tools/run-local.sh` runs the real app on an ordinary Linux box, so UI and API work doesn't need a flash-and-look cycle for every change. There's no `/dev/fb0` to draw into, so the app is pointed at a plain malloc'd buffer of the same size and reads keys from the terminal instead of `/dev/input/eventN`; every frame is dumped and converted to a PNG by `tools/raw_to_png.py` (stdlib `zlib` only — no image library needed).
+
+```bash
+tools/run-local.sh                            # interactive: arrows, Enter, Esc, Tab, q to quit
+tools/run-local.sh -k "right,right,a"         # scripted, then screenshot the result
+tools/run-local.sh -k "down:200,a:1500" -o shot.png
+tools/run-local.sh --ntsc -k "a"              # 240-line NTSC geometry instead of PAL's 288
+```
+
+It needs a `./jellyfin.conf` in the repo root pointing at a real server (gitignored, same file `--preview-browse` expects). **Video playback is not usable this way** — mplayer writes straight into a real framebuffer, which a malloc'd buffer can't stand in for; everything else (browsing, info screens, music metadata, menus, auth) works normally.
+
+`MISTERFIN_INPUT_DEBUG=1` works on real hardware too, not just on a desktop: it prints every incoming input event with its device, raw code and what it mapped to (or why it was dropped) to stderr, so run it over SSH rather than from the Scripts menu. MiSTer's input routing is genuinely unusual — it grabs directly-wired USB pads exclusively and re-emits them on a synthetic "MiSTer virtual input" device — so if a button isn't doing anything, this says whether it's arriving at all and under which code.
+
+The underlying switches are plain environment variables if you'd rather drive them yourself: `MISTERFIN_FB=640x288` picks the headless buffer size, `MISTERFIN_FRAME_OUT=<path>` dumps each frame, `MISTERFIN_STDIN=1` reads the terminal, and `MISTERFIN_KEYS="right,a:800"` plays a scripted sequence (`MISTERFIN_KEYS_HOLD=1` to stay running afterwards instead of quitting).
+
 ---
 
 ## Installation
@@ -100,7 +120,28 @@ If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enab
 
 ## Configuring `jellyfin.conf`
 
-Create `/media/fat/misterfin/jellyfin.conf` — 4 lines (see `jellyfin.conf.example`):
+Create `/media/fat/misterfin/jellyfin.conf`. The only line you actually need is your server:
+
+```
+http://<your-jellyfin-ip>:8096
+PAL
+```
+
+On first launch MiSTerFin shows a **Quick Connect** code. Open Jellyfin on any device where you're already signed in, go to your user menu → Quick Connect, and type the code in. That's it — the resulting login is saved to `token.conf` next to the config, so it's a one-time step. If the login is ever revoked, the app notices and asks again by itself.
+
+Two small files get written next to `jellyfin.conf` and don't need creating yourself: `token.conf` (the saved login) and `device.conf` (a random GUID identifying this install to the server). Delete `token.conf` to sign out. Don't copy `device.conf` between two MiSTers that use the same Jellyfin account — Jellyfin logs out any existing session sharing a device id, so they'd take turns signing each other out.
+
+Quick Connect must be enabled server-side (Dashboard → General → Quick Connect); it's on by default on most installs. If it's off, MiSTerFin says so and tells you the alternative.
+
+**TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
+
+**Transcode profile** is also optional, and likewise recognised wherever it appears — `WxH` or `WxH@BITRATE`, e.g. `640x480@12000000`. It sets what the server is asked to transcode video down to before mplayer scales it back up to fill the screen; the default is `480x270@8000000`. The active profile is shown on the pause screen so you can confirm which one is in effect.
+
+Raising it is the main lever on picture quality, and the main way to run out of CPU. Total pixel count is what costs decode time on this hardware — bitrate is close to free (2 Mbps and 8 Mbps both measured ~34% CPU with no A/V drift), while `720x576` was confirmed unsustainable: A/V desync grew continuously and the CPU saturated. `480x270` is the known-good default. Anything in between is unmeasured, so if you raise it, watch for audio drifting out of sync — that's the symptom that appears first.
+
+### Using an API key instead
+
+Still supported, and unchanged if you already have one set up:
 
 ```
 http://<your-jellyfin-ip>:8096
@@ -111,10 +152,15 @@ PAL
 
 1. **Server URL** — no trailing slash.
 2. **API key** — Jellyfin admin dashboard → Advanced → API Keys → **+**. Name it something recognizable like "MiSTerFin" when you create it — Jellyfin's Dashboard → Devices/Sessions shows the *key's own registered name* as the client, permanently fixed at creation time, not something MiSTerFin can override later (its actual version number still shows up correctly regardless). A generically-named key (or one created before you'd settled on a name) will just show that name instead — harmless, but confusing to look at later.
-3. **Username** — your plain Jellyfin username. MiSTerFin resolves it to the real user id via `GET /Users` at startup (the raw id isn't easily findable anywhere in the Jellyfin UI — it only shows up buried in a dashboard URL — but everyone already knows their own username).
-4. **TV mode** — `PAL` or `NTSC`. Optional, defaults to `PAL`.
+3. **Username** — your plain Jellyfin username. MiSTerFin resolves it to the real user id via `GET /Users` at startup.
 
-There is no on-screen setup keyboard in v1 — edit the file over SSH (using the standard MiSTer root password) or by pulling the SD card.
+Quick Connect is the better option where you have the choice. An API key isn't scoped to a user — it authenticates as the *server*, and which user's watch state gets written is decided entirely by the `userId` the client sends, resolved from the username on line 3. That works fine, but it's honour-system: the same key can read and write any account on the server, so it's a much broader credential than the job needs. It also requires admin dashboard access to create in the first place, and it's why playback progress has to be reported through a per-user endpoint rather than the normal session one (see `report_user_data` — `Sessions/Playing/Progress` silently does nothing without a real user session).
+
+A Quick Connect token *is* the user, so none of that applies: nothing to resolve, nothing to trust, and no access beyond that one account.
+
+A saved Quick Connect login takes precedence over an API key in the file, so re-authenticating once sticks even if an old key is left behind.
+
+There is no on-screen keyboard for the server URL — edit the file over SSH (using the standard MiSTer root password) or by pulling the SD card.
 
 ---
 
@@ -150,18 +196,24 @@ Button labels below follow Xbox-style naming (bottom face button = A, right face
 |--------|----------|--------|
 | B | Enter / X | Pause / resume |
 | Left / Right | Left / Right | Seek back/forward 30s (or adjust subtitle sync, in the subtitle menu) |
-| SELECT | Tab | Open the subtitle menu |
+| SELECT | Tab | Open the audio/subtitle track picker |
 | L | PageUp | VSync ON |
 | R | PageDown | VSync OFF |
 | A | Esc / Backspace / Z | Stop, back to browser |
 
-### Subtitle menu (SELECT during video playback)
+### Track picker (SELECT during video playback)
+
+Two tabs — **AUDIO** and **SUBTITLES** — switched with the shoulder buttons.
+
 | Button | Keyboard | Action |
 |--------|----------|--------|
-| Up / Down | Up / Down | Select subtitle track (or off) |
-| Left / Right | Left / Right | Adjust subtitle sync offset |
+| L / R | PageUp / PageDown | Switch between the AUDIO and SUBTITLES tabs |
+| Up / Down | Up / Down | Select a track (SUBTITLES also has an "Off" entry) |
+| Left / Right | Left / Right | Adjust subtitle sync offset (SUBTITLES tab only) |
 | B | Enter / X | Apply |
 | A / SELECT | Esc / Backspace / Z / Tab | Cancel |
+
+A `>` marks the track currently playing. Changing the **subtitle** track is instant for text-based tracks (rendered client-side). Changing the **audio** track always restarts the stream at the current position — Jellyfin transcodes one chosen audio stream into what it sends, so there's no way to switch it client-side the way a subtitle can be. Changing both at once costs a single restart, not two.
 
 VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom.
 
@@ -193,6 +245,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - **Any mplayer slave command sent while paused silently resumes playback unless prefixed with `pausing_keep`.** This isn't Jellyfin/MiSTerFin-specific, just an mplayer slave-mode quirk — but it's the reason pause-state commands (subtitle visibility, seeking while paused) are all prefixed that way throughout `main.c`.
 - **Server-side subtitle burn-in (image-based tracks only) forces a full stream restart, and seeking with it active re-decodes from the true start of the file up to the seek target** — a multi-minute stall on a deep seek. Text-based tracks are unaffected (rendered client-side, no restart). See `jf_stream_url()`'s `burn_in_sub_index` comment.
 - **`MediaSourceId` is omitted** from stream/progress/subtitle requests rather than guessed — works for direct single-version items; multi-version items (multiple cuts/qualities of the same title) may not resolve to the version you expect.
+- **The on-screen font is ASCII-only**, so non-ASCII titles are transliterated rather than drawn as-is (`Amélie` → `Amelie`, `Zoë & Co.` → `Zoe & Co.`, smart quotes and em-dashes normalised). Accented Latin folds to its base letter; anything with no ASCII form — CJK, Cyrillic, Greek — collapses to a single `?`. See `jf_text_to_display()`. Fixing this properly means a larger font atlas, not a parsing change.
 - **No on-screen keyboard** for server setup — `jellyfin.conf` must be edited manually (SSH or SD card).
 - Silent failure if `mplayer-arm` can't open the stream (bad URL, server down, transcode rejected) — you're dropped back to the browser with no error message.
 
