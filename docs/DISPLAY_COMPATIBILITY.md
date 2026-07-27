@@ -205,14 +205,14 @@ This is **not** a MiSTerFin setting — it replaces two system-wide files on you
    mv /media/fat/MiSTer.new /media/fat/MiSTer && chmod +x /media/fat/MiSTer
    cp menu.rbf /media/fat/menu.rbf
    ```
-4. **Enable it in `MiSTer.ini`** — add one line under `[Menu]`, next to the `vga_scaler=1` your analog combo already uses:
+4. **Enable it in `MiSTer.ini`** — the only new line is `direct_video_interlace=1`, added under `[Menu]` next to the `vga_scaler=1` your analog combo already uses. It is the same single flag for both PAL and NTSC:
    ```ini
    [Menu]
    vga_scaler=1
    direct_video_interlace=1
-   video_mode=640,26,60,74,288,0,4,20,12587
+   video_mode=<your existing PAL or NTSC line from the combo above — unchanged>
    ```
-   **Leave your `video_mode` exactly as it was.** The scaler doubles the field-sized mode into the full interlaced frame by itself — doubling the line count in `video_mode` yourself produces a huge, flickering picture (confirmed the hard way).
+   **Keep your `video_mode` (and `menu_pal`) exactly as your confirmed PAL or NTSC combo above set them** — e.g. the PAL SCART/Component combos use `video_mode=640,26,60,74,288,0,4,20,12587`, while the NTSC combos use their own 240-line mode plus `menu_pal=0`. The scaler doubles that field-sized mode into the full interlaced frame by itself — doubling the line count in `video_mode` yourself produces a huge, flickering picture (confirmed the hard way).
 5. **Reboot.** MiSTerFin needs no configuration changes at all — the default transcode profile already carries full PAL/NTSC source detail.
 
 ### Restoring stock
