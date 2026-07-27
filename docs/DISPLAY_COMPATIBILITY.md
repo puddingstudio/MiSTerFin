@@ -174,6 +174,64 @@ video_mode=640,288,100
 
 ---
 
+## Experimental: true interlaced output (576i/480i) on a CRT TV
+
+Everything above scans out progressively — 288 (PAL) or 240 (NTSC) lines, each drawn every field, which gives the classic scanline look. A CRT TV was actually built for **interlaced** video: two half-line-offset fields alternating, filling all 625/525 raster lines. For film and TV content that's visibly smoother and "fuller" — no scanline gaps, broadcast-style motion — and side by side we found it clearly nicer to watch movies on.
+
+MiSTer's stock scaler can't do this today. Izzie Walton (@iwalton3) wrote a patch for the MiSTer core that adds it — see the [tracking issue](https://github.com/puddingstudio/MiSTerFin/issues/11) — and it works with MiSTerFin unmodified: the framebuffer stays the normal 640x288/640x240, the scaler turns it into a proper interlaced signal at scanout.
+
+**Confirmed working** on the Analog I/O board over **both SCART and Component**, in **both PAL and NTSC**, on the setups this doc's confirmed combos above describe — 2026-07-27. (The patch author verified it over `direct_video` HDMI; the analog paths were confirmed here.)
+
+### What's involved (read before doing it)
+
+This is **not** a MiSTerFin setting — it replaces two system-wide files on your SD card (`MiSTer`, the main system binary, and `menu.rbf`, the menu core) with patched builds from a fork. That affects your whole MiSTer, not just MiSTerFin, and it is experimental. Two things to accept up front:
+
+- **A MiSTer system update will overwrite the patched files** (update_all / Downloader replaces `MiSTer` and `menu.rbf` with official builds), silently turning interlace back off. Re-apply the steps after updating, or skip those items in your updater config.
+- **Keep the backups.** If anything goes wrong you'll want to restore the stock files from the SD card on another machine.
+
+### Steps
+
+1. **Back up the stock files** (SSH into the MiSTer, or do the equivalent with the SD card in a PC):
+   ```sh
+   mkdir -p /media/fat/interlace-backup
+   cp /media/fat/MiSTer /media/fat/interlace-backup/MiSTer.stock
+   cp /media/fat/menu.rbf /media/fat/interlace-backup/menu.rbf.stock
+   cp /media/fat/MiSTer.ini /media/fat/interlace-backup/MiSTer.ini.bak
+   ```
+2. **Get the patched files** from [iwalton3's test release](https://github.com/iwalton3/MiSTerFin/releases/tag/v0.0.1) (`MiSTer` and `menu.rbf`; source for both is public — [Main_MiSTer](https://github.com/iwalton3/Main_MiSTer/tree/direct-video-interlace) and [Menu_MiSTer](https://github.com/iwalton3/Menu_MiSTer/tree/direct-video-interlace), branch `direct-video-interlace`).
+3. **Install them.** The running `MiSTer` binary can't be overwritten in place — copy to a temporary name first, then move over it:
+   ```sh
+   # copy the downloaded files to the SD card, then:
+   mv /media/fat/MiSTer.new /media/fat/MiSTer && chmod +x /media/fat/MiSTer
+   cp menu.rbf /media/fat/menu.rbf
+   ```
+4. **Enable it in `MiSTer.ini`** — add one line under `[Menu]`, next to the `vga_scaler=1` your analog combo already uses:
+   ```ini
+   [Menu]
+   vga_scaler=1
+   direct_video_interlace=1
+   video_mode=640,26,60,74,288,0,4,20,12587
+   ```
+   **Leave your `video_mode` exactly as it was.** The scaler doubles the field-sized mode into the full interlaced frame by itself — doubling the line count in `video_mode` yourself produces a huge, flickering picture (confirmed the hard way).
+5. **Reboot.** MiSTerFin needs no configuration changes at all — the default transcode profile already carries full PAL/NTSC source detail.
+
+### Restoring stock
+
+```sh
+cp /media/fat/interlace-backup/MiSTer.stock /media/fat/MiSTer.new
+mv /media/fat/MiSTer.new /media/fat/MiSTer && chmod +x /media/fat/MiSTer
+cp /media/fat/interlace-backup/menu.rbf.stock /media/fat/menu.rbf
+```
+Then remove the `direct_video_interlace=1` line from `MiSTer.ini` and reboot.
+
+### Notes
+
+- Static UI elements (menu text, thin horizontal edges) show the slight interline flicker inherent to interlaced video — that's physics, not a bug. Film/TV content is where this mode shines.
+- MiSTerFin versions before v0.9.5 could show stretched or corrupted video with this mode when the transcode profile was raised — fixed in v0.9.5 (aspect-exact letterboxing for any profile, and DVD-format sources are always freshly transcoded). Use v0.9.5 or later.
+- The long-term goal is getting this upstreamed into the official MiSTer core so it becomes a plain ini option — progress is tracked in [issue #11](https://github.com/puddingstudio/MiSTerFin/issues/11).
+
+---
+
 ## Untested / reported problem combos
 
 *(to fill in as we verify or get reports)*

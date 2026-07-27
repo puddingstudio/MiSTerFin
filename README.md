@@ -18,6 +18,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 - **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - **Info screen** with cover art, description, year, and status
 - **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
+- **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look. It needs experimental patched MiSTer core files (system-level, not something MiSTerFin ships), so it's an opt-in recipe: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#experimental-true-interlaced-output-576i480i-on-a-crt-tv), confirmed working over SCART and Component in both PAL and NTSC
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
 - **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
@@ -254,6 +255,14 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## Changelog
+
+### v0.9.5
+- Sharper video out of the box — the default transcode is now full PAL resolution (720x576 @ 12 Mbps, up from 480x270 @ 8 Mbps), measured on hardware with plenty of CPU headroom left
+- Correct letterboxing for any transcode profile, not just the default
+- DVD-sourced files now always get a clean transcode (previously they could stream-copy raw interlaced MPEG-2 and play slow and glitchy)
+- Subtitles now survive seeking and audio-track changes
+- Music: the immersive now-playing cover is the same physical size on NTSC as on PAL
+- New guide: experimental interlaced (576i/480i) CRT output — smoother, broadcast-style motion on analog outputs, using patched cores by iwalton3
 
 ### v0.9.4
 - **Quick Connect sign-in** — no API key or admin dashboard needed; approve a code from any signed-in Jellyfin device (API keys still work)
