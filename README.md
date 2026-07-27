@@ -136,7 +136,7 @@ Quick Connect must be enabled server-side (Dashboard → General → Quick Conne
 
 **TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
 
-**Transcode profile** is optional and you normally shouldn't touch it. The default (`720x576@12000000` — full PAL source resolution) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — measured on hardware across widescreen, 4:3, and DVD-rip sources with no dropped frames, no A/V drift, and plenty of CPU headroom left. The setting exists as a tuning knob, not something a normal setup needs to set.
+**Transcode profile** is optional and you normally shouldn't touch it. The default (`720x576@12000000` — full standard-definition source resolution, for PAL and NTSC alike; the video is scaled to exactly fit whichever mode your MiSTer outputs) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — measured on hardware across widescreen and 4:3 content with no dropped frames, no A/V drift, and plenty of CPU headroom left. The setting exists as a tuning knob, not something a normal setup needs to set.
 
 If you do want to change it, it's recognised wherever it appears in the file — `WxH` or `WxH@BITRATE`, e.g. `480x270@8000000`. It sets what the server is asked to transcode video down to before mplayer scales it to fill the screen. The active profile is shown on the pause screen so you can confirm which one is in effect.
 
@@ -257,9 +257,9 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ## Changelog
 
 ### v0.9.5
-- Sharper video out of the box — the default transcode is now full PAL resolution (720x576 @ 12 Mbps, up from 480x270 @ 8 Mbps), measured on hardware with plenty of CPU headroom left
+- Sharper video out of the box — the default transcode is now full standard-definition resolution (720x576 @ 12 Mbps, up from 480x270 @ 8 Mbps; applies to PAL and NTSC alike), measured on hardware with plenty of CPU headroom left
 - Correct letterboxing for any transcode profile, not just the default
-- DVD-sourced files now always get a clean transcode (previously they could stream-copy raw interlaced MPEG-2 and play slow and glitchy)
+- Files already stored in the requested format now always get a clean transcode (previously they could pass through as raw interlaced video and play slow and glitchy)
 - Subtitles now survive seeking and audio-track changes
 - Music: the immersive now-playing cover is the same physical size on NTSC as on PAL
 - New guide: experimental interlaced (576i/480i) CRT output — smoother, broadcast-style motion on analog outputs, using patched cores by iwalton3

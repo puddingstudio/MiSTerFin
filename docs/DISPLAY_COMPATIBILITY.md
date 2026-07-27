@@ -227,7 +227,7 @@ Then remove the `direct_video_interlace=1` line from `MiSTer.ini` and reboot.
 ### Notes
 
 - Static UI elements (menu text, thin horizontal edges) show the slight interline flicker inherent to interlaced video — that's physics, not a bug. Film/TV content is where this mode shines.
-- MiSTerFin versions before v0.9.5 could show stretched or corrupted video with this mode when the transcode profile was raised — fixed in v0.9.5 (aspect-exact letterboxing for any profile, and DVD-format sources are always freshly transcoded). Use v0.9.5 or later.
+- MiSTerFin versions before v0.9.5 could show stretched or corrupted video with this mode when the transcode profile was raised — fixed in v0.9.5 (aspect-exact letterboxing for any profile, and every source is always freshly transcoded). Use v0.9.5 or later.
 - The long-term goal is getting this upstreamed into the official MiSTer core so it becomes a plain ini option — progress is tracked in [issue #11](https://github.com/puddingstudio/MiSTerFin/issues/11).
 
 ---
