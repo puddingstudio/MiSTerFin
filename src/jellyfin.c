@@ -1339,9 +1339,23 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
         snprintf(audio_params, sizeof(audio_params),
                  "&audioStreamIndex=%d", audio_stream_index);
 
+    /* allowVideoStreamCopy=false: without it, a source that already matches
+     * the request (an MPEG-2 DVD rip whose 720x576 fits inside the profile
+     * box) gets stream-COPIED instead of transcoded — confirmed on hardware
+     * with two PAL DVD rips at a 720x576 profile: severe slowdown plus
+     * codec-looking glitches without this parameter, clean playback with it,
+     * same titles/profile/session (note /Sessions' TranscodingInfo can't
+     * tell the two apart — it comes back empty for ApiKey progressive
+     * streams either way). The whole playback pipeline here is built on the
+     * server delivering a clean, progressive, freshly-encoded stream (the
+     * mplayer chain has no deinterlacer, and raw DVD MPEG-2 is interlaced
+     * VBR with DVD-style timestamps) — so forbid the copy shortcut
+     * outright; a genuine re-encode of an already-small source is cheap for
+     * the server anyway. Audio needs no equivalent: audioCodec=mp3 already
+     * forces a real audio transcode, see the comment above. */
     snprintf(out, outlen,
         "%s/Videos/%s/stream?static=false&videoCodec=mpeg2video&container=ts"
-        "&audioCodec=mp3&audioChannels=2"
+        "&audioCodec=mp3&audioChannels=2&allowVideoStreamCopy=false"
         "&maxWidth=%d&maxHeight=%d&videoBitRate=%d"
         "&startTimeTicks=%lld&playSessionId=%s%s%s&ApiKey=%s",
         cfg->server, safe_id,

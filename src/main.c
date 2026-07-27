@@ -4627,18 +4627,34 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
 
     char vf_arg[96];
-    if (fb->height == 288) {
-        /* PAL — byte-for-byte the original, long-proven chain. Deliberately
-         * NOT touched by the NTSC comb fix below: PAL's width-first
-         * "scale=640:-1" mismatch is real (confirmed via the same PAR math
-         * used for NTSC) but mild enough to have never shown a visible
-         * artifact, and there's no reason to risk regressing something
-         * that's worked for the platform's entire history over a
-         * theoretical aspect-precision improvement it doesn't need. */
+    if (fb->height == 288 &&
+        g_cfg.profile_width == 480 && g_cfg.profile_height == 270) {
+        /* PAL at the ORIGINAL 480x270 transcode dimensions (the default for
+         * the platform's entire history until the 640x288 bump — see
+         * JF_PROFILE_DEFAULT_*) — byte-for-byte the original, long-proven
+         * chain, kept selectable by explicitly setting 480x270 in
+         * jellyfin.conf. Deliberately NOT touched by the NTSC comb fix
+         * below: PAL's width-first "scale=640:-1" mismatch is real
+         * (confirmed via the same PAR math used for NTSC) but mild enough
+         * to have never shown a visible artifact at these dimensions.
+         *
+         * Gated on the literal legacy dimensions rather than the current
+         * defaults, because "-1" keeps whatever coded height the server
+         * sent: at 480x270 that lands close enough, but a wider profile
+         * (like the 640x288 default) makes the picture fill the framebuffer
+         * with no letterboxing at all, and anything taller than the
+         * framebuffer corrupts outright (confirmed on hardware with
+         * 640x480: pink garbage / white comb lines, exactly the NTSC
+         * failure mode described below). Everything else takes the same
+         * DAR-aware branch NTSC uses — including the 720x576 default,
+         * confirmed correct on a PAL CRT (letterbox, 4:3, DVD-rip sources,
+         * and multi-minute zero-drift/zero-drop soaks). Bitrate-only tweaks
+         * on 480x270 stay on this chain. */
         snprintf(vf_arg, sizeof(vf_arg), "scale=%d:-1,expand=%d:%d:-1:-1:1,dsize=%d:%d",
                  fb->width, fb->width, fb->height, fb->width, fb->height);
     } else {
-        /* NTSC (and any other non-288 height) — confirmed on hardware that
+        /* NTSC (and any other non-288 height), plus PAL with a custom
+         * transcode profile (see above) — confirmed on hardware that
          * "scale=640:-1" (sizing height assuming square pixels) builds an
          * intermediate frame far taller than the framebuffer, which
          * something downstream (dsize/vo_fbdev) then has to crush back
@@ -4664,6 +4680,33 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                  fb->width, target_h, fb->width, fb->height, fb->width, fb->height);
     }
 
+    /* A selected client-rendered (text) subtitle rides the COMMAND LINE
+     * (-sub/-subdelay) rather than slave commands sent after the fork:
+     * confirmed on hardware (get_property sub_delay) that this mplayer
+     * build resets sub_delay to 0 when playback initialization completes,
+     * silently wiping any value written into the slave pipe before that
+     * point. At offset 0 the wiped value was only the fixed ~1.6s sync
+     * correction — subtitles still showed, just slightly off, so nobody
+     * noticed — but on a seek/audio-change restart it's the entire
+     * -g_play_offset clock shift (minutes), leaving the subtitle "selected
+     * but never displayed" (issue #12). Startup options ARE the init
+     * values, so nothing wipes them; the slave path (subtitle_load_client)
+     * stays for LIVE track changes, which happen with playback long since
+     * initialized. An image-based (burned-in) selection needs none of
+     * this — it's baked into the url via g_burned_in_sub_index. A failed
+     * download just means no -sub args, the same net result as the old
+     * post-spawn attempt failing. */
+    int cmdline_sub = 0;
+    char subdelay_arg[24];
+    if (g_current_sub_index >= 0 && g_burned_in_sub_index < 0 &&
+        jf_download_subtitle(&g_cfg, g_info_item.id, g_info_item.id,
+                             g_current_sub_index, SUB_LOCAL_PATH)) {
+        subtitles_sanitize_srt(SUB_LOCAL_PATH);
+        snprintf(subdelay_arg, sizeof(subdelay_arg), "%.3f",
+                 AUDIO_DELAY_SEC + SUBTITLE_SYNC_FUDGE_SEC - g_play_offset + g_sub_delay_extra);
+        cmdline_sub = 1;
+    }
+
     int pfd[2];
     pipe(pfd);
 
@@ -4675,11 +4718,15 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
         nice(-5);
-        execlp(MPLAYER, "mplayer",
-               "-slave", "-quiet",
-               "-nojoystick", "-noconsolecontrols",
-               "-vo", "fbdev:/dev/fb0",
-               "-ao", "alsa",
+        /* Built as an array (execvp) rather than the execlp literal it used
+         * to be solely so the -sub/-subdelay pair can be conditional. */
+        const char *args[64];
+        int an = 0;
+        args[an++] = "mplayer";
+        args[an++] = "-slave";      args[an++] = "-quiet";
+        args[an++] = "-nojoystick"; args[an++] = "-noconsolecontrols";
+        args[an++] = "-vo";         args[an++] = "fbdev:/dev/fb0";
+        args[an++] = "-ao";         args[an++] = "alsa";
                /* osdlevel 0: mplayer's native seekbar/status OSD (shown by
                 * default on pause/seek slave commands) draws directly into
                 * the framebuffer on its own internal refresh schedule,
@@ -4692,20 +4739,21 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                 * separate mechanism (not gated by osdlevel) — see
                 * player_pause_toggle()'s sub_visibility toggle for that
                 * other half of the same race. */
-               "-osdlevel", "0",
-               "-font", "/media/fat/misterfin/font/font.desc",
-               "-framedrop",
-               "-autosync", "30",
-               "-cache", "8192", "-cache-min", "20",
-               /* mplayer's own native MPEG-TS demuxer sometimes misses the
-                * video PID on Jellyfin's transcoded TS output (only finds
-                * audio) — forcing the ffmpeg/libavformat demuxer instead
-                * fixes it. Confirmed against a real Jellyfin 10.11 server. */
-               "-demuxer", "lavf",
-               /* -sws 0 = fast bilinear instead of the (much costlier)
-                * default bicubic scaler — confirmed empirically to matter
-                * a lot given there's no NEON path in this build. */
-               "-sws", "0",
+        args[an++] = "-osdlevel"; args[an++] = "0";
+        args[an++] = "-font";     args[an++] = "/media/fat/misterfin/font/font.desc";
+        args[an++] = "-framedrop";
+        args[an++] = "-autosync"; args[an++] = "30";
+        args[an++] = "-cache";    args[an++] = "8192";
+        args[an++] = "-cache-min"; args[an++] = "20";
+        /* mplayer's own native MPEG-TS demuxer sometimes misses the
+         * video PID on Jellyfin's transcoded TS output (only finds
+         * audio) — forcing the ffmpeg/libavformat demuxer instead
+         * fixes it. Confirmed against a real Jellyfin 10.11 server. */
+        args[an++] = "-demuxer"; args[an++] = "lavf";
+        /* -sws 0 = fast bilinear instead of the (much costlier)
+         * default bicubic scaler — confirmed empirically to matter
+         * a lot given there's no NEON path in this build. */
+        args[an++] = "-sws"; args[an++] = "0";
                /* Decode is requested small server-side (see profile below)
                 * to keep the software H.264 decode cheap; this -vf chain
                 * scales it back up to fill /dev/fb0's actual live size
@@ -4721,9 +4769,9 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                 * 640x288 (the PAL framebuffer size), which caused green
                 * corruption artifacts once tested against a 240-tall NTSC
                 * framebuffer. */
-               "-vf", vf_arg,
-               "-lavdopts", "threads=2:fast",
-               "-af", "format=s16le",
+        args[an++] = "-vf";       args[an++] = vf_arg;
+        args[an++] = "-lavdopts"; args[an++] = "threads=2:fast";
+        args[an++] = "-af";       args[an++] = "format=s16le";
                /* This build has no FreeType/fontconfig (confirmed on
                 * hardware: -subfont-osd-scale/-subfont-text-scale are both
                 * "Unknown option"), so without -subfont, subtitles would
@@ -4743,28 +4791,35 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                 * (fb->height - 8 - SAFE_Y_BOT, ~90% at the 288-tall PAL
                 * output) per user request, after confirming 88 read as too
                 * high up. */
-               /* The sanitized .srt we write is UTF-8 (jf_text_to_display now
-                * keeps Latin-1 accents rather than folding them). -utf8 tells
-                * mplayer to decode it as UTF-8 and look each code point up in
-                * the subtitle font, which now carries U+00A0-U+00FF glyphs
-                * (see gen_subfont.py) — so accented subtitles render instead
-                * of dropping the accented characters. */
-               "-utf8",
-               "-subfont", "/media/fat/misterfin/subfont/font.desc",
-               "-subwidth", "90",
-               "-subpos", "92",
-               /* Audio consistently trails video by a small fixed amount
-                * (reported by the user across titles — not load-dependent,
-                * so not the same issue fb_wait_vsync() fixed). First guess
-                * was -0.10 — confirmed on hardware to make the gap BIGGER,
-                * so the sign was backwards for this mplayer build. Flipped
-                * to positive and roughly doubled the magnitude (since the
-                * wrong-signed -0.10 visibly widened the gap by about that
-                * much) — needs live tuning against further hardware
-                * feedback, sign/magnitude both still empirical. */
-               "-delay", delay_arg,
-               url,
-               (char *)NULL);
+        /* The sanitized .srt we write is UTF-8 (jf_text_to_display now
+         * keeps Latin-1 accents rather than folding them). -utf8 tells
+         * mplayer to decode it as UTF-8 and look each code point up in
+         * the subtitle font, which now carries U+00A0-U+00FF glyphs
+         * (see gen_subfont.py) — so accented subtitles render instead
+         * of dropping the accented characters. */
+        args[an++] = "-utf8";
+        /* See cmdline_sub above (issue #12): the (re)start's subtitle
+         * selection must be a startup option, not an early slave command. */
+        if (cmdline_sub) {
+            args[an++] = "-sub";      args[an++] = SUB_LOCAL_PATH;
+            args[an++] = "-subdelay"; args[an++] = subdelay_arg;
+        }
+        args[an++] = "-subfont";  args[an++] = "/media/fat/misterfin/subfont/font.desc";
+        args[an++] = "-subwidth"; args[an++] = "90";
+        args[an++] = "-subpos";   args[an++] = "92";
+        /* Audio consistently trails video by a small fixed amount
+         * (reported by the user across titles — not load-dependent,
+         * so not the same issue fb_wait_vsync() fixed). First guess
+         * was -0.10 — confirmed on hardware to make the gap BIGGER,
+         * so the sign was backwards for this mplayer build. Flipped
+         * to positive and roughly doubled the magnitude (since the
+         * wrong-signed -0.10 visibly widened the gap by about that
+         * much) — needs live tuning against further hardware
+         * feedback, sign/magnitude both still empirical. */
+        args[an++] = "-delay"; args[an++] = delay_arg;
+        args[an++] = url;
+        args[an]   = NULL;
+        execvp(MPLAYER, (char *const *)args);
         _exit(1);
     }
 
@@ -4776,14 +4831,10 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
      * loading spinner without racing its own frame writes. */
     spinner_show(fb, 2.0);
 
-    /* A client-rendered (text) subtitle selection survives a seek-triggered
-     * restart (see player_seek) but the fresh mplayer instance doesn't have
-     * anything loaded yet — re-download+load it the same way
-     * subtitle_load_client() does for a manual change. An image-based
-     * (burned-in) selection needs no client-side action at all here: it's
-     * already baked into the url built above via g_burned_in_sub_index. */
-    if (g_current_sub_index >= 0 && g_burned_in_sub_index < 0)
-        subtitle_load_client(g_current_sub_index);
+    /* Nothing subtitle-related to send here: a client-rendered selection
+     * rides the command line (see cmdline_sub above — slave commands sent
+     * this early get their sub_delay wiped by playback init, issue #12),
+     * and a burned-in one is baked into the url. */
 }
 
 /* ── music playback (audio-only, direct play — see jf_audio_stream_url) ──── */
@@ -4980,6 +5031,15 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
             int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
             int box_h  = bottom - top;
             int box_w  = (fb->height == 288) ? box_h : (int)(box_h * par_correction(fb) + 0.5);
+            /* Cap at the square box PAL's own math lands on (246 px at 288
+             * lines). Without it, the par-corrected box on shorter buffers
+             * is never width-constrained, so a square cover fills box_h's
+             * full physical height (~88% of the screen at NTSC's 240 lines)
+             * instead of PAL's ~51%. Both buffers are 640 px wide, so equal
+             * pixel width == equal physical on-screen size; the aspect fit
+             * inside blit_fit_centered brings the height down to match.
+             * A no-op at 288 lines (box_w is already exactly 246 there). */
+            if (box_w > 246) box_w = 246;
             blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
                                fb->width / 2, (top + bottom) / 2, box_w, box_h, 255);
         }

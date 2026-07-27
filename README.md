@@ -135,11 +135,11 @@ Quick Connect must be enabled server-side (Dashboard → General → Quick Conne
 
 **TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
 
-**Transcode profile** is optional and you normally shouldn't touch it. The default (`480x270@8000000`) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — it plays correctly on the hardware. The setting exists mainly so the resolution/bitrate ceiling can be experimented with; it's a testing/tuning knob, not something a normal setup needs to set.
+**Transcode profile** is optional and you normally shouldn't touch it. The default (`720x576@12000000` — full PAL source resolution) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — measured on hardware across widescreen, 4:3, and DVD-rip sources with no dropped frames, no A/V drift, and plenty of CPU headroom left. The setting exists as a tuning knob, not something a normal setup needs to set.
 
-If you do want to experiment, it's recognised wherever it appears in the file — `WxH` or `WxH@BITRATE`, e.g. `640x480@12000000`. It sets what the server is asked to transcode video down to before mplayer scales it back up to fill the screen. The active profile is shown on the pause screen so you can confirm which one is in effect.
+If you do want to change it, it's recognised wherever it appears in the file — `WxH` or `WxH@BITRATE`, e.g. `480x270@8000000`. It sets what the server is asked to transcode video down to before mplayer scales it to fill the screen. The active profile is shown on the pause screen so you can confirm which one is in effect.
 
-Raising it is the main lever on picture quality, and the main way to run out of CPU. Total pixel count is what costs decode time on this hardware — bitrate is close to free (2 Mbps and 8 Mbps both measured ~34% CPU with no A/V drift), while `720x576` was confirmed unsustainable: A/V desync grew continuously and the CPU saturated. `480x270` is the known-good default. Anything in between is unmeasured, so if you raise it, watch for audio drifting out of sync — that's the symptom that appears first.
+The main reason to set it is a constrained network: the default asks the server for about 12 Mbps (~1.5 MB/s — trivial over the wired connection MiSTers normally use, but potentially too much for a weak WiFi bridge). If playback stutters or audio drifts out of sync, set `480x270@8000000` — the original default from earlier releases, which also selects the exact scaling path those releases used.
 
 ### Using an API key instead
 

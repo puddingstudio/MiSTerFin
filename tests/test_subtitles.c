@@ -127,11 +127,15 @@ static void test_timing_lines_survive(void)
 
 static void test_non_ascii_folding(void)
 {
-    /* Previously every byte >= 0x80 was blanked, so an accented word turned
-     * into gaps. Folding keeps it readable on an ASCII-only font. */
-    CHECK_EQ(sanitize("Caf\xC3\xA9 na\xC3\xAF ve\n"), "Cafe nai ve\n");
-    /* U+266A MUSIC NOTE — common in subtitles to mark background music. It
-     * has no ASCII equivalent, so it becomes a single '?'. */
+    /* Latin-1 accents pass through as UTF-8 since the subtitle font carries
+     * U+00A0-U+00FF glyphs (gen_subfont.py) and mplayer runs with -utf8 —
+     * they used to fold to bare ASCII back when the font was ASCII-only. */
+    CHECK_EQ(sanitize("Caf\xC3\xA9 na\xC3\xAF ve\n"), "Caf\xC3\xA9 na\xC3\xAF ve\n");
+    /* Beyond Latin-1 there's still no glyph, so folding continues: an em
+     * dash has an ASCII stand-in... */
+    CHECK_EQ(sanitize("a \xE2\x80\x94 b\n"), "a - b\n");
+    /* ...and U+266A MUSIC NOTE (common in subtitles to mark background
+     * music) has none, so it becomes a single '?'. */
     CHECK_EQ(sanitize("\xE2\x99\xAA\n"), "?\n");
 }
 

@@ -28,23 +28,23 @@ static void t(const char *label, const char *body,
 }
 int main(void) {
     t("no profile -> defaults", "http://s:8096\nPAL\n",
-      480,270,8000000,"","PAL");
+      720,576,12000000,"","PAL");
     t("WxH only", "http://s:8096\n640x480\nNTSC\n",
-      640,480,8000000,"","NTSC");
+      640,480,12000000,"","NTSC");
     t("WxH@rate", "http://s:8096\n720x480@12000000\nPAL\n",
       720,480,12000000,"","PAL");
     t("with api key + username", "http://s:8096\nkey123\nbob\n640x480@9000000\nPAL\n",
       640,480,9000000,"key123","PAL");
     t("profile before credentials", "http://s:8096\n640x480\nkey123\nbob\n",
-      640,480,8000000,"key123","PAL");
+      640,480,12000000,"key123","PAL");
     /* Out of range: rejected, defaults kept, and NOT read as an api key. */
     t("too large -> ignored", "http://s:8096\n9999x9999\nPAL\n",
-      480,270,8000000,"","PAL");
+      720,576,12000000,"","PAL");
     t("bad bitrate -> size kept, rate default", "http://s:8096\n640x480@5\nPAL\n",
-      640,480,8000000,"","PAL");
+      640,480,12000000,"","PAL");
     /* Trailing junk must not parse, and must fall through to the api_key slot. */
     t("trailing junk is a credential", "http://s:8096\n480x270junk\nbob\n",
-      480,270,8000000,"480x270junk","PAL");
+      720,576,12000000,"480x270junk","PAL");
     printf("profile: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

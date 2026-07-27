@@ -401,14 +401,32 @@ typedef struct {
 } JfStreamProfile;
 
 /* What the client asks the server to transcode down to, before mplayer scales
- * it back up to fill the framebuffer. Deliberately small: this device decodes
- * in scalar C with no NEON path, and total pixel count is what costs CPU —
- * confirmed on hardware that bitrate barely matters (2Mbps and 8Mbps both sat
- * at ~34% utime with no A/V drift) while 720x576 pegged the CPU and drifted
- * continuously. */
-#define JF_PROFILE_DEFAULT_W    480
-#define JF_PROFILE_DEFAULT_H    270
-#define JF_PROFILE_DEFAULT_RATE 8000000
+ * it back up (or down) to fill the framebuffer.
+ *
+ * Raised from the original 480x270@8M — full PAL source resolution, i.e. the
+ * most detail this pipeline can meaningfully carry — after a measured
+ * hardware pass: a 5-minute A/B soak (480x270@8M vs 640x288@12M: both zero
+ * dropped frames, zero A/V drift, ~2-3 percentage points apart in total CPU)
+ * followed by live sweeps up to 720x576@12M including the worst case (4:3
+ * content filling the whole box, ~720x540 decode) — which still left ~60%+
+ * of the CPU idle. An old note here claimed 720x576 "pegged the CPU and
+ * drifted"; re-measured, that turned out to be an artifact of the UI redraw
+ * loop running behind the old measurement, not the decode itself (the
+ * dominant vo/scale cost also doesn't grow with source size — decode is the
+ * only part that does, 8%->~30% usr from 480x270 to full-box 720x576).
+ *
+ * Two things this default leans on, both in this file / play():
+ * allowVideoStreamCopy=false in jf_stream_url (a 720x576 box would otherwise
+ * let a PAL DVD rip stream-copy raw interlaced MPEG-2 — see that comment),
+ * and the DAR-aware -vf chain for non-480x270 profiles (heights above the
+ * framebuffer must downscale, not overflow). Users on a weak network
+ * (12Mbps is ~1.5MB/s, trivial for the wired connection MiSTers normally
+ * use) can set 480x270@8000000 in jellyfin.conf to get the old behavior
+ * back — those exact dimensions also re-select the original PAL scaling
+ * chain (see play()). */
+#define JF_PROFILE_DEFAULT_W    720
+#define JF_PROFILE_DEFAULT_H    576
+#define JF_PROFILE_DEFAULT_RATE 12000000
 
 /* Bounds for a profile read from the config file. Wide enough not to get in
  * the way of experimenting, narrow enough that a typo can't ask the server
