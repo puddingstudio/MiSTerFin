@@ -36,7 +36,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 ## Requirements
 
 - MiSTer FPGA (standard Linux image, standard `menu.rbf` — no special core required)
-- A reachable Jellyfin server + an API key
+- A reachable Jellyfin server, and a way to sign in — Quick Connect (enabled by default on most installs, no API key or admin access needed) or an API key
 - `curl` on the MiSTer (included in the standard MiSTer Linux image)
 
 Grab the latest release zip from the [Releases](../../releases) page and skip straight to **Installation** below, or build from source if you'd rather. Everything needed to run MiSTerFin (including its own `mplayer-arm`) is built from this repo either way; you don't need a separate mplayer install or any other MiSTer app already set up.
@@ -253,6 +253,15 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ## Changelog
 
+### v0.9.4
+- **Quick Connect sign-in** — no API key or admin dashboard needed; approve a code from any signed-in Jellyfin device (API keys still work)
+- **Continue Watching and Next Up** rows on the home screen
+- **Alternate audio track selection** — switch audio streams, not just subtitles
+- Large libraries no longer capped at ~200 items, with page-jump and hold-to-repeat scrolling
+- Subtitle improvements — proper track names, and ASS/SSA markup cleaned up instead of shown as text
+- Configurable transcode resolution/bitrate from `jellyfin.conf`
+- Controllers keep working after a disconnect/reconnect
+
 ### v0.9.3
 - Redesigned info screen — full-height backdrop art, bigger logo, star rating
 - Home screen loads faster — library covers now cache to the SD card and prefetch in the background
@@ -275,11 +284,21 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ---
 
+## Credits
+
+MiSTerFin is made by [Pudding Studio](https://pudding.studio).
+
+Quick Connect sign-in, alternate audio track selection, Continue Watching / Next Up, the real JSON parser, large-library pagination, the subtitle handling improvements, a configurable transcode profile, the controller-reconnect hardening, an off-hardware test harness, and a thorough security-hardening pass were contributed by **[Izzie Walton (@iwalton3)](https://github.com/iwalton3)** in [#6](https://github.com/puddingstudio/MiSTerFin/pull/6) — a substantial contribution, tested end-to-end on real hardware. Thank you.
+
+Interlaced video for MiSTerFin is also in the works from the same contributor — patched [Main_MiSTer](https://github.com/iwalton3/Main_MiSTer/tree/direct-video-interlace) and [Menu_MiSTer](https://github.com/iwalton3/Menu_MiSTer/tree/direct-video-interlace) cores that add true 480i/576i scaler output over `direct_video`, letting MiSTerFin push a proper interlaced picture (still experimental).
+
+---
+
 ## Licence
 
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, share, and modify, non-commercial only.
 
 ---
 
-| <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio |
+| <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio<br><br>*with the power of open source*<br>major contributions by [Izzie Walton (@iwalton3)](https://github.com/iwalton3) |
 |:---:|:---|
