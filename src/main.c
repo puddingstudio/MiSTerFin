@@ -1659,6 +1659,28 @@ static int browse_move_sel(FBDev *fb, int delta)
     return 1;
 }
 
+/* Re-pull the current frame from the server while keeping the cursor where it
+ * was (same window, same absolute row), rather than snapping to the top the
+ * way a bare fetch_frame() does. Used on return from playback so a just-
+ * watched item's freshly-reported watched/resume state shows immediately —
+ * and, importantly, so the server-driven Continue Watching / Next Up rows
+ * drop or advance the item the way the server now sees it, instead of keeping
+ * a stale local copy. A failed re-fetch leaves the current window untouched. */
+static void refetch_frame_keep_selection(FBDev *fb)
+{
+    int abs_sel = g_window_start + g_sel;
+    if (!fetch_frame_window(g_window_start)) return;
+    int sel = abs_sel - g_window_start;
+    if (sel >= g_item_count) sel = g_item_count - 1;
+    if (sel < 0) sel = 0;
+    g_sel = sel;
+
+    int vis = visible_rows(fb);
+    g_scroll = (g_sel >= vis) ? g_sel - vis + 1 : 0;
+    if (vis > 0 && g_scroll > g_item_count - vis) g_scroll = g_item_count - vis;
+    if (g_scroll < 0) g_scroll = 0;
+}
+
 /* Simple "flying through stars" background for the About screen — each
  * star has a depth (z) that shrinks every frame; projecting x/y by 1/z
  * makes it appear to accelerate toward the viewer, and it respawns at max
@@ -3557,6 +3579,18 @@ static double play_position(void)
     return g_play_offset + (now_sec() - g_play_start_wall);
 }
 
+/* A title counts as watched once playback passed ~90% of its runtime — the
+ * same threshold Jellyfin's own server uses to flip Played and drop the
+ * resume marker. Reaching end-of-file lands here too (position ~= runtime).
+ * An early stop below the threshold keeps a real resume point instead; an
+ * item with no runtime metadata (runtime_ticks==0) can't be judged, so it's
+ * treated as not-yet-watched rather than guessed. */
+static int playback_watched(int64_t runtime_ticks, double pos_sec)
+{
+    if (runtime_ticks <= 0) return 0;
+    return pos_sec >= 0.9 * (double)runtime_ticks / 10000000.0;
+}
+
 static int player_running(void)
 {
     if (g_player_pid < 0) return 0;
@@ -5246,17 +5280,27 @@ int main(int argc, char **argv)
 
         case STATE_PLAYING:
             if (!player_running()) {
+                double pos = play_position();
+                int watched = playback_watched(g_info_item.runtime_ticks, pos);
                 jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                                   (int64_t)(play_position() * 10000000.0));
+                                   (int64_t)(pos * 10000000.0), watched);
+                g_info_item.played = watched;
+                g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
                 playing = 0;
                 state = STATE_BROWSE;
+                refetch_frame_keep_selection(&fb);
                 draw_browse(&fb);
             } else if (inp & INP_B) {
+                double pos = play_position();
+                int watched = playback_watched(g_info_item.runtime_ticks, pos);
                 jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                                   (int64_t)(play_position() * 10000000.0));
+                                   (int64_t)(pos * 10000000.0), watched);
+                g_info_item.played = watched;
+                g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
                 player_stop();
                 playing = 0;
                 state = STATE_BROWSE;
+                refetch_frame_keep_selection(&fb);
                 draw_browse(&fb);
             } else if (g_paused) {
                 if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
@@ -5303,8 +5347,10 @@ int main(int argc, char **argv)
         case STATE_PLAYING_AUDIO: {
             JfItem *cur = &g_items[g_audio_queue_pos];
             if (!player_running()) {
+                double pos = play_position();
                 jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
-                                   (int64_t)(play_position() * 10000000.0));
+                                   (int64_t)(pos * 10000000.0),
+                                   playback_watched(cur->runtime_ticks, pos));
                 if (g_audio_queue_pos + 1 < g_item_count &&
                     g_items[g_audio_queue_pos + 1].type == JF_TYPE_TRACK) {
                     play_audio(&fb, g_audio_queue_pos + 1);
@@ -5329,8 +5375,10 @@ int main(int argc, char **argv)
                     break;
                 }
             } else if (inp & INP_B) {
+                double pos = play_position();
                 jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
-                                   (int64_t)(play_position() * 10000000.0));
+                                   (int64_t)(pos * 10000000.0),
+                                   playback_watched(cur->runtime_ticks, pos));
                 player_stop();
                 if (g_shuffle_mode) { g_shuffle_mode = 0; fetch_frame(); }
                 state = STATE_BROWSE;
@@ -5340,16 +5388,20 @@ int main(int argc, char **argv)
                 player_pause_toggle();
             } else if (inp & INP_UP) {
                 if (g_audio_queue_pos > 0 && g_items[g_audio_queue_pos - 1].type == JF_TYPE_TRACK) {
+                    double pos = play_position();
                     jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
-                                       (int64_t)(play_position() * 10000000.0));
+                                       (int64_t)(pos * 10000000.0),
+                                       playback_watched(cur->runtime_ticks, pos));
                     player_stop();
                     play_audio(&fb, g_audio_queue_pos - 1);
                 }
             } else if (inp & INP_DOWN) {
                 if (g_audio_queue_pos + 1 < g_item_count &&
                     g_items[g_audio_queue_pos + 1].type == JF_TYPE_TRACK) {
+                    double pos = play_position();
                     jf_report_stopped(&g_cfg, cur->id, g_play_session_id,
-                                       (int64_t)(play_position() * 10000000.0));
+                                       (int64_t)(pos * 10000000.0),
+                                       playback_watched(cur->runtime_ticks, pos));
                     player_stop();
                     play_audio(&fb, g_audio_queue_pos + 1);
                 }

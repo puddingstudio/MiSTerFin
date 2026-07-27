@@ -484,7 +484,8 @@ void jf_report_start   (const JfConfig *cfg, const char *item_id,
 void jf_report_progress(const JfConfig *cfg, const char *item_id,
                          const char *play_session_id, int64_t position_ticks, int paused);
 void jf_report_stopped (const JfConfig *cfg, const char *item_id,
-                         const char *play_session_id, int64_t position_ticks);
+                         const char *play_session_id, int64_t position_ticks,
+                         int played);
 
 /* Generates a client-side play session id, e.g. "misterfin-<pid>-<time>". */
 void jf_make_play_session_id(char *out, int outlen);

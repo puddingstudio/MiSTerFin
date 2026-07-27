@@ -1445,8 +1445,15 @@ void jf_report_progress(const JfConfig *cfg, const char *item_id,
 }
 
 void jf_report_stopped(const JfConfig *cfg, const char *item_id,
-                        const char *play_session_id, int64_t position_ticks)
+                        const char *play_session_id, int64_t position_ticks,
+                        int played)
 {
     (void)play_session_id;
-    report_user_data(cfg, item_id, position_ticks, 0);
+    /* When the title was watched to the end, Jellyfin's convention is
+     * Played=true with the resume position cleared to 0. Reporting the
+     * near-end position with Played=false unconditionally (what this used to
+     * do) left every finished title still offering a resume that jumped
+     * straight to the last few seconds — and kept it sitting in the Continue
+     * Watching row instead of moving the series on to Next Up. */
+    report_user_data(cfg, item_id, played ? 0 : position_ticks, played);
 }
