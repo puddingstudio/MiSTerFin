@@ -21,7 +21,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
 - **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
-- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art) — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
+- **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, **Nebula** (our own audio-reactive plasma visualizer, inspired by Ryan Geiss's classic feedback visualizer), or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art); Nebula and Toasty use an immersive layout — just an enlarged centered cover over the effect — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
 - **About screen** with a GitHub-releases update check and one-button in-app update (A installs, applied on next launch); the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
@@ -135,7 +135,9 @@ Quick Connect must be enabled server-side (Dashboard → General → Quick Conne
 
 **TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
 
-**Transcode profile** is also optional, and likewise recognised wherever it appears — `WxH` or `WxH@BITRATE`, e.g. `640x480@12000000`. It sets what the server is asked to transcode video down to before mplayer scales it back up to fill the screen; the default is `480x270@8000000`. The active profile is shown on the pause screen so you can confirm which one is in effect.
+**Transcode profile** is optional and you normally shouldn't touch it. The default (`480x270@8000000`) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — it plays correctly on the hardware. The setting exists mainly so the resolution/bitrate ceiling can be experimented with; it's a testing/tuning knob, not something a normal setup needs to set.
+
+If you do want to experiment, it's recognised wherever it appears in the file — `WxH` or `WxH@BITRATE`, e.g. `640x480@12000000`. It sets what the server is asked to transcode video down to before mplayer scales it back up to fill the screen. The active profile is shown on the pause screen so you can confirm which one is in effect.
 
 Raising it is the main lever on picture quality, and the main way to run out of CPU. Total pixel count is what costs decode time on this hardware — bitrate is close to free (2 Mbps and 8 Mbps both measured ~34% CPU with no A/V drift), while `720x576` was confirmed unsustainable: A/V desync grew continuously and the CPU saturated. `480x270` is the known-good default. Anything in between is unmeasured, so if you raise it, watch for audio drifting out of sync — that's the symptom that appears first.
 
@@ -257,9 +259,14 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - **Quick Connect sign-in** — no API key or admin dashboard needed; approve a code from any signed-in Jellyfin device (API keys still work)
 - **Continue Watching and Next Up** rows on the home screen
 - **Alternate audio track selection** — switch audio streams, not just subtitles
+- **Nebula** music-player background — an audio-reactive plasma visualizer (inspired by Geiss); Nebula and Toasty now use an immersive layout (just the cover over the effect, with the track name flashing on change)
+- Accented and international characters now display correctly in titles, descriptions and subtitles (Latin scripts — é, ã, ç, ñ, ü, and so on)
+- Smoother music playback and menu scrolling — no more brief freezes, and browse cover art is now cached to the SD card so revisited lists load instantly
 - Large libraries no longer capped at ~200 items, with page-jump and hold-to-repeat scrolling
 - Subtitle improvements — proper track names, and ASS/SSA markup cleaned up instead of shown as text
-- Configurable transcode resolution/bitrate from `jellyfin.conf`
+- Finished titles now correctly mark as watched and leave Continue Watching
+- Hardened server communication (security review of the request and in-app update paths)
+- Optional transcode resolution/bitrate override in `jellyfin.conf` for experimentation — the default is tuned and works correctly out of the box
 - Controllers keep working after a disconnect/reconnect
 
 ### v0.9.3

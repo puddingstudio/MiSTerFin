@@ -42,6 +42,14 @@
  * finishes last. */
 #define POSTER_TMP_BG "/tmp/misterfin_poster_bg.img"
 #define GRID_CACHE_DIR "/media/fat/misterfin/gridcache"
+/* Per-item browse-list cover art, cached to the SD card (same idea as the
+ * home-screen grid cache above) so scrolling a list reads covers from the
+ * card instead of re-downloading each one — no network round-trip on the
+ * main thread, so no scroll freeze and no blank-then-appear. A background
+ * thread (cover_prefetch_thread) fills the cache for the current list;
+ * COVER_TMP_BG is that thread's own download scratch path. */
+#define COVER_CACHE_DIR "/media/fat/misterfin/covercache"
+#define COVER_TMP_BG   "/tmp/misterfin_cover_bg.img"
 #define CRASH_LOG    "/media/fat/misterfin/crash.log"
 /* mplayer's -af export writes live PCM samples to this mmap'd file for the
  * now-playing visualizer to read — confirmed supported on this build
@@ -421,12 +429,58 @@ static int font_scale_x(FBDev *fb, int scale)
     return scale;
 }
 
-static void draw_char(FBDev *fb, int x, int y, unsigned char c, int scale,
+/* Text is UTF-8. One glyph cell is drawn per code point (not per byte), so
+ * accented Latin (é, ã, ç, ñ, ü, ...) renders properly instead of as one
+ * cell per raw byte. ASCII comes from font8x8_basic, U+00A0-U+00FF from
+ * font8x8_ext_latin; anything else (CJK/Cyrillic/Greek) shows '?'. Titles/
+ * overviews are pre-normalised by jf_text_to_display so only code points we
+ * can actually draw ever reach here. */
+static unsigned utf8_cp(const char **s)
+{
+    const unsigned char *p = (const unsigned char *)*s;
+    unsigned c = *p, cp; int extra;
+    if      (c < 0x80)           { *s += 1; return c; }
+    else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+    else                         { *s += 1; return 0xFFFD; }
+    for (int i = 1; i <= extra; i++) {
+        if ((p[i] & 0xC0) != 0x80) { *s += 1; return 0xFFFD; }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    *s += extra + 1;
+    return cp;
+}
+
+static const uint8_t *glyph_for_cp(unsigned cp)
+{
+    if (cp < 0x80)                return font8x8_basic[cp];
+    if (cp >= 0xA0 && cp <= 0xFF) return font8x8_ext_latin[cp - 0xA0];
+    return font8x8_basic['?'];
+}
+
+/* Number of code points in the first nbytes of s (stops at NUL). */
+static int cp_count(const char *s, int nbytes)
+{
+    int n = 0; const char *end = s + nbytes;
+    while (s < end && *s) { utf8_cp(&s); n++; }
+    return n;
+}
+
+/* Cut s in place to at most keep_cols code points (at a code-point boundary,
+ * no ellipsis added). */
+static void truncate_cp(char *s, int keep_cols)
+{
+    const char *p = s; int i = 0;
+    while (*p && i < keep_cols) { utf8_cp(&p); i++; }
+    s[(int)(p - s)] = '\0';
+}
+
+static void draw_char(FBDev *fb, int x, int y, unsigned cp, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
-    if (c >= 128) c = '?';
     int sx = font_scale_x(fb, scale);
-    const uint8_t *glyph = font8x8_basic[c];
+    const uint8_t *glyph = glyph_for_cp(cp);
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < 8; col++) {
@@ -441,11 +495,15 @@ static void draw_text(FBDev *fb, int x, int y, const char *s, int scale,
                       uint8_t r, uint8_t g, uint8_t b)
 {
     int sx = font_scale_x(fb, scale);
-    for (; *s; s++, x += 8*sx)
-        draw_char(fb, x, y, (unsigned char)*s, scale, r, g, b);
+    while (*s) { unsigned cp = utf8_cp(&s); draw_char(fb, x, y, cp, scale, r, g, b); x += 8*sx; }
 }
 
-static int text_width(FBDev *fb, const char *s, int scale) { return (int)strlen(s) * 8 * font_scale_x(fb, scale); }
+static int text_width(FBDev *fb, const char *s, int scale)
+{
+    int n = 0;
+    while (*s) { utf8_cp(&s); n++; }
+    return n * 8 * font_scale_x(fb, scale);
+}
 
 /* Like draw_text, but skips any character whose whole glyph cell doesn't
  * fit within [clip_x0, clip_x1) — used for the scrolling browse title
@@ -455,9 +513,12 @@ static int text_width(FBDev *fb, const char *s, int scale) { return (int)strlen(
 static void draw_text_clipped(FBDev *fb, int x, int y, const char *s, int scale,
                                uint8_t r, uint8_t g, uint8_t b, int clip_x0, int clip_x1)
 {
-    for (; *s; s++, x += 8 * scale)
+    while (*s) {
+        unsigned cp = utf8_cp(&s);
         if (x >= clip_x0 && x + 8 * scale <= clip_x1)
-            draw_char(fb, x, y, (unsigned char)*s, scale, r, g, b);
+            draw_char(fb, x, y, cp, scale, r, g, b);
+        x += 8 * scale;
+    }
 }
 
 /* Truncates s in-place (with a trailing "...") so it fits within max_w
@@ -466,10 +527,11 @@ static void draw_text_clipped(FBDev *fb, int x, int y, const char *s, int scale,
 static void truncate_to_width(FBDev *fb, char *s, int scale, int max_w)
 {
     int max_chars = max_w / (8 * font_scale_x(fb, scale));
-    int len = (int)strlen(s);
-    if (len <= max_chars) return;
-    if (max_chars > 3) { s[max_chars - 3] = '\0'; strcat(s, "..."); }
-    else if (max_chars > 0) s[max_chars] = '\0';
+    if (max_chars < 1) { s[0] = '\0'; return; }
+    int n = 0; { const char *p = s; while (*p) { utf8_cp(&p); n++; } }
+    if (n <= max_chars) return;
+    if (max_chars > 3) { truncate_cp(s, max_chars - 3); strcat(s, "..."); }
+    else               { truncate_cp(s, max_chars); }
 }
 
 static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
@@ -479,7 +541,8 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
     int cols    = max_w / (8 * font_scale_x(fb, scale));
     int line_h  = 8 * scale + 2;
     char line[256] = {0};
-    int  li         = 0;
+    int  li         = 0;   /* bytes in `line` */
+    int  lcols      = 0;   /* display columns in `line` */
     int  drawn      = 0;
     const char *p   = text;
 
@@ -488,18 +551,19 @@ static int draw_wrapped(FBDev *fb, int x, int y, const char *text,
         if (!*p) break;
         const char *we = p;
         while (*we && *we != ' ') we++;
-        int wlen = (int)(we - p);
-        if (li > 0 && li + 1 + wlen > cols) {
+        int wlen  = (int)(we - p);
+        int wcols = cp_count(p, wlen);
+        if (lcols > 0 && lcols + 1 + wcols > cols) {
             int is_last = (drawn == max_lines - 1);
             if (is_last && *we) {
-                if (li > cols - 3) li = cols - 3;
-                strcpy(line + li, "...");
+                if (lcols > cols - 3) truncate_cp(line, cols - 3 > 0 ? cols - 3 : 0);
+                strcat(line, "...");
             }
             draw_text(fb, x, y + drawn * line_h, line, scale, r, g, b);
-            drawn++; li = 0; memset(line, 0, sizeof(line));
+            drawn++; li = 0; lcols = 0; memset(line, 0, sizeof(line));
         }
-        if (li > 0 && li < (int)sizeof(line) - 2) line[li++] = ' ';
-        if (li + wlen < (int)sizeof(line) - 1) { memcpy(line+li, p, wlen); li += wlen; }
+        if (lcols > 0 && li < (int)sizeof(line) - 2) { line[li++] = ' '; lcols++; }
+        if (li + wlen < (int)sizeof(line) - 1) { memcpy(line+li, p, wlen); li += wlen; lcols += wcols; }
         p = we;
     }
     if (li > 0 && drawn < max_lines) {
@@ -1181,15 +1245,24 @@ static int    g_confirm_exit = 0;
 static int    g_shuffle_mode = 0;
 /* Now-playing background effect, cycled by SELECT (see the
  * STATE_PLAYING_AUDIO input handling) — 0 = starfield, 1 = rain,
- * 2 = Toasty Squadron sprites (see draw_toasty). Persists for the whole
- * app session, same as g_root_list_mode. */
-#define NOW_PLAYING_BG_COUNT 3
+ * 2 = Nebula, our audio-reactive plasma visualizer (see draw_nebula), 3 =
+ * Toasty Squadron sprites (see draw_toasty). Persists for the whole app
+ * session, same as g_root_list_mode. Index 2 (Nebula) is an immersive mode: it hides
+ * the clock/title/timeline/VU and just shows an enlarged centered cover over
+ * the effect (see draw_now_playing). */
+#define NOW_PLAYING_BG_COUNT 4
+#define NOW_PLAYING_BG_NEBULA  2
 static int    g_now_playing_bg = 0;
-static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Toasty Squadron" };
+static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "Toasty Squadron" };
 /* Label shows briefly on change then disappears, rather than sitting on
  * screen permanently — set to now_sec()+1.5 wherever g_now_playing_bg
  * changes (see the STATE_PLAYING_AUDIO SELECT handling), 0 = not shown. */
 static double g_now_playing_bg_shown_until = 0.0;
+/* In the immersive backgrounds (Nebula/Toasty) the track title is otherwise
+ * hidden, so on each track change it's flashed at the top for a few seconds
+ * then disappears — set to now_sec()+N wherever a new track starts playing
+ * (see play_audio), 0 = not shown. */
+static double g_np_title_shown_until = 0.0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
@@ -1212,6 +1285,15 @@ static uint8_t *load_image_tmp(const char *tmp_path, int *w, int *h)
     uint8_t *px = stbi_load(tmp_path, w, h, &channels, 4);
     unlink(tmp_path);
     return px;
+}
+
+/* Like load_image_tmp but KEEPS the file — for reading a persistent cache
+ * file off the SD card (the cover cache), where deleting it would defeat the
+ * whole point. */
+static uint8_t *load_image_keep(const char *path, int *w, int *h)
+{
+    int channels = 0;
+    return stbi_load(path, w, h, &channels, 4);
 }
 
 static void info_assets_free(void)
@@ -1513,9 +1595,16 @@ static int fetch_frame_window(int start_index)
     return 1;
 }
 
+/* Bumped every time the browse frame's item list changes, so an in-flight
+ * cover prefetch for the previous list stops instead of caching covers no
+ * longer on screen. */
+static volatile int g_cover_gen = 0;
+static void start_cover_prefetch(void);   /* defined with the cover cache below */
+
 static void fetch_frame(void)
 {
     fetch_frame_window(0);
+    g_cover_gen++;                 /* invalidate any prefetch for the old list */
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
     g_sel = 0; g_scroll = 0;
     /* Returning to the root screen (B all the way back out of a library)
@@ -1530,6 +1619,10 @@ static void fetch_frame(void)
         if (g_sel >= g_item_count) g_sel = g_item_count - 1;
         if (g_sel < 0) g_sel = 0;
     }
+
+    /* Fill the SD cover cache for this list in the background so scrolling
+     * reads covers off the card, never off the network. */
+    start_cover_prefetch();
 }
 
 static void push_frame(FrameKind kind, const char *title,
@@ -1763,6 +1856,183 @@ static void draw_rain(FBDev *fb)
         fb_fill_rect_alpha(fb, sx, sy,     1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 255);
         fb_fill_rect_alpha(fb, sx, sy - 2, 1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 140);
         fb_fill_rect_alpha(fb, sx, sy - 4, 1, 1, (uint8_t)(b*0.7f), (uint8_t)(b*0.8f), b, 70);
+    }
+}
+
+/* Now-playing background effect #2 (index NOW_PLAYING_BG_NEBULA) — "Nebula",
+ * our own audio-reactive plasma visualizer. It's an ORIGINAL effect written
+ * from scratch, inspired by Ryan Geiss's classic feedback visualizer but not
+ * a port of any of his code — so it carries no third-party licensing.
+ *
+ * How it works, and why it's cheap enough for a Cortex-A9 at ~60fps:
+ *  - A small NEBULA_W x NEBULA_H intensity field is kept between frames. Each
+ *    frame it's resampled through a gentle zoom + slow rotation and decayed
+ *    a little — that feedback is what turns injected shapes into flowing
+ *    plasma trails (the Geiss signature).
+ *  - The live PCM (samples: n int16s, left half then right half — see
+ *    read_af_samples) is injected as a bright centered scope line, and its
+ *    energy speeds up the swirl and palette so the whole thing reacts to
+ *    the music.
+ *  - The field maps through a time-cycling palette and is nearest-neighbour
+ *    upscaled to the framebuffer via precomputed x/y maps (no per-pixel
+ *    divide in the hot loop). All the per-pixel cost is one field this small
+ *    plus one full-screen palette lookup. */
+#define NEBULA_W     160
+#define NEBULA_H      90
+#define NEBULA_MAXW  720
+#define NEBULA_MAXH  576
+#define NEBULA_NATTR   1   /* one gentle "circular attractor" — see the warp loop */
+
+static uint8_t  nebula_buf[2][NEBULA_W * NEBULA_H];
+static int      nebula_cur = 0;
+static double   nebula_pal_phase = 0.0;
+static double   nebula_hue = 0.0;   /* eased toward the current 15s scheme */
+static double   nebula_swirl = 0.0;
+static double   nebula_t = 0.0;   /* attractor-motion clock */
+static int      nebula_xmap[NEBULA_MAXW], nebula_ymap[NEBULA_MAXH];
+static int      nebula_map_w = 0, nebula_map_h = 0;
+
+static void draw_nebula(FBDev *fb, const int16_t *samples, int n)
+{
+    if (fb->width > NEBULA_MAXW || fb->height > NEBULA_MAXH) return;   /* OOB guard */
+
+    if (nebula_map_w != fb->width) {
+        for (int x = 0; x < fb->width; x++) nebula_xmap[x] = x * NEBULA_W / fb->width;
+        nebula_map_w = fb->width;
+    }
+    if (nebula_map_h != fb->height) {
+        for (int y = 0; y < fb->height; y++) nebula_ymap[y] = (y * NEBULA_H / fb->height) * NEBULA_W;
+        nebula_map_h = fb->height;
+    }
+
+    uint8_t *prev = nebula_buf[nebula_cur];
+    uint8_t *next = nebula_buf[nebula_cur ^ 1];
+    nebula_cur ^= 1;
+
+    /* Mean-abs of this frame's left channel, normalized to 0..1. */
+    int half = n / 2;
+    double energy = 0.0;
+    for (int i = 0; i < half; i++) { int s = samples[i]; energy += s < 0 ? -s : s; }
+    if (half > 0) energy /= (double)half * 32768.0;
+    if (energy > 1.0) energy = 1.0;
+
+    /* Feedback resample: zoom + slow rotation, both breathing with the audio,
+     * then decay. */
+    /* Global motion: gentle zoom + slow rotation, both breathing with the
+     * audio. */
+    nebula_swirl += 0.010 + energy * 0.05;
+    double theta = 0.022 * sin(nebula_swirl);
+    double zoom  = 1.0 - (0.010 + energy * 0.018);   /* <1 => content flows */
+    double ct = cos(theta) / zoom, st = sin(theta) / zoom;
+    double cx = NEBULA_W / 2.0, cy = NEBULA_H / 2.0;
+    unsigned decay = 243;   /* /256 per frame */
+
+    /* On top of the global spin, one gentle "circular attractor" drifting
+     * behind the cover adds a small bounded radial pull + tangential swirl to
+     * where the feedback is sampled — just enough to curl the waveform,
+     * deliberately weak so it doesn't suck the whole image into a whirlpool.
+     * Louder audio strengthens it a little. */
+    nebula_t += 0.006 + energy * 0.02;
+    static const double asw[NEBULA_NATTR] = { 0.26 };   /* swirl sign/strength */
+    double ax[NEBULA_NATTR], ay[NEBULA_NATTR], asr[NEBULA_NATTR];
+    for (int i = 0; i < NEBULA_NATTR; i++) {
+        /* Small drift around the centre so the single vortex sits behind the
+         * cover and stays gentle — a weak pull that curls the waveform a
+         * little rather than sucking it into a whirlpool. */
+        ax[i] = cx + (NEBULA_W * 0.10) * sin(nebula_t * 0.43);
+        ay[i] = cy + (NEBULA_H * 0.10) * cos(nebula_t * 0.37);
+        asr[i] = 12.0 + energy * 16.0;
+    }
+
+    for (int y = 0; y < NEBULA_H; y++) {
+        double dy = y - cy;
+        double bx = cx - dy * st;
+        double by = cy + dy * ct;
+        uint8_t *nrow = next + y * NEBULA_W;
+        for (int x = 0; x < NEBULA_W; x++) {
+            double dx = x - cx;
+            double fx = bx + dx * ct;
+            double fy = by + dx * st;
+            for (int i = 0; i < NEBULA_NATTR; i++) {
+                double rx = ax[i] - x, ry = ay[i] - y;
+                double fo = asr[i] / (rx * rx + ry * ry + 24.0);
+                fx += rx * fo + (-ry) * fo * asw[i];
+                fy += ry * fo + ( rx) * fo * asw[i];
+            }
+            int sx = (int)fx, sy = (int)fy;
+            uint8_t v = 0;
+            if ((unsigned)sx < (unsigned)NEBULA_W && (unsigned)sy < (unsigned)NEBULA_H)
+                v = prev[sy * NEBULA_W + sx];
+            nrow[x] = (uint8_t)((v * decay) >> 8);
+        }
+    }
+
+    /* Waveform injected additively so overlapping passes build up brightness
+     * and the feedback smears it into plasma over the following frames. */
+    if (half > 0) {
+        double amp = NEBULA_H * 0.40;
+        for (int x = 0; x < NEBULA_W; x++) {
+            int s  = samples[x * half / NEBULA_W];
+            int yy = (int)(cy + (double)s / 32768.0 * amp);
+            if ((unsigned)yy < (unsigned)NEBULA_H) {
+                uint8_t *c = &next[yy * NEBULA_W + x];
+                int t = *c + 170; *c = t > 255 ? 255 : (uint8_t)t;
+                if (yy > 0)           { uint8_t *u = c - NEBULA_W; int e = *u + 90; *u = e > 255 ? 255 : (uint8_t)e; }
+                if (yy < NEBULA_H - 1) { uint8_t *d = c + NEBULA_W; int e = *d + 90; *d = e > 255 ? 255 : (uint8_t)e; }
+            }
+        }
+    }
+
+    /* Colour scheme steps to a new hue family every ~15s (eased in, not an
+     * abrupt cut), with only a slow drift in between — calmer than a constant
+     * rainbow cycle. The golden-angle step keeps consecutive schemes well
+     * separated. Intensity 0 stays black. */
+    double target_hue = (double)((int)(now_sec() / 15.0)) * 2.39996;
+    nebula_hue += (target_hue - nebula_hue) * 0.05;
+    nebula_pal_phase += 0.0015 + energy * 0.010;   /* only a slow in-scheme drift */
+    uint32_t pal[256];
+    for (int i = 0; i < 256; i++) {
+        double t = i / 255.0;
+        /* Narrower hue spread across intensity (3.4 rad, not a full 2*pi) so a
+         * scheme has a dominant colour family rather than being a full
+         * rainbow — that's what makes the 15s hue step actually read as a
+         * colour change instead of just rotating the same rainbow. */
+        double base = nebula_hue + nebula_pal_phase + t * 3.4;
+        int r = (int)((0.5 + 0.5 * sin(base))           * t * 255.0);
+        int g = (int)((0.5 + 0.5 * sin(base + 2.09439)) * t * 255.0);
+        int b = (int)((0.5 + 0.5 * sin(base + 4.18879)) * t * 255.0);
+        pal[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+
+    /* Upscale to the framebuffer (nearest), one 32-bit store per pixel. */
+    for (int y = 0; y < fb->height; y++) {
+        int base = nebula_ymap[y];
+        uint32_t *row = (uint32_t *)(fb->back + (size_t)y * fb->stride);
+        for (int x = 0; x < fb->width; x++)
+            row[x] = pal[next[base + nebula_xmap[x]]];
+    }
+
+    /* A clean scope waveform painted straight onto the framebuffer AFTER the
+     * plasma — it does NOT feed the feedback field, so it stays crisp and
+     * always readable (the centered cover, blitted later by draw_now_playing,
+     * masks the middle, leaving this line visible over the plasma to either
+     * side). Continuous: each column fills the vertical span to the previous
+     * sample so it reads as a line, not dots. */
+    if (half > 0) {
+        int   midy = fb->height / 2;
+        double amp = fb->height * 0.30;
+        int prevy  = midy;
+        for (int x = 0; x < fb->width; x++) {
+            int s  = samples[x * half / fb->width];
+            int yy = midy + (int)((double)s / 32768.0 * amp);
+            if (yy < 0) yy = 0;
+            if (yy >= fb->height) yy = fb->height - 1;
+            int y0 = yy < prevy ? yy : prevy;
+            int y1 = yy < prevy ? prevy : yy;
+            for (int y = y0; y <= y1; y++)
+                *((uint32_t *)(fb->back + (size_t)y * fb->stride) + x) = 0x00E6F0FF;
+            prevy = yy;
+        }
     }
 }
 
@@ -2485,33 +2755,134 @@ static uint8_t *g_browse_cover_px = NULL;
 static int      g_browse_cover_w = 0, g_browse_cover_h = 0;
 static char     g_browse_cover_item_id[JF_ID_LEN] = "";
 
-/* Loads the currently-selected row's cover into the top-right panel, only
- * re-fetching when the selection actually changed (draw_browse redraws on
- * every keypress, not just navigation). */
-static void browse_cover_sync(void)
+/* Cache-file path for one item's cover on the SD card. Keyed by item id plus
+ * a few chars of the image tag, so replacing the artwork server-side lands on
+ * a new filename rather than serving stale art. */
+static void cover_cache_path(const char *item_id, const char *tag, char *out, size_t outsz)
+{
+    char safe[JF_ID_LEN + 12];
+    size_t j = 0;
+    for (size_t i = 0; item_id[i] && j < JF_ID_LEN; i++) {
+        char c = item_id[i];
+        safe[j++] = (isalnum((unsigned char)c) || c == '-') ? c : '_';
+    }
+    if (j < sizeof(safe) - 1) safe[j++] = '_';
+    for (size_t i = 0; tag[i] && i < 8 && j < sizeof(safe) - 1; i++) {
+        char c = tag[i];
+        safe[j++] = isalnum((unsigned char)c) ? c : '_';
+    }
+    safe[j] = '\0';
+    snprintf(out, outsz, COVER_CACHE_DIR "/%s.img", safe);
+}
+
+/* Downloads one cover into the SD cache if not already there. Downloads to a
+ * ".tmp" sibling IN THE CACHE DIR (so the rename into place stays within one
+ * filesystem — a /tmp->/media/fat rename fails with EXDEV) and renames it, so
+ * the main thread's browse_cover_load never reads a half-written file. */
+static void cover_fetch_to_cache(const char *image_item_id, const char *tag,
+                                  const char *item_id)
+{
+    if (!tag[0]) return;
+    char cpath[160];
+    cover_cache_path(item_id, tag, cpath, sizeof(cpath));
+    struct stat st;
+    if (stat(cpath, &st) == 0 && st.st_size > 0) return;   /* already cached */
+    mkdir(COVER_CACHE_DIR, 0755);   /* ensure the dir exists for tmp + final */
+    char tmp[176];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cpath);
+    if (jf_download_item_image(&g_cfg, image_item_id, "Primary", tag, 180, tmp)) {
+        if (rename(tmp, cpath) != 0) unlink(tmp);
+    } else {
+        unlink(tmp);
+    }
+}
+
+/* The item id whose cover the current selection wants, or "" if none. */
+static const char *browse_cover_wanted_id(void)
 {
     JfItem *it = (g_item_count > 0) ? &g_items[g_sel] : NULL;
-    int wants_cover = it && it->image_tag[0] &&
+    int wants = it && it->image_tag[0] &&
         (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE ||
          it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON ||
          it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM || it->type == JF_TYPE_TRACK);
+    return wants ? it->id : "";
+}
 
-    if (!wants_cover) {
-        if (g_browse_cover_item_id[0]) {
-            if (g_browse_cover_px) { stbi_image_free(g_browse_cover_px); g_browse_cover_px = NULL; }
-            g_browse_cover_w = g_browse_cover_h = 0;
-            g_browse_cover_item_id[0] = '\0';
-        }
-        return;
-    }
-    if (!strcmp(g_browse_cover_item_id, it->id)) return;   /* already loaded */
+/* Loads the selected row's cover into the top-right panel — from the SD cache
+ * ONLY, never the network. A cached cover shows instantly (no freeze, no
+ * blank); an as-yet-uncached one leaves the panel blank until the background
+ * prefetch (cover_prefetch_thread) writes it to the card, at which point the
+ * next browse redraw (~100ms, for the live clock/marquee) picks it up. So the
+ * main thread never blocks on a per-item download — that was the scroll
+ * freeze — and any list visited before shows every cover instantly. Stale art
+ * is dropped up front so an item with no cover never inherits the previous
+ * row's. */
+static void browse_cover_load(void)
+{
+    JfItem *it = (g_item_count > 0) ? &g_items[g_sel] : NULL;
+    const char *want = browse_cover_wanted_id();
+
+    if (g_browse_cover_px && strcmp(g_browse_cover_item_id, want) == 0) return;
 
     if (g_browse_cover_px) { stbi_image_free(g_browse_cover_px); g_browse_cover_px = NULL; }
     g_browse_cover_w = g_browse_cover_h = 0;
-    strncpy(g_browse_cover_item_id, it->id, sizeof(g_browse_cover_item_id) - 1);
+    g_browse_cover_item_id[0] = '\0';
+    if (want[0] == '\0') return;   /* this item has no cover */
 
-    if (jf_download_item_image(&g_cfg, it->image_item_id, "Primary", it->image_tag, 180, POSTER_TMP))
-        g_browse_cover_px = load_image_tmp(POSTER_TMP, &g_browse_cover_w, &g_browse_cover_h);
+    char cpath[160];
+    cover_cache_path(it->id, it->image_tag, cpath, sizeof(cpath));
+    int w = 0, h = 0;
+    uint8_t *px = load_image_keep(cpath, &w, &h);
+    if (!px) return;   /* not cached yet — blank; prefetch fills it, next redraw loads it */
+    g_browse_cover_px = px;
+    g_browse_cover_w = w; g_browse_cover_h = h;
+    strncpy(g_browse_cover_item_id, it->id, sizeof(g_browse_cover_item_id) - 1);
+    g_browse_cover_item_id[sizeof(g_browse_cover_item_id) - 1] = '\0';
+}
+
+/* Background fill of the SD cover cache for the current list, so scrolling
+ * reads covers off the card. Snapshots the item ids/tags (never touches
+ * g_items off-thread) and stops early if the list changed under it (g_cover_gen). */
+typedef struct {
+    int gen, n;
+    struct { char id[JF_ID_LEN], img_id[JF_ID_LEN], tag[JF_ID_LEN]; } items[JF_PAGE_SIZE];
+} CoverPrefetch;
+
+static void *cover_prefetch_thread(void *arg)
+{
+    CoverPrefetch *cp = (CoverPrefetch *)arg;
+    for (int i = 0; i < cp->n; i++) {
+        if (g_cover_gen != cp->gen) break;   /* navigated away — stop */
+        cover_fetch_to_cache(cp->items[i].img_id, cp->items[i].tag, cp->items[i].id);
+    }
+    free(cp);
+    return NULL;
+}
+
+static void start_cover_prefetch(void)
+{
+    CoverPrefetch *cp = malloc(sizeof(*cp));
+    if (!cp) return;
+    cp->gen = g_cover_gen;
+    cp->n = 0;
+    for (int i = 0; i < g_item_count && cp->n < JF_PAGE_SIZE; i++) {
+        JfItem *it = &g_items[i];
+        int wants = it->image_tag[0] &&
+            (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_EPISODE ||
+             it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON ||
+             it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM || it->type == JF_TYPE_TRACK);
+        if (!wants) continue;
+        snprintf(cp->items[cp->n].id,     JF_ID_LEN, "%s", it->id);
+        snprintf(cp->items[cp->n].img_id, JF_ID_LEN, "%s", it->image_item_id);
+        snprintf(cp->items[cp->n].tag,    JF_ID_LEN, "%s", it->image_tag);
+        cp->n++;
+    }
+    if (cp->n == 0) { free(cp); return; }
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, cover_prefetch_thread, cp) != 0) free(cp);
+    pthread_attr_destroy(&at);
 }
 
 /* Clock (right-aligned, stopping short of the spinner's reserved corner —
@@ -3076,7 +3447,7 @@ static void draw_browse(FBDev *fb)
     BrowseFrame *f = &g_stack[g_stack_depth - 1];
     if (f->kind == FRAME_VIEWS && !g_root_list_mode) { draw_browse_carousel(fb); return; }
 
-    browse_cover_sync();
+    browse_cover_load();
 
     fb_clear(fb);
 
@@ -3503,6 +3874,39 @@ static int     g_paused          = 0;
 static double  g_pause_wall      = 0.0;
 static char    g_play_session_id[64];
 static double  g_last_progress_report = 0.0;
+
+/* Playback progress is fire-and-forget (the result is never read), but the
+ * curl round-trip is blocking — running it on the main thread froze the
+ * now-playing animation for its duration every PROGRESS_REPORT_INTERVAL (and
+ * stuttered menu redraws). It's invisible during video only because mplayer
+ * owns the picture there. Fire it on a detached thread instead. The args are
+ * COPIED into a heap struct: the main thread may start the next track
+ * (regenerating g_play_session_id / overwriting g_items) before this thread
+ * runs, so it must not read those globals. jellyfin.c's request path forks
+ * its own curl with stack-local buffers, so a concurrent caller is safe —
+ * same as the grid-prefetch thread. */
+typedef struct { char item_id[JF_ID_LEN]; char session[64]; int64_t pos; int paused; } ProgressJob;
+static void *progress_report_thread(void *arg)
+{
+    ProgressJob *j = (ProgressJob *)arg;
+    jf_report_progress(&g_cfg, j->item_id, j->session, j->pos, j->paused);
+    free(j);
+    return NULL;
+}
+static void report_progress_async(const char *item_id, const char *session,
+                                   int64_t pos, int paused)
+{
+    ProgressJob *j = malloc(sizeof(*j));
+    if (!j) return;   /* skip one report rather than block the UI */
+    snprintf(j->item_id, sizeof(j->item_id), "%s", item_id);
+    snprintf(j->session, sizeof(j->session), "%s", session);
+    j->pos = pos; j->paused = paused;
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, progress_report_thread, j) != 0) free(j);
+    pthread_attr_destroy(&at);
+}
 /* -1 = off, otherwise JfSubtitle.index of the loaded/active track. Text
  * tracks are rendered client-side by mplayer (sub_load/sub_select — see
  * subtitle_load_client()) and don't need a restart; image-based tracks
@@ -4309,6 +4713,13 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                 * (fb->height - 8 - SAFE_Y_BOT, ~90% at the 288-tall PAL
                 * output) per user request, after confirming 88 read as too
                 * high up. */
+               /* The sanitized .srt we write is UTF-8 (jf_text_to_display now
+                * keeps Latin-1 accents rather than folding them). -utf8 tells
+                * mplayer to decode it as UTF-8 and look each code point up in
+                * the subtitle font, which now carries U+00A0-U+00FF glyphs
+                * (see gen_subfont.py) — so accented subtitles render instead
+                * of dropping the accented characters. */
+               "-utf8",
                "-subfont", "/media/fat/misterfin/subfont/font.desc",
                "-subwidth", "90",
                "-subpos", "92",
@@ -4361,6 +4772,7 @@ static void play_audio(FBDev *fb, int queue_pos)
     JfItem *it = &g_items[queue_pos];
     g_audio_queue_pos = queue_pos;
     g_vu_level_l = g_vu_level_r = 0.0;
+    g_np_title_shown_until = now_sec() + 5.0;   /* flash the new title in immersive mode */
 
     unlink(AF_EXPORT_PATH);   /* don't let the visualizer read a stale previous track's data */
 
@@ -4486,16 +4898,63 @@ static void draw_vu_horizontal(FBDev *fb, const int16_t *samples, int count,
 static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 {
     fb_clear(fb);
+
+    /* Live PCM for the audio-reactive effect (Nebula) and the VU meters
+     * below — read once, up here, so the background pass can use it too.
+     * Not read while paused: decode has stopped, so the export file would
+     * just return stale pre-pause samples (a frozen meter, per user
+     * feedback) instead of settling to empty. */
+    int16_t af_buf[4096];
+    int af_n = g_paused ? 0 : read_af_samples(af_buf, 4096);
+
+    int nebula = (g_now_playing_bg == NOW_PLAYING_BG_NEBULA);
+    /* Both Nebula and Toasty Squadron use the immersive layout — just the
+     * enlarged centered cover over the effect plus the bottom hint bar
+     * (Toasty's sprites still fly over the top, see draw_toasty_fg below). */
+    int immersive = nebula || (g_now_playing_bg == 3);
+
     if      (g_now_playing_bg == 1) draw_rain(fb);
-    else if (g_now_playing_bg == 2) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
+    else if (nebula)                 draw_nebula(fb, af_buf, af_n);
+    else if (g_now_playing_bg == 3) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
     else                            draw_starfield(fb);
 
-    draw_clock(fb);
-
+    /* The brief "which background" label on SELECT is shown in every mode
+     * (that's how the cycle stays legible); the clock and PAUSED marker are
+     * hidden in the immersive modes, which keep only the cover + hints. */
     if (now_sec() < g_now_playing_bg_shown_until)
         draw_text(fb, SAFE_X, SAFE_Y, NOW_PLAYING_BG_NAMES[g_now_playing_bg], 1, COL_HINT);
-    if (g_paused)
-        draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
+    /* In the immersive modes the title is otherwise hidden, so flash it at the
+     * top for a few seconds on each track change (see g_np_title_shown_until,
+     * set in play_audio). Nudged down a line if the bg-name label happens to
+     * be up at the same moment so the two don't overlap. */
+    if (immersive && now_sec() < g_np_title_shown_until) {
+        int ty0 = (now_sec() < g_now_playing_bg_shown_until) ? SAFE_Y + 12 : SAFE_Y;
+        char tflash[300];
+        snprintf(tflash, sizeof(tflash), "%s", it->name);
+        truncate_to_width(fb, tflash, 1, fb->width - 2 * SAFE_X);
+        draw_text(fb, SAFE_X, ty0, tflash, 1, COL_TITLE);
+    }
+    if (!immersive) {
+        draw_clock(fb);
+        if (g_paused)
+            draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
+    }
+
+    if (immersive) {
+        /* Immersive mode: enlarged cover centered in the screen over the
+         * effect, and nothing else but the shared hint bar below. Seeking
+         * still works (L/R input untouched) — only its timeline readout is
+         * hidden. */
+        if (g_nowplaying_cover_px) {
+            int top    = (fb->height == 288) ? SAFE_Y : 2;
+            int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
+            int box_h  = bottom - top;
+            int box_w  = (fb->height == 288) ? box_h : (int)(box_h * par_correction(fb) + 0.5);
+            blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
+                               fb->width / 2, (top + bottom) / 2, box_w, box_h, 255);
+        }
+        goto np_hint;
+    }
 
     /* cover_max is solved from the space actually available down to the
      * hint bar, then capped at 165 (the original PAL-tuned size) so this is
@@ -4546,12 +5005,6 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
                            fb->width / 2, cy, cover_max_w, cover_disp_h, 255);
     }
 
-    int16_t af_buf[4096];
-    /* Don't read the export file while paused — decode has stopped, so it
-     * would just keep returning the same stale pre-pause samples, reading
-     * as a frozen meter (user feedback) instead of settling to empty. */
-    int af_n = g_paused ? 0 : read_af_samples(af_buf, 4096);
-
     int ty = cover_top + cover_max - 3;
     draw_text(fb, (fb->width - text_width(fb, it->name, 1)) / 2, ty, it->name, 1, COL_TITLE);
     ty += 10;
@@ -4581,17 +5034,20 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     ty += vu_h + vu_gap;
     draw_vu_horizontal(fb, af_buf + af_n / 2, af_n - af_n / 2, SAFE_X, ty, vu_w, vu_h, &g_vu_level_r);
 
+np_hint:
     /* Hint line stays at the SAME height as every other screen's hint row
      * (fb->height - 8 - SAFE_Y_BOT) — everything above it got tightened/
      * moved up instead, per user feedback that this must stay consistent. */
+    {
     const char *hint = g_paused ? "B:resume  L/R:seek  U/D:prev/next  SELECT:bg  A:stop"
                                  : "B:pause  L/R:seek  U/D:prev/next  SELECT:bg  A:stop";
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+    }
 
     /* Mega-tier Toasty sprites fly over everything above — see
      * draw_toasty_fg()'s own comment. */
-    if (g_now_playing_bg == 2) draw_toasty_fg(fb);
+    if (g_now_playing_bg == 3) draw_toasty_fg(fb);
 
     fb_flip(fb);
 }
@@ -5338,8 +5794,8 @@ int main(int argc, char **argv)
 
                 if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
                     g_last_progress_report = loop_now;
-                    jf_report_progress(&g_cfg, g_info_item.id, g_play_session_id,
-                                        (int64_t)(play_position() * 10000000.0), 0);
+                    report_progress_async(g_info_item.id, g_play_session_id,
+                                          (int64_t)(play_position() * 10000000.0), 0);
                 }
             }
             break;
@@ -5430,7 +5886,7 @@ int main(int argc, char **argv)
             } else if (inp & INP_SELECT) {
                 g_now_playing_bg = (g_now_playing_bg + 1) % NOW_PLAYING_BG_COUNT;
                 g_now_playing_bg_shown_until = now_sec() + 1.5;
-                if (g_now_playing_bg == 2 && !g_toasty_loaded) {
+                if (g_now_playing_bg == 3 && !g_toasty_loaded) {
                     /* Draw one full frame first — cover/title/timeline/VU/
                      * hint all render normally, background stays plain
                      * black since draw_toasty_bg() no-ops until loaded —
@@ -5442,8 +5898,8 @@ int main(int argc, char **argv)
                 }
             } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
                 g_last_progress_report = loop_now;
-                jf_report_progress(&g_cfg, cur->id, g_play_session_id,
-                                    (int64_t)(play_position() * 10000000.0), g_paused);
+                report_progress_async(cur->id, g_play_session_id,
+                                      (int64_t)(play_position() * 10000000.0), g_paused);
             }
             draw_now_playing(&fb, &g_items[g_audio_queue_pos], play_position());
             break;

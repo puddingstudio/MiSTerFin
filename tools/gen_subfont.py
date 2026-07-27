@@ -18,9 +18,11 @@ Run from project root: python3 tools/gen_subfont.py
 
 import re, struct, os
 
-FIRST     = 0x20   # space
-LAST      = 0x7E   # tilde
-NUM_CHARS = LAST - FIRST + 1   # 95
+# ASCII printable + Latin-1 Supplement (accented Latin, U+00A0-U+00FF), so
+# subtitles show accents instead of missing glyphs — matches the two ranges
+# the on-screen UI font now covers (src/font8x8.h: basic + ext_latin).
+CODES     = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))
+NUM_CHARS = len(CODES)   # 95 + 96 = 191
 
 SUPERSAMPLE  = 8          # internal render scale before downsampling
 TARGET_H     = 13         # final glyph height in px (vs. 16px for the OSD font)
@@ -45,13 +47,21 @@ IMG_H = TARGET_H
 def parse_font8x8(path):
     with open(path) as f:
         text = f.read()
-    entries = re.findall(r'\{((?:0x[0-9a-fA-F]+,?\s*){8})\}', text)
+    entries = re.findall(r'\{\s*((?:0x[0-9a-fA-F]+,?\s*){8})\}', text)
     font = []
     for e in entries:
         vals = [int(v, 16) for v in re.findall(r'0x[0-9a-fA-F]+', e)]
         font.append(vals)
-    assert len(font) == 128, f"Expected 128 glyphs, got {len(font)}"
+    # font8x8.h now holds font8x8_basic (128, U+0000-U+007F) followed by
+    # font8x8_ext_latin (96, U+00A0-U+00FF).
+    assert len(font) == 224, f"Expected 224 glyphs (128 basic + 96 ext_latin), got {len(font)}"
     return font
+
+def glyph_for_code(font, code):
+    """Map a Unicode code point to its glyph row in the parsed font8x8.h."""
+    if code < 0x80:
+        return font[code]
+    return font[128 + (code - 0xA0)]   # ext_latin block: index 128 == U+00A0
 
 def make_raw(pixels, w, h):
     """Encode pixel array as mhwanh indexed raw file (same format gen_font.py uses)."""
@@ -120,8 +130,8 @@ def render(font):
     # background pixels are left at the bytearray default of 0/0
     # (untouched). Match that here: only write alpha/bitmap for foreground
     # (coverage-thresholded) pixels.
-    for ci, code in enumerate(range(FIRST, LAST + 1)):
-        glyph  = font[code]
+    for ci, code in enumerate(CODES):
+        glyph  = glyph_for_code(font, code)
         cov    = glyph_coverage(glyph)
         x_base = ci * TARGET_W
         for gy in range(TARGET_H):
@@ -148,7 +158,7 @@ def make_desc():
         "",
         "[characters]",
     ]
-    for ci, code in enumerate(range(FIRST, LAST + 1)):
+    for ci, code in enumerate(CODES):
         start = ci * TARGET_W
         end   = start + TARGET_W - 1
         lines.append(f"{code} {start} {end}")

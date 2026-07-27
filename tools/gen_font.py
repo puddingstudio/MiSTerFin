@@ -13,9 +13,10 @@ Run from project root: python3 tools/gen_font.py
 import re, struct, os, sys
 
 SCALE     = 2
-FIRST     = 0x20   # space
-LAST      = 0x7E   # tilde
-NUM_CHARS = LAST - FIRST + 1   # 95
+# ASCII printable + Latin-1 Supplement (accented Latin, U+00A0-U+00FF) so
+# the OSD font matches the UI/subtitle coverage (src/font8x8.h basic + ext_latin).
+CODES     = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))
+NUM_CHARS = len(CODES)   # 95 + 96 = 191
 CHAR_W    = 8 * SCALE          # 16 px wide per glyph
 CHAR_H    = 8 * SCALE          # 16 px tall per glyph
 IMG_W     = NUM_CHARS * CHAR_W # 1520 px total width
@@ -30,13 +31,18 @@ OUTDIR = os.path.join(ROOT, "assets", "font")
 def parse_font8x8(path):
     with open(path) as f:
         text = f.read()
-    entries = re.findall(r'\{((?:0x[0-9a-fA-F]+,?\s*){8})\}', text)
+    entries = re.findall(r'\{\s*((?:0x[0-9a-fA-F]+,?\s*){8})\}', text)
     font = []
     for e in entries:
         vals = [int(v, 16) for v in re.findall(r'0x[0-9a-fA-F]+', e)]
         font.append(vals)
-    assert len(font) == 128, f"Expected 128 glyphs, got {len(font)}"
+    assert len(font) == 224, f"Expected 224 glyphs (128 basic + 96 ext_latin), got {len(font)}"
     return font
+
+def glyph_for_code(font, code):
+    if code < 0x80:
+        return font[code]
+    return font[128 + (code - 0xA0)]   # ext_latin block: index 128 == U+00A0
 
 def make_raw(pixels, w, h):
     """Encode pixel array as mhwanh indexed raw file."""
@@ -64,8 +70,8 @@ def render(font):
     alpha  = bytearray(IMG_W * IMG_H)   # default 0 = transparent (skip draw)
     bitmap = bytearray(IMG_W * IMG_H)   # default 0 (won't be drawn anyway)
 
-    for ci, code in enumerate(range(FIRST, LAST + 1)):
-        glyph  = font[code]      # 8 bytes, one per row, LSB-first
+    for ci, code in enumerate(CODES):
+        glyph  = glyph_for_code(font, code)   # 8 bytes, one per row, LSB-first
         x_base = ci * CHAR_W
 
         for row in range(8):
@@ -102,7 +108,7 @@ def make_desc():
         "",
         "[characters]",
     ]
-    for ci, code in enumerate(range(FIRST, LAST + 1)):
+    for ci, code in enumerate(CODES):
         start = ci * CHAR_W
         end   = start + CHAR_W - 1
         lines.append(f"{code} {start} {end}")

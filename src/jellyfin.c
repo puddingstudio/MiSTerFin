@@ -48,9 +48,11 @@ static void jf_sanitize_id(const char *in, char *out, int outlen)
 
 /* ── text for an ASCII-only display ──────────────────────────────────────── */
 
-/* Folds UTF-8 down to the ASCII the on-screen bitmap font can actually draw
- * (src/font8x8.h covers 0x00-0x7F and nothing else; draw_char turns anything
- * above that into '?').
+/* Normalises UTF-8 for the on-screen bitmap font. The font now covers ASCII
+ * (0x00-0x7F) AND Latin-1 (0x00A0-0x00FF, see font8x8_ext_latin), so accented
+ * Latin is kept as-is; only code points beyond that (Latin Extended-A, CJK,
+ * Cyrillic, exotic punctuation) are folded to an ASCII approximation or a
+ * single '?'.
  *
  * This became necessary the moment escapes were decoded properly. Jellyfin
  * escapes every non-ASCII character as \uXXXX, and the old scanner emitted
@@ -155,6 +157,18 @@ void jf_text_to_display(const char *utf8, char *out, int outlen)
             /* Newlines inside an overview would break single-line layout;
              * the previous implementation flattened them to spaces too. */
             out[pos++] = (cp == '\n' || cp == '\r' || cp == '\t') ? ' ' : (char)cp;
+            last_was_unknown = 0;
+            continue;
+        }
+
+        if (cp >= 0xA0 && cp <= 0xFF) {
+            /* The on-screen font now has Latin-1 glyphs (font8x8_ext_latin),
+             * so keep these as real UTF-8 instead of folding to bare ASCII —
+             * "Ressurreição" stays "Ressurreição", not "Ressurreicao". */
+            if (pos < outlen - 2) {
+                out[pos++] = (char)(0xC0 | (cp >> 6));
+                out[pos++] = (char)(0x80 | (cp & 0x3F));
+            }
             last_was_unknown = 0;
             continue;
         }
