@@ -213,16 +213,41 @@ static int update_tag_is_sane(const char *tag)
  * this path decides which binary gets written over misterfin-arm and run at
  * next launch, so accepting a substituted response is accepting a substituted
  * executable. No amount of quoting downstream fixes that. */
+/* curl on the stock MiSTer image has no working default CA path — verifying
+ * github fails with "unable to get local issuer certificate" even though a
+ * perfectly good CA bundle ships in the image, curl just doesn't look there.
+ * Point --cacert at the first bundle that exists so TLS verification stays ON
+ * (the whole reason the updater dropped -k) instead of silently failing every
+ * update check on real hardware. Returns NULL only if none is found. */
+static const char *ca_bundle_path(void)
+{
+    static const char *const cands[] = {
+        "/etc/ssl/certs/cacert.pem",
+        "/etc/ssl/cert.pem",
+        "/usr/lib/python3.9/site-packages/certifi/cacert.pem",
+        NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        struct stat st;
+        if (stat(cands[i], &st) == 0 && st.st_size > 0) return cands[i];
+    }
+    return NULL;
+}
+
 static void *update_check_thread(void *arg)
 {
     (void)arg;
 
-    char *const argv[] = {
-        (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
-        (char *)"--tlsv1.2", (char *)"--max-time", (char *)"8",
-        (char *)"https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest",
-        NULL
-    };
+    const char *ca = ca_bundle_path();
+    char *argv[16];
+    int n = 0;
+    argv[n++] = (char *)"curl";     argv[n++] = (char *)"-fsSL";
+    argv[n++] = (char *)"--proto";  argv[n++] = (char *)"=https";
+    argv[n++] = (char *)"--tlsv1.2";
+    if (ca) { argv[n++] = (char *)"--cacert"; argv[n++] = (char *)ca; }
+    argv[n++] = (char *)"--max-time"; argv[n++] = (char *)"8";
+    argv[n++] = (char *)"https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest";
+    argv[n] = NULL;
 
     char buf[8192];
     if (!run_no_shell(argv, buf, sizeof(buf))) goto fail;
@@ -287,11 +312,16 @@ static void *install_thread(void *arg)
              tag, tag);
 
     {
-        char *const argv[] = {
-            (char *)"curl", (char *)"-fsSL", (char *)"--proto", (char *)"=https",
-            (char *)"--tlsv1.2", (char *)"--max-time", (char *)"120",
-            url, (char *)"-o", (char *)"/tmp/misterfin-update.zip", NULL
-        };
+        const char *ca = ca_bundle_path();
+        char *argv[16];
+        int n = 0;
+        argv[n++] = (char *)"curl";     argv[n++] = (char *)"-fsSL";
+        argv[n++] = (char *)"--proto";  argv[n++] = (char *)"=https";
+        argv[n++] = (char *)"--tlsv1.2";
+        if (ca) { argv[n++] = (char *)"--cacert"; argv[n++] = (char *)ca; }
+        argv[n++] = (char *)"--max-time"; argv[n++] = (char *)"120";
+        argv[n++] = url; argv[n++] = (char *)"-o"; argv[n++] = (char *)"/tmp/misterfin-update.zip";
+        argv[n] = NULL;
         if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
     }
 
