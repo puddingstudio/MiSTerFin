@@ -25,7 +25,18 @@ CODES     = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))
 NUM_CHARS = len(CODES)   # 95 + 96 = 191
 
 SUPERSAMPLE  = 8          # internal render scale before downsampling
-TARGET_H     = 13         # final glyph height in px (vs. 16px for the OSD font)
+# Two atlases: 13px for the progressive 288/240-line framebuffers, and 16px
+# (an exact 2x of the 8x8 glyphs — integer scaling keeps every stroke the
+# same thickness, unlike 13px's mixed 1px/2px strokes) for the interlaced
+# full-frame 576/480-line modes, where mplayer renders in physical lines and
+# a 13px glyph would show up half-size and squashed. 24px (3x) was tried
+# first and read as too large on a real CRT.
+# Third field: line advance ("height" in font.desc) — the 2x atlas gets 3px
+# of extra leading between subtitle rows (reported as sitting too close at a
+# plain 16px advance on a real CRT); the progressive 13px atlas keeps its
+# long-shipped spacing untouched.
+TARGETS      = [(13, 13, "subfont"), (16, 19, "subfont2x")]
+TARGET_H     = 13         # set per-target in main()
 TARGET_W     = TARGET_H   # font8x8 glyphs are square
 COVER_THRESH = 128        # confirmed on hardware: mplayer's font renderer has no
                            # alpha blending — ANY nonzero alpha renders fully
@@ -41,6 +52,17 @@ OUTDIR = os.path.join(ROOT, "assets", "subfont")
 
 IMG_W = NUM_CHARS * TARGET_W
 IMG_H = TARGET_H
+
+LINE_H = 13
+
+def set_target(h, line_h, dirname):
+    global TARGET_H, TARGET_W, LINE_H, OUTDIR, IMG_W, IMG_H
+    TARGET_H = h
+    TARGET_W = h
+    LINE_H   = line_h
+    OUTDIR   = os.path.join(ROOT, "assets", dirname)
+    IMG_W    = NUM_CHARS * TARGET_W
+    IMG_H    = TARGET_H
 
 # ---------------------------------------------------------------------------
 
@@ -150,7 +172,7 @@ def make_desc():
         "name MiSTerFin-sub",
         f"spacewidth {TARGET_W}",
         "charspace 1",
-        f"height {TARGET_H}",
+        f"height {LINE_H}",
         "",
         "[files]",
         "alpha font-alpha.raw",
@@ -168,18 +190,20 @@ def make_desc():
 
 def main():
     font = parse_font8x8(SRC)
-    alpha, bitmap = render(font)
-    os.makedirs(OUTDIR, exist_ok=True)
+    for h, line_h, dirname in TARGETS:
+        set_target(h, line_h, dirname)
+        alpha, bitmap = render(font)
+        os.makedirs(OUTDIR, exist_ok=True)
 
-    with open(os.path.join(OUTDIR, "font.desc"), "w") as f:
-        f.write(make_desc())
-    with open(os.path.join(OUTDIR, "font-alpha.raw"), "wb") as f:
-        f.write(make_raw(alpha, IMG_W, IMG_H))
-    with open(os.path.join(OUTDIR, "font-bitmap.raw"), "wb") as f:
-        f.write(make_raw(bitmap, IMG_W, IMG_H))
+        with open(os.path.join(OUTDIR, "font.desc"), "w") as f:
+            f.write(make_desc())
+        with open(os.path.join(OUTDIR, "font-alpha.raw"), "wb") as f:
+            f.write(make_raw(alpha, IMG_W, IMG_H))
+        with open(os.path.join(OUTDIR, "font-bitmap.raw"), "wb") as f:
+            f.write(make_raw(bitmap, IMG_W, IMG_H))
 
-    print(f"Generated assets/subfont/ ({IMG_W}x{IMG_H} px, {NUM_CHARS} chars, "
-          f"{TARGET_H}px glyph height, {SUPERSAMPLE}x supersampled AA)")
+        print(f"Generated assets/{dirname}/ ({IMG_W}x{IMG_H} px, {NUM_CHARS} chars, "
+              f"{TARGET_H}px glyph height)")
 
 if __name__ == "__main__":
     main()

@@ -12,19 +12,42 @@ Run from project root: python3 tools/gen_font.py
 
 import re, struct, os, sys
 
-SCALE     = 2
-# ASCII printable + Latin-1 Supplement (accented Latin, U+00A0-U+00FF) so
-# the OSD font matches the UI/subtitle coverage (src/font8x8.h basic + ext_latin).
+# Two targets: the normal 2x (16x16, square — this platform's usual
+# non-square pixels happen to read fine at a plain uniform scale here,
+# established for a long time) glyph for progressive 288/240-line
+# framebuffers, and an ASYMMETRIC one for the interlaced full-frame
+# 576/480-line modes. mplayer draws its OSD (VSync/seek flash) straight
+# into the physical framebuffer, bypassing the app's own line-doubling
+# (that only applies to what the APP itself draws) — confirmed on hardware
+# in two steps: a uniform 4x read vertically squished (about half the
+# height it should be relative to the doubled physical raster), and a
+# uniform 3x read too WIDE/stretched once height was fixed — the doubled
+# vertical resolution alone (same physical screen, 2x the scanlines) makes
+# a uniformly-scaled square glyph visibly non-square here, unlike the
+# progressive resolutions. Scale width and height separately instead.
+TARGETS = [(2, 2, "font"), (2, 3, "font2x")]
+SCALE_X   = 2
+SCALE_Y   = 2
 CODES     = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))
 NUM_CHARS = len(CODES)   # 95 + 96 = 191
-CHAR_W    = 8 * SCALE          # 16 px wide per glyph
-CHAR_H    = 8 * SCALE          # 16 px tall per glyph
-IMG_W     = NUM_CHARS * CHAR_W # 1520 px total width
-IMG_H     = CHAR_H             # 16 px total height
+CHAR_W    = 8 * SCALE_X         # glyph width in px
+CHAR_H    = 8 * SCALE_Y         # glyph height in px
+IMG_W     = NUM_CHARS * CHAR_W  # total atlas width
+IMG_H     = CHAR_H              # total atlas height
 
 ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC    = os.path.join(ROOT, "src", "font8x8.h")
 OUTDIR = os.path.join(ROOT, "assets", "font")
+
+def set_target(scale_x, scale_y, dirname):
+    global SCALE_X, SCALE_Y, CHAR_W, CHAR_H, IMG_W, IMG_H, OUTDIR
+    SCALE_X = scale_x
+    SCALE_Y = scale_y
+    CHAR_W  = 8 * SCALE_X
+    CHAR_H  = 8 * SCALE_Y
+    IMG_W   = NUM_CHARS * CHAR_W
+    IMG_H   = CHAR_H
+    OUTDIR  = os.path.join(ROOT, "assets", dirname)
 
 # ---------------------------------------------------------------------------
 
@@ -79,10 +102,10 @@ def render(font):
             for col in range(8):
                 if not ((bits >> col) & 1):
                     continue
-                for dy in range(SCALE):
-                    for dx in range(SCALE):
-                        px = x_base + col * SCALE + dx
-                        py = row * SCALE + dy
+                for dy in range(SCALE_Y):
+                    for dx in range(SCALE_X):
+                        px = x_base + col * SCALE_X + dx
+                        py = row * SCALE_Y + dy
                         idx = py * IMG_W + px
                         # mplayer blend: dst_new = (video * srca >> 8) + src
                         # srca=0  → if(srca) is false → TRANSPARENT (skip)
@@ -118,22 +141,21 @@ def make_desc():
 
 def main():
     font = parse_font8x8(SRC)
-    alpha, bitmap = render(font)
-    os.makedirs(OUTDIR, exist_ok=True)
+    for scale_x, scale_y, dirname in TARGETS:
+        set_target(scale_x, scale_y, dirname)
+        alpha, bitmap = render(font)
+        os.makedirs(OUTDIR, exist_ok=True)
 
-    with open(os.path.join(OUTDIR, "font.desc"), "w") as f:
-        f.write(make_desc())
+        with open(os.path.join(OUTDIR, "font.desc"), "w") as f:
+            f.write(make_desc())
 
-    with open(os.path.join(OUTDIR, "font-alpha.raw"), "wb") as f:
-        f.write(make_raw(alpha, IMG_W, IMG_H))
+        with open(os.path.join(OUTDIR, "font-alpha.raw"), "wb") as f:
+            f.write(make_raw(alpha, IMG_W, IMG_H))
 
-    with open(os.path.join(OUTDIR, "font-bitmap.raw"), "wb") as f:
-        f.write(make_raw(bitmap, IMG_W, IMG_H))
+        with open(os.path.join(OUTDIR, "font-bitmap.raw"), "wb") as f:
+            f.write(make_raw(bitmap, IMG_W, IMG_H))
 
-    print(f"Generated assets/font/ ({IMG_W}x{IMG_H} px, {NUM_CHARS} chars, scale {SCALE}x)")
-    print(f"  font.desc       {os.path.getsize(os.path.join(OUTDIR, 'font.desc'))} B")
-    print(f"  font-alpha.raw  {os.path.getsize(os.path.join(OUTDIR, 'font-alpha.raw'))} B")
-    print(f"  font-bitmap.raw {os.path.getsize(os.path.join(OUTDIR, 'font-bitmap.raw'))} B")
+        print(f"Generated assets/{dirname}/ ({IMG_W}x{IMG_H} px, {NUM_CHARS} chars, scale {SCALE_X}x{SCALE_Y})")
 
 if __name__ == "__main__":
     main()

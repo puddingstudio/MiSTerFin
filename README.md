@@ -18,7 +18,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 - **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - **Info screen** with cover art, description, year, and status
 - **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
-- **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look. It needs experimental patched MiSTer core files (system-level, not something MiSTerFin ships), so it's an opt-in recipe: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#experimental-true-interlaced-output-576i480i-on-a-crt-tv), confirmed working over SCART and Component in both PAL and NTSC
+- **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look, and genuinely tear-free thanks to a hardware page-flip technique. It runs on a standalone core that doesn't touch any MiSTer system files, switched live with a button combo: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv), confirmed working over SCART and Component/YPbPr, both PAL and NTSC
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
 - **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
@@ -218,7 +218,7 @@ Two tabs — **AUDIO** and **SUBTITLES** — switched with the shoulder buttons.
 
 A `>` marks the track currently playing. Changing the **subtitle** track is instant for text-based tracks (rendered client-side). Changing the **audio** track always restarts the stream at the current position — Jellyfin transcodes one chosen audio stream into what it sends, so there's no way to switch it client-side the way a subtitle can be. Changing both at once costs a single restart, not two.
 
-VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom.
+VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom. In [true interlaced mode](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv) the L/R VSync toggle isn't offered at all — video there is always tear-free via hardware page-flip, independent of VSync.
 
 ### Now playing (music) — selecting a track plays it immediately, no separate info screen
 | Button | Keyboard | Action |
@@ -255,6 +255,12 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## Changelog
+
+### v0.9.6
+- True interlaced (576i/480i) output, via a standalone core that doesn't touch any MiSTer system files — switch live with a button combo, reverts automatically on reboot (see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv))
+- Video in that mode is genuinely tear-free, using a hardware page-flip technique — no FPGA/core changes involved
+- MiSTerFin automatically adapts its UI, video letterboxing, and on-screen text to the real interlaced framebuffer resolution — no configuration needed
+- Confirmed working over SCART and Component/YPbPr, both PAL and NTSC
 
 ### v0.9.5
 - Sharper video out of the box — the default transcode is now full standard-definition resolution (720x576 @ 12 Mbps, up from 480x270 @ 8 Mbps; applies to PAL and NTSC alike), measured on hardware with plenty of CPU headroom left
@@ -306,7 +312,7 @@ MiSTerFin is made by [Pudding Studio](https://pudding.studio).
 
 Quick Connect sign-in, alternate audio track selection, Continue Watching / Next Up, the real JSON parser, large-library pagination, the subtitle handling improvements, a configurable transcode profile, the controller-reconnect hardening, an off-hardware test harness, and a thorough security-hardening pass were contributed by **[Izzie Walton (@iwalton3)](https://github.com/iwalton3)** in [#6](https://github.com/puddingstudio/MiSTerFin/pull/6) — a substantial contribution, tested end-to-end on real hardware. Thank you.
 
-Interlaced video for MiSTerFin is also in the works from the same contributor — patched [Main_MiSTer](https://github.com/iwalton3/Main_MiSTer/tree/direct-video-interlace) and [Menu_MiSTer](https://github.com/iwalton3/Menu_MiSTer/tree/direct-video-interlace) cores that add true 480i/576i scaler output over `direct_video`, letting MiSTerFin push a proper interlaced picture (still experimental).
+True interlaced (480i/576i) output is also thanks to the same contributor — a [standalone interlaced menu core](https://github.com/iwalton3/Menu_MiSTer/releases/tag/v0.0.1) that adds real scaler-level interlaced scanout without touching `Main_MiSTer` or your main `menu.rbf`. See the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv) for setup.
 
 ---
 

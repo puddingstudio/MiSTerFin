@@ -29,7 +29,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
-
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #ifdef __ANDROID__
@@ -673,6 +672,129 @@ static struct fb_cmap *make_directcolor_cmap(struct fb_var_screeninfo *var)
 }
 
 
+/* ── MiSTer hardware page flipping ────────────────────────────────────────
+ * The MiSTer scaler (ascal.vhd) latches its framebuffer base address ONLY
+ * at the VSync edge — confirmed on hardware by repointing the base to a
+ * second, pre-painted page via a partial UIO_SET_FBUF (0x2F) SPI command:
+ * the whole screen switches atomically, no tearing possible by
+ * construction. Main_MiSTer already reserves three full framebuffer pages
+ * at FB_ADDR (it maps FB_SIZE*4*3), so page 1 is ours to use.
+ *
+ * When /tmp/misterfin_pageflip exists (the MiSTerFin app creates it, and
+ * SIGSTOPs Main_MiSTer for the playback so the raw SPI writes below can't
+ * race Main's own bus traffic), every frame is rendered into the page NOT
+ * being displayed, then a 3-word flip command points the scaler at it.
+ * No blocking vsync wait, no racing the beam — full speed AND tear-free,
+ * even for frames whose write takes longer than a field. */
+#define PF_FLAG          "/tmp/misterfin_pageflip"
+#define PF_FPGA_REG_BASE 0xFF000000u
+#define PF_FPGA_REG_SIZE 0x01000000u
+#define PF_GPO_OFF       0x706010u
+#define PF_GPI_OFF       0x706014u
+#define PF_SSPI_STROBE   (1u << 17)
+#define PF_SSPI_IO_EN    (1u << 20)
+#define PF_UIO_SET_FBUF  0x2Fu
+#define PF_MODE_PARAM    "/sys/module/MiSTer_fb/parameters/mode"
+#define PF_FMT_WORD      0x8016u   /* FB_EN | FB_FMT_RxB | FB_FMT_8888 — what Main sets for the Linux fb */
+
+static int      pf_active;      /* page-flip mode engaged for this playback */
+static int      pf_back;        /* page being rendered into (not displayed) */
+static uint8_t *pf_page[2];     /* both pages, mapped through the fb driver */
+static size_t   pf_map_len;     /* one page's byte size */
+static size_t   pf_center_off;  /* byte offset of 'center' within a page */
+static uint32_t pf_page_phys[2];
+static volatile uint32_t *pf_gpo, *pf_gpi;
+static void    *pf_reg_map;
+
+static void pf_spi_word(uint32_t base_gpo, uint16_t w)
+{
+    uint32_t g = (base_gpo & ~(0xFFFFu | PF_SSPI_STROBE)) | w;
+    *pf_gpo = g;
+    *pf_gpo = g | PF_SSPI_STROBE;
+    while (!(*pf_gpi & PF_SSPI_STROBE));
+    *pf_gpo = g;
+    while (*pf_gpi & PF_SSPI_STROBE);
+}
+
+/* Repoint the scaler at page n: command + format word + base low/high, then
+ * stop — UIO_SET_FBUF consumes words positionally, so ending the command
+ * here leaves the remaining geometry registers (width/height/window/stride)
+ * exactly as Main_MiSTer programmed them. */
+static void pf_flip_to(int n)
+{
+    uint32_t phys = pf_page_phys[n];
+    uint32_t gpo  = (*pf_gpo | 0x80000000u) | PF_SSPI_IO_EN;
+    *pf_gpo = gpo;
+    pf_spi_word(gpo, PF_UIO_SET_FBUF);
+    pf_spi_word(gpo, PF_FMT_WORD);
+    pf_spi_word(gpo, (uint16_t)(phys & 0xFFFF));
+    pf_spi_word(gpo, (uint16_t)(phys >> 16));
+    *pf_gpo = gpo & ~PF_SSPI_IO_EN;
+}
+
+/* The second page must be written through the fb DRIVER's mapping — it
+ * memremaps its whole region write-through (~1.5 GB/s measured), while a
+ * /dev/mem mapping of the same physical bytes is uncached (~60 MB/s, which
+ * made playback slower than realtime when this first went through
+ * /dev/mem). The driver only lets us mmap smem_len = one frame, so:
+ * momentarily report a double-height mode (doubling smem_len), take a
+ * two-frame mmap, and restore the real mode — the established mapping
+ * stays valid after the restore. Page 1 is then simply the frame-sized
+ * slice right after page 0, well inside the driver's (much larger)
+ * reserved region, and the scaler happily scans any DDR address (proven
+ * with the solid-color flip test). Side effect: the driver's mode_set
+ * memsets its whole region, so the screen blanks for an instant — at
+ * playback start, where this runs, that's invisible. */
+static int pf_init(void)
+{
+    struct fb_fix_screeninfo fi;
+    if (ioctl(fb_dev_fd, FBIOGET_FSCREENINFO, &fi) < 0) return 0;
+
+    pf_map_len      = (size_t)fb_line_len * fb_yres;
+    pf_page_phys[0] = (uint32_t)fi.smem_start;
+    pf_page_phys[1] = (uint32_t)fi.smem_start + (uint32_t)pf_map_len;
+
+    char mode_now[96];
+    int  mfd = open(PF_MODE_PARAM, O_RDONLY);
+    if (mfd < 0) return 0;
+    int n = read(mfd, mode_now, sizeof(mode_now) - 1);
+    close(mfd);
+    if (n <= 0) return 0;
+    mode_now[n] = '\0';
+
+    unsigned fmt, rb, w, h, stride;
+    if (sscanf(mode_now, "%u %u %u %u %u", &fmt, &rb, &w, &h, &stride) != 5) return 0;
+
+    char tmp[96];
+    snprintf(tmp, sizeof(tmp), "%u %u %u %u %u", fmt, rb, w, h * 2, stride);
+    mfd = open(PF_MODE_PARAM, O_WRONLY);
+    if (mfd < 0) return 0;
+    write(mfd, tmp, strlen(tmp));
+    close(mfd);
+
+    uint8_t *both = mmap(0, pf_map_len * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fb_dev_fd, 0);
+
+    snprintf(tmp, sizeof(tmp), "%u %u %u %u %u", fmt, rb, w, h, stride);
+    mfd = open(PF_MODE_PARAM, O_WRONLY);
+    if (mfd >= 0) { write(mfd, tmp, strlen(tmp)); close(mfd); }
+
+    if (both == MAP_FAILED) return 0;
+    pf_page[0] = both;
+    pf_page[1] = both + pf_map_len;
+
+    int dm = open("/dev/mem", O_RDWR | O_SYNC);
+    if (dm < 0) { munmap(both, pf_map_len * 2); return 0; }
+    pf_reg_map = mmap(0, PF_FPGA_REG_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dm, PF_FPGA_REG_BASE);
+    close(dm);
+    if (pf_reg_map == MAP_FAILED) { munmap(both, pf_map_len * 2); return 0; }
+    pf_gpo = (volatile uint32_t *)((uint8_t *)pf_reg_map + PF_GPO_OFF);
+    pf_gpi = (volatile uint32_t *)((uint8_t *)pf_reg_map + PF_GPI_OFF);
+
+    pf_back = 1;   /* page 0 is on screen right now */
+    return 1;
+}
+
+
 static int fb_preinit(int reset)
 {
     static int fb_preinit_done = 0;
@@ -990,6 +1112,18 @@ static int config(uint32_t width, uint32_t height, uint32_t d_width,
                  x_offset * fb_pixel_size + y_offset * fb_line_len +
                  fb_page * fb_yres * fb_line_len;
 
+        /* MiSTer page flipping (see the PF_* block above): render into the
+         * hidden page and repoint the scaler per frame instead of writing
+         * over the displayed one. Page 0 is the same physical memory this
+         * fb0 mmap points at, so the centering offset carries over 1:1. */
+        pf_active = 0;
+        if (access(PF_FLAG, F_OK) == 0 && pf_init()) {
+            pf_active     = 1;
+            pf_center_off = (size_t)(center - frame_buffer);
+            center        = pf_page[pf_back] + pf_center_off;
+            mp_msg(MSGT_VO, MSGL_INFO, "fbdev: MiSTer page-flip mode engaged\n");
+        }
+
         mp_msg(MSGT_VO, MSGL_DBG2, "frame_buffer @ %p\n", frame_buffer);
         mp_msg(MSGT_VO, MSGL_DBG2, "center @ %p\n", center);
         mp_msg(MSGT_VO, MSGL_V, "pixel per line: %d\n", fb_line_len / fb_pixel_size);
@@ -1055,9 +1189,50 @@ static void draw_alpha(int x0, int y0, int w, int h, unsigned char *src,
 {
     unsigned char *dst;
 
+    /* The interlaced raster overscans noticeably more than the progressive
+     * modes (same reason the app widened its title-safe margins there) —
+     * confirmed on hardware that OSD text is present in a framebuffer dump
+     * but invisible on the CRT, eaten by overscan. Clamp top-of-screen
+     * glyphs (the OSD area — gated by y0 so bottom-anchored subtitles,
+     * which share this same draw_alpha path, are untouched) INWARD from
+     * whichever edges they're closest to. A plain rightward/downward shift
+     * (tried first) fixed left-anchored messages but pushed right-anchored
+     * ones (VSync ON/OFF, drawn top-right) further past their bounds check
+     * and left them uncorrected — a symmetric clamp handles both. Margin
+     * matches the app's own SAFE_X for this mode (in_width/in_height are
+     * the vf chain's dsize output, i.e. the full 640x576 screen). */
+    if (pf_active && y0 < fb_yres / 4) {
+        /* Measured on hardware with a row-ruler test pattern (the
+         * standalone interlaced core's raster crops roughly the first 40
+         * physical rows — asymmetric, nothing is lost at the bottom): 64
+         * clears that crop with real margin instead of sitting right on
+         * the edge (44 still landed mostly in the cropped zone, cutting
+         * off most of a glyph's height). */
+        const int mx = 36, my = 64;
+        if (y0 < my) y0 = my;
+        if (x0 < mx) x0 = mx;
+        if (x0 + w > in_width - mx) x0 = in_width - mx - w;
+        if (x0 < 0) x0 = 0;
+    }
+
     dst = center + fb_line_len * y0 + fb_pixel_size * x0;
 
     (*draw_alpha_p)(w, h, src, srca, stride, dst, fb_line_len);
+
+    /* Page flipping: also stamp the OSD/subtitle glyphs onto the OTHER
+     * page. mplayer's call order was designed for one persistent buffer;
+     * with two alternating pages an OSD drawn only into the current back
+     * page can get overwritten by the next video frame before that page is
+     * ever shown (confirmed on hardware: seek/VSync flash text invisible in
+     * flip mode). Drawing the (tiny) glyph regions into both pages makes
+     * the text visible immediately and on every subsequent frame. */
+    if (pf_active) {
+        size_t off = (size_t)(center - pf_page[pf_back]);
+        (*draw_alpha_p)(w, h, src, srca, stride,
+                        pf_page[pf_back ^ 1] + off + (size_t)fb_line_len * y0
+                                             + (size_t)fb_pixel_size * x0,
+                        fb_line_len);
+    }
 }
 
 static int draw_slice(uint8_t *src[], int stride[], int w, int h, int x, int y)
@@ -1065,8 +1240,23 @@ static int draw_slice(uint8_t *src[], int stride[], int w, int h, int x, int y)
     uint8_t *d;
 
     /* Wait for vblank before writing the first slice of each frame.
-     * Toggled at runtime via /tmp/misterdvd_vsync flag file (L/R buttons). */
-    if (y == 0 && access("/tmp/misterdvd_vsync", F_OK) == 0) {
+     * Toggled at runtime via /tmp/misterdvd_vsync flag file (L/R buttons).
+     *
+     * A predictive, non-blocking variant of this (a background thread
+     * timestamping vblanks, this write path sleeping to a computed phase
+     * instead of calling the ioctl directly) was built for the interlaced
+     * full-frame page-flip modes, where the plain blocking wait below
+     * doesn't fit a frame period — but page flipping (see the PF_* block)
+     * turned out to solve that case entirely on its own (the scaler
+     * latches the displayed page at its own vblank, so there is nothing
+     * left for THIS wait to protect once flipping is active — note the
+     * pf_active exclusion below, unchanged since before that work).
+     * Progressive modes never had the timing problem the predictive
+     * version was built for, and reintroduced tearing there instead
+     * (confirmed on hardware) — this plain per-frame block is what
+     * shipped for the platform's entire history and is what pf_active==0
+     * still needs. */
+    if (y == 0 && !pf_active && access("/tmp/misterdvd_vsync", F_OK) == 0) {
         __u32 dummy = 0;
         ioctl(fb_dev_fd, FBIO_WAITFORVSYNC, &dummy);
     }
@@ -1090,6 +1280,15 @@ static void flip_page(void)
     if (vidix_name)
         return;
 #endif
+    /* MiSTer page flipping: the frame just rendered lives in pf_back —
+     * repoint the scaler at it (latched in hardware at the next vsync)
+     * and retarget rendering at the page that just left the screen. */
+    if (pf_active) {
+        pf_flip_to(pf_back);
+        pf_back ^= 1;
+        center = pf_page[pf_back] + pf_center_off;
+        return;
+    }
     if (!vo_doublebuffering)
         return;
 
@@ -1107,6 +1306,15 @@ static void draw_osd(void)
 
 static void uninit(void)
 {
+    /* Best-effort restore of the normal display page (the app enforces the
+     * same after killing the player, since a SIGKILL never reaches here).
+     * Main_MiSTer is still SIGSTOPped at this point, so the SPI is safe. */
+    if (pf_active) {
+        pf_flip_to(0);
+        munmap(pf_page[0], pf_map_len * 2);   /* one double-length mapping, see pf_init */
+        munmap(pf_reg_map, PF_FPGA_REG_SIZE);
+        pf_active = 0;
+    }
     if (fb_cmap_changed) {
         if (ioctl(fb_dev_fd, FBIOPUTCMAP, &fb_oldcmap))
             mp_msg(MSGT_VO, MSGL_WARN, "Can't restore original cmap\n");

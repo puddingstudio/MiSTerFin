@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -111,9 +112,91 @@ static void on_signal(int s) { (void)s; g_running = 0; }
 static char g_setup_reason[64];   /* set once at startup, redrawn every frame by draw_setup_screen() */
 
 static void cursor_show(void);  /* forward decl for emergency_cleanup */
+static void input_drain(void);  /* forward decl for pageflip_end */
+
+/* ── MiSTer page-flip playback (interlaced full-frame modes) ──────────────
+ * The scaler latches its framebuffer base address at vsync (ascal.vhd), so
+ * repointing it is a hardware page flip — tear-free by construction, no
+ * per-frame copy racing the beam. mplayer's vo_fbdev does the actual
+ * per-frame flips (see docker/vo_fbdev.c, PF_* block); the app's job is
+ * the choreography around a playback: create the flag file the vo checks,
+ * SIGSTOP Main_MiSTer so the raw SPI flips can't race its bus traffic,
+ * and on stop put the display back on page 0 (the Linux fb this app draws)
+ * and wake Main back up. Engaged only under line_double — progressive
+ * modes never suffered the write-vs-beam race badly enough to need it,
+ * and keeping Main running is strictly safer. */
+#define PAGEFLIP_FLAG "/tmp/misterfin_pageflip"
+static int   g_pageflip_mode    = 0;   /* fb.line_double, latched in main() */
+static int   g_pageflip_engaged = 0;   /* between pageflip_begin() and _end() */
+static pid_t g_mister_pid       = 0;
+
+/* Main_MiSTer's pid, found by comm name — no shell involved (the whole
+ * request pipeline is fork+execvp by design, see jf_curl_run). */
+static pid_t mister_main_pid(void)
+{
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *e;
+    pid_t found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64], comm[32];
+        snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        int n = read(fd, comm, sizeof(comm) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        comm[n] = '\0';
+        if (!strcmp(comm, "MiSTer\n") || !strcmp(comm, "MiSTer"))
+            found = (pid_t)atoi(e->d_name);
+    }
+    closedir(d);
+    return found;
+}
+
+static void pageflip_begin(void)
+{
+    if (!g_pageflip_mode || g_pageflip_engaged) return;
+    int fd = open(PAGEFLIP_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+    g_mister_pid = mister_main_pid();
+    if (g_mister_pid > 0) kill(g_mister_pid, SIGSTOP);
+    fb_set_reflip(1);   /* app overlays re-assert page 0, see fb_set_reflip */
+    g_pageflip_engaged = 1;
+}
+
+static void pageflip_end(void)
+{
+    if (!g_pageflip_engaged) return;
+    fb_set_reflip(0);
+    fb_page_flip(0);                 /* Main still stopped — SPI is safe */
+    if (g_mister_pid > 0) {
+        kill(g_mister_pid, SIGCONT);
+        /* Main_MiSTer echoes physical joystick presses onto a synthetic
+         * "MiSTer virtual input" device (see device_is_mister_virtual's
+         * comment) — SIGSTOPping it for the whole playback means whatever
+         * it echoes is backed up in the kernel's input event queue rather
+         * than lost, and it can flush that backlog in a burst right as it
+         * resumes. Confirmed on hardware: exiting video landed two screens
+         * back instead of one — the backlog included an echo of the very
+         * B press that stopped playback, arriving a moment later and
+         * getting read as a SECOND "back" once already on the browse
+         * screen. 80ms is comfortably longer than that flush takes;
+         * draining after it discards the whole backlog in one place
+         * rather than chasing it at every pageflip_end() call site. */
+        usleep(80000);
+        input_drain();
+    }
+    unlink(PAGEFLIP_FLAG);
+    g_pageflip_engaged = 0;
+}
 
 static void emergency_cleanup(void)
 {
+    /* A crash with Main_MiSTer SIGSTOPped (or the display parked on the
+     * flip page) would leave the whole device wedged — undo both first. */
+    pageflip_end();
     ddr_close();
     cursor_show();
 }
@@ -1418,13 +1501,20 @@ static const SpinnerSamplePt SPINNER_SAMPLE_PTS[] = {
  * info/cover page while "loading". */
 static void spinner_show(FBDev *fb, double seconds)
 {
-    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+    fb_sync_back(fb);
+    /* Dim the held frame while the (re)started stream buffers. Without
+     * this, a seek shows the stale pre-seek frame at full strength for a
+     * few seconds — including the "PAUSED" overlay text if the seek came
+     * from pause — which reads as "playback stuck", reported exactly so
+     * once page flipping made the held frame more visible. Dimmed, it
+     * reads as the transition it actually is. */
+    fb_fill_rect_alpha(fb, 0, 0, fb->width, fb->height, 0, 0, 0, 150);
 
     uint32_t ref[SPINNER_SAMPLE_N];
     int valid[SPINNER_SAMPLE_N];
     for (int i = 0; i < SPINNER_SAMPLE_N; i++) {
         valid[i] = SPINNER_SAMPLE_PTS[i].x < fb->width && SPINNER_SAMPLE_PTS[i].y < fb->height;
-        ref[i] = valid[i] ? *(const uint32_t *)(fb->mem + SPINNER_SAMPLE_PTS[i].y * fb->stride
+        ref[i] = valid[i] ? *(const uint32_t *)(fb_mem_row(fb, SPINNER_SAMPLE_PTS[i].y)
                                                           + SPINNER_SAMPLE_PTS[i].x * 4) : 0;
     }
 
@@ -1435,7 +1525,7 @@ static void spinner_show(FBDev *fb, double seconds)
             int changed = 0;
             for (int i = 0; i < SPINNER_SAMPLE_N && !changed; i++) {
                 if (!valid[i]) continue;
-                uint32_t cur = *(const uint32_t *)(fb->mem + SPINNER_SAMPLE_PTS[i].y * fb->stride
+                uint32_t cur = *(const uint32_t *)(fb_mem_row(fb, SPINNER_SAMPLE_PTS[i].y)
                                                              + SPINNER_SAMPLE_PTS[i].x * 4);
                 if (cur != ref[i]) changed = 1;
             }
@@ -3852,7 +3942,7 @@ static JfStreamProfile stream_profile(void);   /* forward decl — defined with 
 
 static void draw_paused(FBDev *fb, const char *name, double pos)
 {
-    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+    fb_sync_back(fb);
 
     int cy = fb->height / 2 - 16;
     fb_fill_rect_alpha(fb, 0, cy - 6, fb->width, 50, 0, 0, 0, 200);
@@ -3885,9 +3975,21 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
     /* SELECT now opens a picker with an audio tab as well, so it's worth
      * offering on a title that has alternate audio but no subtitles at all —
      * the old condition hid it in exactly that case. */
-    const char *hint = (g_info_item.sub_count > 0 || g_info_item.audio_count > 1)
-        ? "B:resume  A:stop  L/R:vsync  SELECT:tracks"
-        : "B:resume  A:stop  L/R:vsync";
+    /* VSync toggle is a no-op in page-flip (true interlace) mode — that
+     * path is always tear-free via hardware page-flip regardless of the
+     * /tmp/misterdvd_vsync flag (see draw_slice()'s pf_active gate in
+     * docker/vo_fbdev.c), so don't offer or hint at a control that does
+     * nothing there. */
+    const char *hint;
+    if (fb->line_double) {
+        hint = (g_info_item.sub_count > 0 || g_info_item.audio_count > 1)
+            ? "B:resume  A:stop  SELECT:tracks"
+            : "B:resume  A:stop";
+    } else {
+        hint = (g_info_item.sub_count > 0 || g_info_item.audio_count > 1)
+            ? "B:resume  A:stop  L/R:vsync  SELECT:tracks"
+            : "B:resume  A:stop  L/R:vsync";
+    }
     draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -4048,6 +4150,9 @@ static void player_stop(void)
         waitpid(g_player_pid, NULL, 0);
         g_player_pid = -1;
     }
+    /* SIGKILL means mplayer's own uninit page restore never ran — put the
+     * display back on page 0 and wake Main up (no-op unless engaged). */
+    pageflip_end();
     g_paused = 0;
 
     /* mplayer's own vo_fbdev patch opens /dev/tty itself and restores
@@ -4094,6 +4199,12 @@ static void player_pause_toggle(void)
          * which is why pause silently stopped holding and why the
          * "pause screen" was actually racing live video underneath it. */
         mp_cmd("pausing_keep sub_visibility 0\n");
+        /* Under page flipping the display is likely parked on page 1 (the
+         * player's flip page) — our pause/submenu overlays draw into page
+         * 0 (fb->mem), so bring that on screen. The shown frame may be one
+         * frame behind the very last decoded one; invisible in practice.
+         * On unpause the player's next flip takes over again. */
+        if (g_pageflip_engaged) fb_page_flip(0);
     }
 }
 
@@ -4309,7 +4420,10 @@ static void submenu_bg_capture(FBDev *fb)
         g_submenu_bg = malloc(sz);
         g_submenu_bg_size = g_submenu_bg ? sz : 0;
     }
-    if (g_submenu_bg) memcpy(g_submenu_bg, fb->mem, sz);
+    /* Snapshot via the logical back buffer (fb_sync_back below fills it from
+     * the screen) rather than raw fb->mem — the two differ in size under
+     * line doubling. */
+    if (g_submenu_bg) memcpy(g_submenu_bg, fb->back, sz);
 }
 
 static void submenu_bg_restore(FBDev *fb)
@@ -4338,8 +4452,8 @@ static void submenu_open(FBDev *fb)
     g_submenu_was_paused = g_paused;
     g_submenu_opened_at  = now_sec();
     if (!g_paused) player_pause_toggle();
-    submenu_bg_capture(fb);
-    memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+    fb_sync_back(fb);        /* pull the live video frame into fb->back... */
+    submenu_bg_capture(fb);  /* ...and snapshot it from there (see its comment) */
 }
 
 static void submenu_close(void)
@@ -4626,8 +4740,16 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_last_progress_report = now_sec();
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
 
+    /* Video, unlike the UI, uses the PHYSICAL framebuffer height: mplayer
+     * opens /dev/fb0 itself and sees the real line count, and on an
+     * interlaced 576/480-line raster the whole point is that video CAN
+     * carry that full vertical resolution (the UI's line doubling is a
+     * layout decision, not a display limit). vh == fb->height everywhere
+     * except under line doubling. */
+    int vh = fb->phys_height;
+
     char vf_arg[96];
-    if (fb->height == 288 &&
+    if (vh == 288 &&
         g_cfg.profile_width == 480 && g_cfg.profile_height == 270) {
         /* PAL at the ORIGINAL 480x270 transcode dimensions (the default for
          * the platform's entire history until the 640x288 bump — see
@@ -4651,7 +4773,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
          * and multi-minute zero-drift/zero-drop soaks). Bitrate-only tweaks
          * on 480x270 stay on this chain. */
         snprintf(vf_arg, sizeof(vf_arg), "scale=%d:-1,expand=%d:%d:-1:-1:1,dsize=%d:%d",
-                 fb->width, fb->width, fb->height, fb->width, fb->height);
+                 fb->width, fb->width, vh, fb->width, vh);
     } else {
         /* NTSC (and any other non-288 height), plus PAL with a custom
          * transcode profile (see above) — confirmed on hardware that
@@ -4671,13 +4793,63 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
             dar = (double)g_info_item.source_width / (double)g_info_item.source_height;
         if (dar <= 0.0) dar = 16.0 / 9.0;
 
-        int target_h = (int)(4.0 * fb->height / (3.0 * dar) + 0.5);
+        int target_h = (int)(4.0 * vh / (3.0 * dar) + 0.5);
         target_h &= ~1;                        /* even, required for yuv420p chroma subsampling */
         if (target_h < 2) target_h = 2;
-        if (target_h > fb->height) target_h = fb->height;
+        if (target_h > vh) target_h = vh;
 
-        snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,expand=%d:%d:-1:-1:1,dsize=%d:%d",
-                 fb->width, target_h, fb->width, fb->height, fb->width, fb->height);
+        /* The standalone interlaced menu core's raster crops roughly the
+         * first 40 physical rows and none at the bottom (measured on
+         * hardware with a row-ruler test pattern) — auto-centering
+         * (expand's "-1" y-offset) splits the letterbox padding evenly
+         * across a range that isn't evenly visible, so the top bar reads
+         * visibly shorter than the bottom one and, on a full-height 4:3
+         * source, the picture itself runs off the top edge. Push the
+         * padding (and so the picture) down by the crop amount instead of
+         * auto-centering, so what's actually ON SCREEN is centered within
+         * the visible ~[40,vh) window rather than the full [0,vh) buffer.
+         * Only applies to this mode (vh is only ever 576/480 here); NTSC's
+         * ordinary 240-line progressive path is unaffected. */
+        char expand_arg[48];
+        if (fb->line_double) {
+            /* Center within the VISIBLE window [40, vh), not the full
+             * [0, vh) buffer — the first attempt added 40 on top of a
+             * normal full-buffer centering, which overshot downward
+             * (confirmed on hardware: top bar became taller than the
+             * bottom one, the opposite of the original asymmetry).
+             *
+             * A near-4:3 source (little/no letterboxing needed) can DAR-
+             * compute a target_h tall enough that fitting it starting at
+             * row 40 would run past vh — confirmed on hardware with a
+             * 1.66:1 title specifically, visibly shifted up into the
+             * cropped zone (the "top + target_h > vh" fallback below let
+             * top go back under 40). Cap target_h itself to the visible
+             * window's height instead, so top can never need to. Costs a
+             * few rows of picture on the rare title tall enough to hit
+             * this — better than losing them off-screen instead. */
+            int visible_h = vh - 40;
+            if (target_h > visible_h) target_h = visible_h & ~1;
+            int top = 40 + (visible_h - target_h) / 2;
+            if (top < 40) top = 40;
+            /* expand's trailing arg is its own "osd" flag (confirmed by
+             * reading vf_expand.c's option table) — when on (the default,
+             * and what every other chain here still uses), expand's
+             * control() INTERCEPTS VFCTRL_DRAW_OSD and never forwards it
+             * down the chain, instead baking OSD text into the frame
+             * itself at coordinates relative to the full pre-crop 640xvh
+             * canvas. Confirmed on hardware: a debug counter in vo_fbdev's
+             * draw_alpha() stayed at zero through repeated OSD triggers
+             * while the message still appeared (baked in by expand) at
+             * the top of the frame — inside the cropped zone, invisible
+             * for exactly the reason our vo-level clamp never got a
+             * chance to run. Turning it off here lets DRAW_OSD reach the
+             * vo, where it has the crop margin to correct it. */
+            snprintf(expand_arg, sizeof(expand_arg), "expand=%d:%d:-1:%d:0", fb->width, vh, top);
+        } else {
+            snprintf(expand_arg, sizeof(expand_arg), "expand=%d:%d:-1:-1:1", fb->width, vh);
+        }
+        snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,%s,dsize=%d:%d",
+                 fb->width, target_h, expand_arg, fb->width, vh);
     }
 
     /* A selected client-rendered (text) subtitle rides the COMMAND LINE
@@ -4707,12 +4879,36 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
         cmdline_sub = 1;
     }
 
+    /* Hardware page flipping for the interlaced modes — must be engaged
+     * (flag file + Main_MiSTer stopped) before the fork, so the fresh
+     * mplayer's vo config sees the flag. See pageflip_begin()'s comment. */
+    pageflip_begin();
+
     int pfd[2];
     pipe(pfd);
 
     g_player_pid = fork();
     if (g_player_pid == 0) {
         setpgid(0, 0);   /* own process group, so player_stop() can kill mplayer's cache-fill child too */
+        /* MiSTer's script launcher pins scripts (and so everything they
+         * spawn) to CPU1 — measured on hardware during a full-height
+         * (576-line) interlaced page-flip playback: cpu1 ~90% busy, cpu0
+         * ~97% IDLE, with visible slow-motion on tall (4:3) pictures. Give
+         * mplayer both cores back; its decode already runs threads=2 (see
+         * -lavdopts) and the video pipeline gets a core to itself. Raw
+         * syscall with a plain bitmask (bit 0 = cpu0, bit 1 = cpu1)
+         * instead of the cpu_set_t macros, which need _GNU_SOURCE.
+         *
+         * ONLY for page-flip mode: Main_MiSTer is SIGSTOPped there, so
+         * cpu0 is free. In normal progressive mode Main keeps running and
+         * actively uses cpu0 for its own scaler/display duties — letting
+         * mplayer spread onto it there caused severe slowdowns (confirmed
+         * on hardware), so leave progressive on the launcher's original
+         * single-core pinning, unchanged from its months-proven behavior. */
+        if (g_pageflip_mode) {
+            unsigned long cpumask = 0x3;
+            syscall(SYS_sched_setaffinity, 0, sizeof(cpumask), &cpumask);
+        }
         dup2(pfd[0], 0);
         close(pfd[0]); close(pfd[1]);
         int devnull = open("/dev/null", O_WRONLY);
@@ -4740,7 +4936,15 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                 * player_pause_toggle()'s sub_visibility toggle for that
                 * other half of the same race. */
         args[an++] = "-osdlevel"; args[an++] = "0";
-        args[an++] = "-font";     args[an++] = "/media/fat/misterfin/font/font.desc";
+        /* mplayer draws its OSD straight into the physical framebuffer,
+         * bypassing the app's own line-doubling — the same reason the
+         * subtitle font gets a dedicated 2x atlas for this mode (see
+         * subfont2x above) applies here too, confirmed on hardware: the
+         * ordinary font read vertically squished once OSD text became
+         * visible on the interlaced raster. */
+        args[an++] = "-font";
+        args[an++] = fb->line_double ? "/media/fat/misterfin/font2x/font.desc"
+                                     : "/media/fat/misterfin/font/font.desc";
         args[an++] = "-framedrop";
         args[an++] = "-autosync"; args[an++] = "30";
         args[an++] = "-cache";    args[an++] = "8192";
@@ -4804,7 +5008,15 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
             args[an++] = "-sub";      args[an++] = SUB_LOCAL_PATH;
             args[an++] = "-subdelay"; args[an++] = subdelay_arg;
         }
-        args[an++] = "-subfont";  args[an++] = "/media/fat/misterfin/subfont/font.desc";
+        /* mplayer lays glyphs out in PHYSICAL lines: on the interlaced
+         * full-frame (line_double) buffers the 13px progressive subfont
+         * shows up half-size and squashed, so those modes get a dedicated
+         * 24px atlas — an exact 3x of the 8x8 glyphs, so every stroke stays
+         * the same thickness (13px's fractional 1.625x scale mixes 1px and
+         * 2px strokes), visually matching 12px at 288 lines. */
+        args[an++] = "-subfont";
+        args[an++] = fb->line_double ? "/media/fat/misterfin/subfont2x/font.desc"
+                                     : "/media/fat/misterfin/subfont/font.desc";
         args[an++] = "-subwidth"; args[an++] = "90";
         args[an++] = "-subpos";   args[an++] = "92";
         /* Audio consistently trails video by a small fixed amount
@@ -4873,6 +5085,12 @@ static void play_audio(FBDev *fb, int queue_pos)
     g_player_pid = fork();
     if (g_player_pid == 0) {
         setpgid(0, 0);
+        /* Same both-cores affinity as the video player, same page-flip-only
+         * gating — see play()'s comment. */
+        if (g_pageflip_mode) {
+            unsigned long cpumask = 0x3;
+            syscall(SYS_sched_setaffinity, 0, sizeof(cpumask), &cpumask);
+        }
         dup2(pfd[0], 0);
         close(pfd[0]); close(pfd[1]);
         int devnull = open("/dev/null", O_WRONLY);
@@ -5187,6 +5405,7 @@ static int run_preview_browse(int sel, int list_mode)
     srand((unsigned)time(NULL));   /* grid_cell_order_shuffle draws on rand() */
     FBDev fb = {0};
     fb.width = 640; fb.height = 288; fb.stride = fb.width * 4;
+    fb.phys_height = fb.height;   /* no line doubling in the fabricated fb */
     fb.mmap_size = (size_t)fb.stride * fb.height;
     fb.mem  = calloc(1, fb.mmap_size);
     fb.back = calloc(1, fb.mmap_size);
@@ -5386,6 +5605,14 @@ int main(int argc, char **argv)
         return 1;
     }
     g_headless = fb.headless;   /* see g_headless' own comment */
+    g_pageflip_mode = fb.line_double;   /* see pageflip_begin()'s comment */
+    /* The interlaced menu core builds its own raster (in-core modeline
+     * conversion — different active width and porches than the progressive
+     * modes the 24px margin was tuned against over months), and on a real
+     * CRT it overscans noticeably more: confirmed on hardware that edges
+     * of the UI get eaten at the stock margin. Widen the title-safe zone
+     * for that mode only; progressive stays exactly as tuned. */
+    if (fb.line_double) SAFE_X = 36;
     /* SAFE_Y as a plain pixel count made the top/bottom margin look
      * noticeably BIGGER than the left/right margin on real hardware, even
      * though 20 < 24 — because our pixels aren't square. Physically,
@@ -5395,15 +5622,31 @@ int main(int argc, char **argv)
      * At fb->height=288 this comes out to 24/1.667≈14 (was a flat 20) —
      * confirmed as a real improvement there too, not NTSC-only. */
     SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
-    memcpy(fb.mem, fb.back, (size_t)fb.stride * fb.height);
+    fb_flip(&fb);   /* push the cleared back buffer to screen (line-doubles if needed) */
 
     cursor_hide();
     input_open();
     input_drain();
 
     /* Enable vsync by default — mplayer's patched vo_fbdev checks this file
-     * each frame (see VSYNC_FLAG comment above). */
-    { int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644); if (vf >= 0) close(vf); }
+     * each frame (see VSYNC_FLAG comment above).
+     *
+     * EXCEPT on an interlaced full-frame raster (line_double): that mode is
+     * tear-free via hardware page-flip instead (pf_active in vo_fbdev.c's
+     * draw_slice() skips this wait entirely, so the flag is normally moot
+     * there), and L/R is disabled during playback in that mode for the same
+     * reason (see the INP_L/INP_R handling above). Clearing it here is a
+     * fallback for the rare case page-flip itself fails to engage (e.g. the
+     * MiSTer_fb mmap in pf_init() fails) — measured on hardware before
+     * page-flip existed that this per-frame wait doesn't line up with this
+     * scanout mode's field timing (A-V drift grew 11s in 45s with the flag
+     * on, vs. 0.000 with it off), so leaving it off is the safer default if
+     * that fallback path is ever hit. */
+    if (!fb.line_double) {
+        int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644); if (vf >= 0) close(vf);
+    } else {
+        unlink(VSYNC_FLAG);   /* clear a stale flag from a previous run */
+    }
 
     pthread_t startup_tid;
     pthread_create(&startup_tid, NULL, startup_resolve_thread, NULL);
@@ -5826,6 +6069,10 @@ int main(int argc, char **argv)
 
         case STATE_PLAYING:
             if (!player_running()) {
+                /* mplayer exited on its own (end of title) — its uninit
+                 * already flipped back to page 0; this wakes Main up and
+                 * clears the flag (no-op unless engaged). */
+                pageflip_end();
                 double pos = play_position();
                 int watched = playback_watched(g_info_item.runtime_ticks, pos);
                 jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
@@ -5853,14 +6100,16 @@ int main(int argc, char **argv)
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
                 if (inp & INP_A) player_pause_toggle();
-                if (inp & INP_L) {
-                    int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                    if (vf >= 0) close(vf);
-                    osd_flash("VSync: ON", 1);
-                }
-                if (inp & INP_R) {
-                    unlink(VSYNC_FLAG);
-                    osd_flash("VSync: OFF", 1);
+                if (!g_pageflip_mode) {
+                    if (inp & INP_L) {
+                        int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                        if (vf >= 0) close(vf);
+                        osd_flash("VSync: ON", 1);
+                    }
+                    if (inp & INP_R) {
+                        unlink(VSYNC_FLAG);
+                        osd_flash("VSync: OFF", 1);
+                    }
                 }
                 /* seek_pending_target() reflects any not-yet-fired
                  * accumulated seek too, so this timeline moves live as the
@@ -5872,14 +6121,16 @@ int main(int argc, char **argv)
                 if (inp & INP_A) player_pause_toggle();
                 if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
                 if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
-                if (inp & INP_L) {
-                    int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                    if (vf >= 0) close(vf);
-                    osd_flash("VSync: ON", 0);
-                }
-                if (inp & INP_R) {
-                    unlink(VSYNC_FLAG);
-                    osd_flash("VSync: OFF", 0);
+                if (!g_pageflip_mode) {
+                    if (inp & INP_L) {
+                        int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                        if (vf >= 0) close(vf);
+                        osd_flash("VSync: ON", 0);
+                    }
+                    if (inp & INP_R) {
+                        unlink(VSYNC_FLAG);
+                        osd_flash("VSync: OFF", 0);
+                    }
                 }
 
                 if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {

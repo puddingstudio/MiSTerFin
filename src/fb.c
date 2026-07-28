@@ -46,6 +46,55 @@ static void fpga_wait_vsync(void)
     while (*s_gpi & SSPI_STROBE);                        /* ACK clear */
     *s_gpo = gpo & ~SSPI_IO_EN;                          /* DisableIO */
 }
+
+/* MiSTer scaler framebuffer pages — see the matching PF_* block in
+ * docker/vo_fbdev.c for the full story (the scaler latches the base
+ * address only at vsync, so repointing it IS a hardware page flip; page 1
+ * is the frame-sized slice right after the Linux fb in the driver's
+ * region, matching vo_fbdev's pf_init). ONLY safe to call while
+ * Main_MiSTer is SIGSTOPped (raw SPI would race its bus traffic
+ * otherwise) — see pageflip_begin()/end() in main.c. */
+#define UIO_SET_FBUF   0x2Fu
+#define FBUF_FMT_WORD  0x8016u   /* FB_EN | FB_FMT_RxB | FB_FMT_8888 */
+
+static uint32_t s_fb_page_phys[2];   /* set in fb_open from FSCREENINFO */
+static int      s_reflip;            /* fb_flip re-asserts page 0, see fb_set_reflip */
+
+static void fpga_spi_word(uint32_t base_gpo, uint16_t w)
+{
+    uint32_t g = (base_gpo & ~(0xFFFFu | SSPI_STROBE)) | w;
+    *s_gpo = g;
+    *s_gpo = g | SSPI_STROBE;
+    while (!(*s_gpi & SSPI_STROBE));
+    *s_gpo = g;
+    while (*s_gpi & SSPI_STROBE);
+}
+
+/* While the video player owns the display (page flipping engaged), any UI
+ * we draw lands in page 0 — but a late in-flight video frame can flip the
+ * display to page 1 AFTER our one-time flip back (confirmed on hardware:
+ * the pause overlay appeared and immediately vanished). With this on,
+ * every fb_flip() re-asserts page 0, and since overlays are redrawn in the
+ * ~100ms UI loop, the display self-heals within a tick. */
+void fb_set_reflip(int on)
+{
+    s_reflip = on;
+}
+
+void fb_page_flip(int page)
+{
+    if (!s_gpo || !s_fb_page_phys[0]) return;
+    uint32_t phys = s_fb_page_phys[page ? 1 : 0];
+    uint32_t gpo  = (*s_gpo | 0x80000000u) | SSPI_IO_EN;
+    *s_gpo = gpo;
+    fpga_spi_word(gpo, UIO_SET_FBUF);
+    fpga_spi_word(gpo, FBUF_FMT_WORD);
+    fpga_spi_word(gpo, (uint16_t)(phys & 0xFFFF));
+    /* Ending the command after the base words leaves the geometry
+     * registers exactly as Main programmed them (positional protocol). */
+    fpga_spi_word(gpo, (uint16_t)(phys >> 16));
+    *s_gpo = gpo & ~SSPI_IO_EN;
+}
 /* -------------------------------------------------------------------------- */
 
 /* Desktop/headless backend — fabricates an FBDev backed by plain malloc'd
@@ -68,13 +117,15 @@ static int fb_open_headless(FBDev *fb, const char *spec)
         return -1;
     }
 
-    fb->fd        = -1;
-    fb->width     = w;
-    fb->height    = h;
-    fb->stride    = w * 4;
-    fb->n_pages   = 1;
-    fb->mmap_size = (size_t)fb->stride * fb->height;
-    fb->headless  = 1;
+    fb->fd          = -1;
+    fb->width       = w;
+    fb->height      = h;
+    fb->phys_height = h;
+    fb->line_double = 0;
+    fb->stride      = w * 4;
+    fb->n_pages     = 1;
+    fb->mmap_size   = (size_t)fb->stride * fb->height;
+    fb->headless    = 1;
 
     fb->mem  = (uint8_t *)calloc(1, fb->mmap_size);
     fb->back = (uint8_t *)calloc(1, fb->mmap_size);
@@ -129,23 +180,38 @@ int fb_open(FBDev *fb, const char *path)
     fb->width  = (int)vinfo.xres;
     fb->height = (int)vinfo.yres;
     fb->stride = (int)finfo.line_length;
+    /* Physical page addresses for fb_page_flip() — page 1 sits one frame
+     * past the Linux fb, same layout vo_fbdev's pf_init establishes. */
+    s_fb_page_phys[0] = (uint32_t)finfo.smem_start;
+    s_fb_page_phys[1] = (uint32_t)finfo.smem_start + (uint32_t)finfo.line_length * vinfo.yres;
     /* Detect double buffering: fbdev reports yres_virtual = 2*yres when
        mplayer's fbdev driver can page-flip via FBIOPAN_DISPLAY */
     fb->n_pages = 1;  /* always single — writing to page 1 corrupts mplayer's back buffer */
-    fb->mmap_size = (size_t)fb->stride * fb->height;
 
-    size_t size = fb->mmap_size;
-    fb->mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fb->fd, 0);
+    /* Interlaced full-frame raster (see fb.h): 576/480 lines are exactly
+     * double the 288/240 layouts the UI is tuned for — halve the logical
+     * height and let fb_flip line-double, instead of teaching every draw
+     * call a second geometry. Only these two exact heights: anything else
+     * is an unknown mode better rendered 1:1 than half-guessed. */
+    fb->phys_height = fb->height;
+    fb->line_double = 0;
+    if (fb->height == 576 || fb->height == 480) {
+        fb->line_double = 1;
+        fb->height     /= 2;
+    }
+    fb->mmap_size = (size_t)fb->stride * fb->phys_height;
+
+    fb->mem = mmap(NULL, fb->mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb->fd, 0);
     if (fb->mem == MAP_FAILED) {
         perror("mmap framebuffer");
         close(fb->fd);
         return -1;
     }
 
-    fb->back = (uint8_t *)calloc(1, size);
+    fb->back = (uint8_t *)calloc(1, (size_t)fb->stride * fb->height);
     if (!fb->back) {
         perror("alloc back-buffer");
-        munmap(fb->mem, size);
+        munmap(fb->mem, fb->mmap_size);
         close(fb->fd);
         return -1;
     }
@@ -183,8 +249,34 @@ void fb_flip(FBDev *fb)
         uint32_t dummy = 0;
         ioctl(fb->fd, FBIO_WAITFORVSYNC, &dummy);
     }
-    memcpy(fb->mem, fb->back, (size_t)fb->stride * fb->height);
+    if (fb->line_double) {
+        for (int y = 0; y < fb->height; y++) {
+            const uint8_t *src = fb->back + (size_t)y * fb->stride;
+            uint8_t       *dst = fb->mem + (size_t)(2 * y) * fb->stride;
+            memcpy(dst, src, (size_t)fb->stride);
+            memcpy(dst + fb->stride, src, (size_t)fb->stride);
+        }
+    } else {
+        memcpy(fb->mem, fb->back, (size_t)fb->stride * fb->height);
+    }
+    if (s_reflip) fb_page_flip(0);   /* see fb_set_reflip */
     if (fb->headless) fb_dump_frame(fb);
+}
+
+void fb_sync_back(FBDev *fb)
+{
+    if (fb->line_double) {
+        for (int y = 0; y < fb->height; y++)
+            memcpy(fb->back + (size_t)y * fb->stride,
+                   fb->mem + (size_t)(2 * y) * fb->stride, (size_t)fb->stride);
+    } else {
+        memcpy(fb->back, fb->mem, (size_t)fb->stride * fb->height);
+    }
+}
+
+uint8_t *fb_mem_row(FBDev *fb, int y)
+{
+    return fb->mem + (size_t)(fb->line_double ? 2 * y : y) * fb->stride;
 }
 
 void fb_wait_vsync(FBDev *fb)
