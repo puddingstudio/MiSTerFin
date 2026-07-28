@@ -66,6 +66,22 @@ deploy: arm
 			root@$(MISTER_HOST):/media/fat/misterfin/subfont/; \
 		echo "subfont deployed"; \
 	fi
+	@if [ -d assets/font2x ]; then \
+		sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
+			"mkdir -p /media/fat/misterfin/font2x"; \
+		sshpass -p "1" scp -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
+			assets/font2x/font.desc assets/font2x/font-alpha.raw assets/font2x/font-bitmap.raw \
+			root@$(MISTER_HOST):/media/fat/misterfin/font2x/; \
+		echo "font2x deployed"; \
+	fi
+	@if [ -d assets/subfont2x ]; then \
+		sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
+			"mkdir -p /media/fat/misterfin/subfont2x"; \
+		sshpass -p "1" scp -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
+			assets/subfont2x/font.desc assets/subfont2x/font-alpha.raw assets/subfont2x/font-bitmap.raw \
+			root@$(MISTER_HOST):/media/fat/misterfin/subfont2x/; \
+		echo "subfont2x deployed"; \
+	fi
 	@if [ -d assets/toasty ]; then \
 		sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
 			"mkdir -p /media/fat/misterfin/toasty"; \

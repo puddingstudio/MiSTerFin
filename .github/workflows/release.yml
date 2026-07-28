@@ -40,6 +40,8 @@ jobs:
           cp jellyfin.conf.example release/misterfin/
           cp -r assets/font release/misterfin/font
           cp -r assets/subfont release/misterfin/subfont
+          cp -r assets/font2x release/misterfin/font2x
+          cp -r assets/subfont2x release/misterfin/subfont2x
           cp -r assets/toasty release/misterfin/toasty
           cp assets/about.png release/misterfin/
           chmod +x release/misterfin/misterfin-arm

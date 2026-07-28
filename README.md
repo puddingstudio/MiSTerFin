@@ -68,7 +68,7 @@ make arm
 make deploy
 ```
 
-`make deploy` copies `misterfin-arm`, `mplayer-arm`, `assets/font/`, `assets/subfont/`, `assets/toasty/`, `assets/about.png`, and the launcher script to the right places on the MiSTer — see the `deploy` target in `Makefile` if you want to do it manually instead.
+`make deploy` copies `misterfin-arm`, `mplayer-arm`, `assets/font/`, `assets/subfont/`, `assets/font2x/`, `assets/subfont2x/`, `assets/toasty/`, `assets/about.png`, and the launcher script to the right places on the MiSTer — see the `deploy` target in `Makefile` if you want to do it manually instead.
 
 `make deploy` targets `mister.local` by default. This works as-is if your MiSTer is visible under that hostname on your network (its stock image advertises itself via mDNS) and you haven't changed the default `root` login. If `mister.local` doesn't resolve for you, override it with your MiSTer's IP instead: `make deploy MISTER_HOST=192.168.x.x`.
 
@@ -102,6 +102,8 @@ The underlying switches are plain environment variables if you'd rather drive th
    mplayer-arm
    font/
    subfont/
+   font2x/
+   subfont2x/
    toasty/
    about.png
    jellyfin.conf      (see below)
