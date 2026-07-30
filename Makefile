@@ -3,7 +3,14 @@ SRCS = src/main.c src/fb.c src/ddr.c src/jellyfin.c src/json.c src/subtitles.c
 TARGET     = misterfin
 TARGET_ARM = misterfin-arm
 
-VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "dev")
+# --abbrev=0 would collapse this to the exact tag name even when the build
+# is N commits past it — indistinguishable from an actual release from the
+# About screen's point of view. Without it, a build that isn't exactly at a
+# tag gets the full "v0.9.6-2-g43bf1da" form instead, which the update
+# check (main.c) compares against the latest GitHub release tag byte-for-
+# byte — so a dev build correctly shows up as "different from the latest
+# release" and offers to install it, rather than silently claiming to BE it.
+VERSION ?= $(shell git describe --tags 2>/dev/null || echo "dev")
 
 CC     = gcc
 CFLAGS = -O2 -Wall -Wextra -Isrc -DAPP_VERSION=\"$(VERSION)\"
