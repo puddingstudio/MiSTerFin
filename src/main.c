@@ -18,6 +18,8 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -192,11 +194,79 @@ static void pageflip_end(void)
     g_pageflip_engaged = 0;
 }
 
+/* ── background music suspend/resume ─────────────────────────────────────
+ * A BGM script (venice1200/MiSTer_BGM's bgm.sh and its derivatives) stops
+ * its own music when a CORE loads, but MiSTerFin is a script, not a core —
+ * from BGM's point of view the Menu core never changed, so the music keeps
+ * playing underneath it and fights for the audio device/CPU, showing up as
+ * video stutter (reported in #15). Confirmed on real hardware (bgm.sh, as
+ * shipped): it plays MP3 via mpg123, WAV via aplay, MIDI via aplaymidi and
+ * VGM via vgmplay — there's no single player process to SIGSTOP. What it
+ * does have is its own control socket, the same one its interactive "Stop
+ * playing"/"Start playing" menu entries use, so this drives that instead of
+ * guessing at a process name. */
+#define BGM_SOCKET_PATH "/tmp/bgm.sock"
+
+/* Connects to bgm.sh's control socket, sends cmd, and (if out is non-NULL)
+ * reads its reply. Returns 0 if bgm.sh isn't running (no listener on the
+ * socket) or the connection dropped, in which case *out is left untouched. */
+static int bgm_send(const char *cmd, char *out, size_t outlen)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, BGM_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    int ok = (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    if (ok) {
+        ssize_t sent = write(fd, cmd, strlen(cmd));
+        ok = (sent == (ssize_t)strlen(cmd));
+        if (ok && out && outlen > 0) {
+            ssize_t n = read(fd, out, outlen - 1);
+            out[n > 0 ? n : 0] = '\0';
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+/* Set only once bgm_pause() has actually stopped a playing BGM — so
+ * bgm_resume() never turns music back ON for someone who had it paused (or
+ * had BGM's own "playback: disabled" setting) before MiSTerFin even
+ * started. */
+static int g_bgm_was_playing = 0;
+
+static void bgm_pause(void)
+{
+    /* "status" replies "<is_playing>\t<playback>\t<playlist>\t<file>" —
+     * <playback> (random/loop/disabled) is BGM's configured mode, unlike
+     * <is_playing> which flips to "no" for an instant between tracks even
+     * while a playlist is actively running. */
+    char status[64];
+    if (!bgm_send("status", status, sizeof(status))) return;
+    char *playback = strchr(status, '\t');
+    if (!playback || !strncmp(playback + 1, "disabled", 8)) return;
+
+    bgm_send("stop", NULL, 0);
+    g_bgm_was_playing = 1;
+}
+
+static void bgm_resume(void)
+{
+    if (!g_bgm_was_playing) return;
+    bgm_send("play", NULL, 0);
+    g_bgm_was_playing = 0;
+}
+
 static void emergency_cleanup(void)
 {
     /* A crash with Main_MiSTer SIGSTOPped (or the display parked on the
      * flip page) would leave the whole device wedged — undo both first. */
     pageflip_end();
+    bgm_resume();
     ddr_close();
     cursor_show();
 }
@@ -2738,7 +2808,9 @@ static void *quick_connect_thread(void *arg)
 {
     (void)arg;
 
-    if (!jf_quick_connect_enabled(&g_cfg)) { qc_set_state(QC_UNAVAILABLE); return NULL; }
+    int qc_enabled = jf_quick_connect_enabled(&g_cfg);
+    if (qc_enabled == 0)  { qc_set_state(QC_UNAVAILABLE); return NULL; }
+    if (qc_enabled  < 0)  { qc_set_state(QC_FAILED);       return NULL; }
 
     JfQuickConnect qc;
     if (!jf_quick_connect_initiate(&g_cfg, &qc)) { qc_set_state(QC_FAILED); return NULL; }
@@ -5548,6 +5620,8 @@ static void *startup_resolve_thread(void *arg)
      * be identical between authenticating and using the resulting token. */
     jf_device_id_init(&g_cfg);
 
+    jf_log_init(&g_cfg);   /* no-op unless "DEBUGLOG" is in jellyfin.conf */
+
     if (jf_token_load(&g_cfg) && jf_credential_works(&g_cfg)) {
         /* A previously earned Quick Connect token, still accepted. Checked
          * before the config's API key so that re-authenticating once sticks
@@ -5604,6 +5678,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "Cannot open /dev/fb0\n");
         return 1;
     }
+
+    bgm_pause();   /* see bgm_pause's own comment; undone by bgm_resume() below
+                     * and, on a crash, by emergency_cleanup(). Deliberately
+                     * after the fb_open check above, which returns early on
+                     * failure — pausing before that would leave BGM stuck
+                     * paused with nothing left running to resume it. */
+
     g_headless = fb.headless;   /* see g_headless' own comment */
     g_pageflip_mode = fb.line_double;   /* see pageflip_begin()'s comment */
     /* The interlaced menu core builds its own raster (in-core modeline
@@ -6277,6 +6358,8 @@ int main(int argc, char **argv)
      * cleanup underneath a thread that is mid-read on a curl pipe. */
     if (qc_running) { pthread_join(qc_tid, NULL); qc_running = 0; }
 
+    bgm_resume();
+    jf_log_close();
     player_stop();
     info_assets_free();
     ddr_close();

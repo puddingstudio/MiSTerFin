@@ -205,6 +205,9 @@ typedef struct {
     int  profile_width;
     int  profile_height;
     int  profile_bitrate;
+    /* "DEBUGLOG" config line — see jf_log_init. Off unless the user opted
+     * in, so nothing is ever written without them asking for it. */
+    int  debug_log;
 } JfConfig;
 
 /* One in-flight Quick Connect request. */
@@ -236,6 +239,27 @@ int jf_config_load(JfConfig *cfg);
  * file, or a token loaded/earned at runtime). */
 int jf_has_credential(const JfConfig *cfg);
 
+/* ── opt-in request log ──────────────────────────────────────────────────
+ * For diagnosing exactly the kind of bug that otherwise needs someone to SSH
+ * in and reproduce it live (see the #8 issue thread) — a user who hits e.g.
+ * "Nothing here" or a stuck Quick Connect screen can turn this on, reproduce
+ * it, and attach /media/fat/misterfin/debug.log to the report instead.
+ *
+ * Deliberately narrow, by construction rather than by care taken at each
+ * call site:
+ *   - Off unless cfg->debug_log is set ("DEBUGLOG" in jellyfin.conf) — never
+ *     writes to the SD card otherwise.
+ *   - Truncated fresh on every launch, same as crash.log — one session's
+ *     worth, not an unbounded file.
+ *   - Every request is logged as METHOD + path only, with the query string
+ *     always cut at '?'. That's what keeps a Quick Connect secret
+ *     (?secret=... on /QuickConnect/Connect) and every userId out of the
+ *     file without needing per-endpoint judgment calls. The Authorization
+ *     header (bearing the API key or access token) is never passed to the
+ *     logger at all — jf_log_request's signature has no parameter for it. */
+void jf_log_init(const JfConfig *cfg);
+void jf_log_close(void);
+
 /* Fills in cfg->device_id, generating and persisting a fresh random GUID the
  * first time. Call once after jf_config_load, before any request — the id
  * goes in the Authorization header of every one of them, and must not change
@@ -257,7 +281,10 @@ void jf_device_id_init(JfConfig *cfg);
  * be reported per-user rather than through the session endpoint — see
  * report_user_data. A Quick Connect token is the user, so neither applies. */
 
-/* 1 if the server has Quick Connect switched on, 0 if not or unreachable. */
+/* 1 if the server has Quick Connect switched on, 0 if it's genuinely off,
+ * -1 if the request itself failed (network blip, timeout, ...) — kept
+ * distinct from 0 so callers don't tell the user Quick Connect is disabled
+ * when the real problem is that the request never got an answer. */
 int jf_quick_connect_enabled(const JfConfig *cfg);
 
 /* Starts a request and fills in the secret + the code to show the user.

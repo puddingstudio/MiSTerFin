@@ -26,6 +26,22 @@ static void t(const char *label, const char *body,
                ew, eh, erate, ekey, emode);
     }
 }
+
+/* DEBUGLOG gets the same "recognised wherever it appears, never eaten as a
+ * credential" treatment as PAL/NTSC — checked separately from t() above
+ * since none of its existing callers care about debug_log. */
+static void tlog(const char *label, const char *body,
+                  int edebug, const char *ekey, const char *euser) {
+    FILE *f = fopen("./jellyfin.conf", "w"); fputs(body, f); fclose(f);
+    JfConfig c; jf_config_load(&c);
+    checks++;
+    int ok = c.debug_log == edebug && !strcmp(c.api_key, ekey) && !strcmp(c.username, euser);
+    if (!ok) { fails++;
+        printf("  FAIL %s\n    got debug_log=%d key=\"%s\" user=\"%s\"\n"
+               "    want debug_log=%d key=\"%s\" user=\"%s\"\n",
+               label, c.debug_log, c.api_key, c.username, edebug, ekey, euser);
+    }
+}
 int main(void) {
     t("no profile -> defaults", "http://s:8096\nPAL\n",
       720,576,12000000,"","PAL");
@@ -45,6 +61,14 @@ int main(void) {
     /* Trailing junk must not parse, and must fall through to the api_key slot. */
     t("trailing junk is a credential", "http://s:8096\n480x270junk\nbob\n",
       720,576,12000000,"480x270junk","PAL");
+
+    tlog("no DEBUGLOG -> off", "http://s:8096\nPAL\n", 0, "", "");
+    tlog("DEBUGLOG anywhere -> on", "http://s:8096\nDEBUGLOG\nkey123\nbob\nPAL\n",
+         1, "key123", "bob");
+    tlog("DEBUGLOG lowercase -> on", "http://s:8096\ndebuglog\n", 1, "", "");
+    tlog("DEBUGLOG not read as a credential", "http://s:8096\nkey123\nbob\nDEBUGLOG\nPAL\n",
+         1, "key123", "bob");
+
     printf("profile: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -544,6 +544,62 @@ static char *jf_curl_run(char *const argv[], int capture, int *exit_ok)
     return buf;
 }
 
+/* ── opt-in request log ──────────────────────────────────────────────────
+ * See jf_log_init's doc comment in jellyfin.h for the privacy rules this is
+ * built to guarantee structurally, not just by convention. */
+static FILE *g_jf_log = NULL;
+
+void jf_log_init(const JfConfig *cfg)
+{
+    if (!cfg->debug_log) return;   /* the only branch that ever touches the SD card */
+
+    const char *paths[] = {
+        "/media/fat/misterfin/debug.log",
+        "./debug.log",
+        NULL
+    };
+    for (int i = 0; paths[i] && !g_jf_log; i++)
+        g_jf_log = fopen(paths[i], "w");   /* "w", not "a" — fresh per launch, see header */
+    if (!g_jf_log) return;
+
+    fprintf(g_jf_log, "MiSTerFin %s — tv_mode=%s profile=%dx%d@%d\n",
+            APP_VERSION, cfg->tv_mode, cfg->profile_width, cfg->profile_height,
+            cfg->profile_bitrate);
+    fflush(g_jf_log);
+}
+
+void jf_log_close(void)
+{
+    if (g_jf_log) { fclose(g_jf_log); g_jf_log = NULL; }
+}
+
+/* method/path_and_query only — deliberately no cfg, no url, no auth header
+ * in this function's signature at all, so there is nothing here capable of
+ * writing a credential even by mistake. path_and_query is cut at the first
+ * '?': every secret this app ever puts in a query string (the Quick Connect
+ * secret, an ApiKey on a media URL) lands after that character, so the cut
+ * removes it regardless of which endpoint this is. */
+static void jf_log_request(const char *method, const char *path_and_query,
+                            int ok, double elapsed_ms, long bytes)
+{
+    if (!g_jf_log) return;
+
+    char path_only[160];
+    size_t n = strcspn(path_and_query, "?");
+    if (n >= sizeof(path_only)) n = sizeof(path_only) - 1;
+    memcpy(path_only, path_and_query, n);
+    path_only[n] = '\0';
+
+    time_t now = time(NULL);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
+
+    fprintf(g_jf_log, "[%s] %-4s %-48s %-4s %6.0fms %6ld bytes\n",
+            ts, method ? method : "GET", path_only,
+            ok ? "ok" : "FAIL", elapsed_ms, bytes);
+    fflush(g_jf_log);   /* request rate is low; a crash right after must not lose this line */
+}
+
 static char *jf_request_alloc(const JfConfig *cfg, const char *method,
                                const char *path_and_query, const char *body_file,
                                int timeout_secs)
@@ -580,7 +636,17 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
     argv[n++] = url;
     argv[n]   = NULL;
 
-    return jf_curl_run((char *const *)argv, 1, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int ok = 0;
+    char *result = jf_curl_run((char *const *)argv, 1, &ok);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    jf_log_request(method, path_and_query, ok && result != NULL, elapsed_ms,
+                    result ? (long)strlen(result) : 0);
+
+    return result;
 }
 
 /* Fetch + parse in one step. Returns 1 on success, with *r owning both the
@@ -671,6 +737,14 @@ int jf_config_load(JfConfig *cfg)
          * "PAL" or "NTSC". */
         if (!strcasecmp(line, "PAL") || !strcasecmp(line, "NTSC")) {
             strncpy(cfg->tv_mode, line, sizeof(cfg->tv_mode) - 1);
+            continue;
+        }
+
+        /* Same "recognised wherever it appears" treatment as PAL/NTSC above,
+         * and for the same reason — no server URL, key, username or TV mode
+         * is ever literally the string "DEBUGLOG". See jf_log_init. */
+        if (!strcasecmp(line, "DEBUGLOG")) {
+            cfg->debug_log = 1;
             continue;
         }
 
@@ -883,10 +957,10 @@ int jf_quick_connect_enabled(const JfConfig *cfg)
     /* Returns a bare `true`/`false` rather than an object — still valid JSON,
      * so the parser handles it and the root node is the boolean itself. */
     JfResponse r;
-    if (!jf_fetch(cfg, "/QuickConnect/Enabled", &r)) return 0;
+    if (!jf_fetch(cfg, "/QuickConnect/Enabled", &r)) return -1;
     int enabled = json_as_bool(json_root(&r.doc), 0);
     jf_response_free(&r);
-    return enabled;
+    return enabled ? 1 : 0;
 }
 
 int jf_quick_connect_initiate(const JfConfig *cfg, JfQuickConnect *qc)
@@ -1210,7 +1284,7 @@ int jf_list_seasons(const JfConfig *cfg, const char *series_id, JfItem *out, int
     snprintf(path, sizeof(path), "/Shows/%s/Seasons?userId=%s", safe_series, cfg->user_id);
 
     JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
+    if (!jf_fetch(cfg, path, &r)) return -1;   /* see jf_list_items */
     int n = parse_item_list(&r.doc, out, max);
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_SEASON;
     jf_response_free(&r);
