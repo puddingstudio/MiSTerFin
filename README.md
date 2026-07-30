@@ -62,13 +62,14 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 ## <a id="requirements"></a>Requirements
 
-- MiSTer FPGA (standard Linux image, standard `menu.rbf` — no special core required)
+- MiSTer FPGA (standard Linux image, standard `menu.rbf` — no special core required for the default progressive-scan output; true interlaced output needs an additional community core, see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output))
+- A way to get the picture onto a CRT — most confirmed setups use the official Analog I/O board; see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md) for confirmed combos and `MiSTer.ini` settings
 - A reachable Jellyfin server, and a way to sign in — Quick Connect (enabled by default on most installs, no API key or admin access needed) or an API key
 - `curl` on the MiSTer (included in the standard MiSTer Linux image)
 
 Grab the latest release zip from the [Releases](../../releases) page and skip straight to **Installation** below, or build from source if you'd rather. Everything needed to run MiSTerFin (including its own `mplayer-arm`) is built from this repo either way; you don't need a separate mplayer install or any other MiSTer app already set up.
 
-Prefer updating through a MiSTer Downloader? There's also a community-maintained [MiSTerFin database](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin) for [Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer) — install it once and future updates get picked up automatically alongside your other MiSTer Downloader-managed content, as an alternative to the in-app updater above.
+Prefer updating through a MiSTer Downloader? There's also a community-maintained [MiSTerFin database](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin) for [Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer) — install it once and future updates get picked up automatically alongside your other MiSTer Downloader-managed content, as an alternative to the in-app updater above. [MiSTer Companion](https://github.com/Anime0t4ku/mister-companion) builds on that same database to offer one-click install/update/uninstall for MiSTerFin from its own GUI.
 
 Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbdev:/dev/fb0`) and works on any menu core.
 
@@ -348,6 +349,8 @@ MiSTerFin made over the weekends at [Pudding Studio](https://pudding.studio).
 ## <a id="thanks"></a>Thanks
 
 Thanks to everyone who's filed a bug report, feature request, or bit of feedback — it's shaped a lot of what MiSTerFin looks like today.
+
+Thanks also to [theypsilon](https://github.com/theypsilon) for the [MultiDatabases_MiSTer integration](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin), and to [Anime0t4ku](https://github.com/Anime0t4ku) for building MiSTerFin support into [MiSTer Companion](https://github.com/Anime0t4ku/mister-companion).
 
 ---
 
