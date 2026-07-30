@@ -8,7 +8,22 @@ This doc tracks combos we've actually verified, plus the exact `MiSTer.ini` keys
 
 ---
 
-## ✅ Confirmed: Analog I/O board (VGA) → SCART → CRT TV (PAL)
+## Contents
+
+- [Confirmed: Analog I/O board (VGA) → SCART → CRT TV (PAL)](#scart-crt-pal)
+- [Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (PAL)](#component-pro-monitor-pal)
+- [Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (NTSC)](#component-pro-monitor-ntsc)
+- [Confirmed: Analog I/O board (VGA) → multisync VGA CRT monitor, IBM P76 (240p @ 120Hz)](#multisync-vga-240p)
+  - [PAL variant: 288p @ 100Hz](#pal-288p-100hz)
+- [True interlaced output (576i/480i) on a CRT TV](#interlaced-output)
+  - [Setup](#interlaced-setup)
+  - [Direct Video Adapter (HDMI-to-VGA DAC)](#hdmi-vga-dac)
+  - [Notes](#interlaced-notes)
+- [Untested / reported problem combos](#untested-combos)
+
+---
+
+## <a id="scart-crt-pal"></a>✅ Confirmed: Analog I/O board (VGA) → SCART → CRT TV (PAL)
 
 **Chain:** MiSTer main board → official MiSTer Analog I/O board (VGA-style DB15 output) → VGA-to-SCART cable → a classic consumer CRT TV, Sony Trinitron, SCART (RGB) input, PAL.
 
@@ -43,7 +58,7 @@ MiSTerFin (like any MiSTer Script) runs under the "Menu" core context, so this s
 
 ---
 
-## ✅ Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (PAL)
+## <a id="component-pro-monitor-pal"></a>✅ Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (PAL)
 
 **Chain:** MiSTer main board → official MiSTer Analog I/O board (VGA-style DB15 output) → VGA-to-3xRCA component breakout cable → Sony LMD-1410 (professional LCD monitor), component input, PAL.
 
@@ -76,7 +91,7 @@ The same `[Menu]`-scoped override from the SCART combo above (`vga_scaler=1` + t
 
 ---
 
-## ✅ Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (NTSC)
+## <a id="component-pro-monitor-ntsc"></a>✅ Confirmed: Analog I/O board (VGA) → Component (YPbPr) → professional monitor (NTSC)
 
 **Chain:** same hardware as the PAL Component combo above (Sony LMD-1410, component input) — this display supports both 525-line (NTSC) and 625-line (PAL) natively — just switched to NTSC.
 
@@ -110,7 +125,7 @@ video_mode=640,26,60,74,240,0,4,18,12587
 
 ---
 
-## ✅ Confirmed: Analog I/O board (VGA) → a real multisync VGA CRT monitor, IBM P76 (240p @ 120Hz)
+## <a id="multisync-vga-240p"></a>✅ Confirmed: Analog I/O board (VGA) → a real multisync VGA CRT monitor, IBM P76 (240p @ 120Hz)
 
 **This is still 240p** — MiSTerFin can't tell this apart from the NTSC Component combo above (same 640×240 framebuffer), it's just reaching a genuine computer VGA monitor instead of a SCART/component-input CRT TV.
 
@@ -145,7 +160,7 @@ That simpler 3-value `video_mode=width,height,Hz` form (rather than the full 9-v
 
 **Status:** confirmed working, including video and music playback — 2026-07-25.
 
-### PAL variant: 288p @ 100Hz
+### <a id="pal-288p-100hz"></a>PAL variant: 288p @ 100Hz
 
 The same trick has a PAL-side equivalent, and it's confirmed working on the same IBM P76 monitor — same cable, same chain, no new photos needed since it looks basically identical to the 240p shots above. This is essentially a clean, native PAL picture — PVM-style — on an ordinary VGA CRT monitor, and with 288 active lines instead of 240 it has a bit more vertical room to work with than the NTSC/240p variant.
 
@@ -174,7 +189,7 @@ video_mode=640,288,100
 
 ---
 
-## True interlaced output (576i/480i) on a CRT TV
+## <a id="interlaced-output"></a>True interlaced output (576i/480i) on a CRT TV
 
 Everything above scans out progressively — 288 (PAL) or 240 (NTSC) lines, each drawn every field, which gives the classic scanline look. A CRT TV was actually built for **interlaced** video: two half-line-offset fields alternating, filling all 625/525 raster lines. For film and TV content that's visibly smoother and "fuller" — no scanline gaps, broadcast-style motion — and side by side we found it clearly nicer to watch movies on.
 
@@ -182,7 +197,7 @@ Izzie Walton (@iwalton3) built a **standalone interlaced menu core** that adds t
 
 **Confirmed working** on the Analog I/O board: **SCART** and **Component (YPbPr)**, both **PAL and NTSC** — 2026-07-28.
 
-### Setup
+### <a id="interlaced-setup"></a>Setup
 
 1. **Download** [`InterlacedMenu.rbf`](https://github.com/iwalton3/Menu_MiSTer/releases/download/v0.0.1/InterlacedMenu.rbf) and put it in any core folder on your SD card — a separate one like `_Unstable` keeps it out of the way of your regular cores.
 2. **Copy your current, already-working `MiSTer.ini` to `MiSTer_alt_2.ini`** (same folder, SD card root). This alt-config is what the interlaced core will load — start from a copy of whatever already gives you a correct picture, not a blank file.
@@ -204,14 +219,22 @@ Izzie Walton (@iwalton3) built a **standalone interlaced menu core** that adds t
 
 4. **Load the core** (navigate to it in the regular MiSTer menu, e.g. inside `_Unstable`), then press **B + D-Pad Up** to switch to the interlaced config. Press **B + D-Pad Right** to switch back to your normal config at any time — this also happens automatically on reboot, so there's nothing to undo if you just want to try it once.
 
-### Notes
+### <a id="hdmi-vga-dac"></a>Direct Video Adapter (HDMI-to-VGA DAC)
+
+**Confirmed by @iwalton3** (not independently verified by us) on the [MiSTer FPGA IO Direct](https://misteraddons.com/products/mister-fpga-io-direct) — an HDMI-to-VGA DAC board — feeding an RGB-modded JVC CRT television. Works in both 240p and the standalone interlaced core's 480i mode. Only RGB video mode has been tested on this adapter; component or other output modes on this DAC remain unconfirmed.
+
+**Note:** the standalone interlaced core needs `forced_scandoubler=1` to double the framebuffer height for true 480i — a SCART/RGB-only setting, which gives no signal at all on a non-RGB path. If your setup can't use `forced_scandoubler=1`, use the replacement `menu.rbf`/`MiSTer` files from the original interlaced-core release instead of the standalone core file; the standalone core should fall back to 240p without it.
+
+**Status:** confirmed by iwalton3, not yet independently verified — 2026-07-30.
+
+### <a id="interlaced-notes"></a>Notes
 
 - Static UI elements (menu text, thin horizontal edges) *may* show slight interline flicker on some displays — it's inherent to interlaced video, not a bug. On other sets (including ours) the UI stays perfectly stable, so it comes down to your specific display. Either way, film/TV content is where this mode shines.
 - Progress on getting this upstreamed into the official MiSTer core is tracked in [issue #11](https://github.com/puddingstudio/MiSTerFin/issues/11).
 
 ---
 
-## Untested / reported problem combos
+## <a id="untested-combos"></a>Untested / reported problem combos
 
 *(to fill in as we verify or get reports)*
 
@@ -219,4 +242,4 @@ Izzie Walton (@iwalton3) built a **standalone interlaced menu core** that adds t
 - HDMI → Blackmagic-style capture card (see the aspect-ratio caveat below — MiSTer stretches a Script's framebuffer to fill the target `video_mode` canvas with no aspect correction, unlike FPGA cores)
 - Component (YPbPr) via a passive VGA-to-component adapter, i.e. **without** the official Analog I/O board (**likely does NOT work** — these adapters just rewire pins, they don't do the RGB→YPbPr color-space conversion; confirmed this produces "no sync" on at least one display we tried)
 - NTSC over SCART/RGB (NTSC is only confirmed over Component so far — see above)
-- Direct Video Adapter (HDMI-to-VGA DAC) for VGA/component output
+- Direct Video Adapter (HDMI-to-VGA DAC) for **component** output specifically — RGB mode is now confirmed, see "True interlaced output" above

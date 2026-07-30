@@ -10,7 +10,33 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 ---
 
-## Features
+## Contents
+
+- [Features](#features)
+- [Scope (v1)](#scope)
+- [Requirements](#requirements)
+- [Building from Source](#building-from-source)
+  - [Running it on a desktop](#running-on-desktop)
+- [Installation](#installation)
+- [Configuring `jellyfin.conf`](#configuring-jellyfin-conf)
+  - [Using an API key instead](#using-api-key)
+- [Controls](#controls)
+  - [Browser](#browser)
+  - [About screen (START)](#about-screen)
+  - [Info screen (movies/episodes)](#info-screen)
+  - [During video playback](#during-playback)
+  - [Track picker (SELECT during video playback)](#track-picker)
+  - [Now playing (music)](#now-playing)
+- [Known limitations](#known-limitations)
+- [Changelog](#changelog)
+  - [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+- [Credits](#credits)
+- [Thanks](#thanks)
+- [Licence](#licence)
+
+---
+
+## <a id="features"></a>Features
 
 - **Quick Connect sign-in** — no API key, no admin dashboard, no password typed on a gamepad. First launch shows a code; approve it from any device already signed into Jellyfin and the login is saved. A revoked login is detected and re-requested automatically. API keys still work for existing setups
 - **Continue Watching and Next Up** appear as the first two cards on the home screen, ahead of the libraries, and only when they have something in them. Episodes there show which series and which episode they are, since a row called "Episode 03" out of context identifies nothing
@@ -18,7 +44,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 - **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - **Info screen** with cover art, description, year, and status
 - **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
-- **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look, and genuinely tear-free thanks to a hardware page-flip technique. It runs on a standalone core that doesn't touch any MiSTer system files, switched live with a button combo: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv), confirmed working over SCART and Component/YPbPr, both PAL and NTSC
+- **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look, and genuinely tear-free thanks to a hardware page-flip technique. It runs on a standalone core that doesn't touch any MiSTer system files, switched live with a button combo: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output), confirmed working over SCART and Component/YPbPr, both PAL and NTSC
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
 - **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
@@ -26,7 +52,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 - **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
 - **About screen** with a GitHub-releases update check and one-button in-app update (A installs, applied on next launch); the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
-## Scope (v1)
+## <a id="scope"></a>Scope (v1)
 
 - Movies, TV shows, and Music — no photo libraries
 - Server-side transcode for video (the MiSTer's ARM Cortex-A9 can't decode arbitrary HEVC/4K sources locally) to a CRT-sized stream, then letterboxed/pillarboxed client-side to exactly fill the PAL/NTSC frame
@@ -34,7 +60,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 ---
 
-## Requirements
+## <a id="requirements"></a>Requirements
 
 - MiSTer FPGA (standard Linux image, standard `menu.rbf` — no special core required)
 - A reachable Jellyfin server, and a way to sign in — Quick Connect (enabled by default on most installs, no API key or admin access needed) or an API key
@@ -48,7 +74,7 @@ Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbd
 
 ---
 
-## Building from Source
+## <a id="building-from-source"></a>Building from Source
 
 Requires [Zig](https://ziglang.org) (for ARM cross-compilation of the app itself), [Docker](https://www.docker.com) (only for building `mplayer-arm`, MiSTerFin's own fbdev-patched mplayer — a one-time step, not needed again unless you want to rebuild it), and `sshpass` (only for `make deploy`, which copies everything over SSH — skip it and copy files manually if you don't want it installed).
 
@@ -74,7 +100,7 @@ make deploy
 
 If you'd rather not build `mplayer-arm` yourself, MPlayer 1.5 built with `--enable-fbdev --enable-alsa` and the vsync patch in `docker/vo_fbdev.c` applied will work — that's exactly what `docker/build-mplayer.sh` automates.
 
-### Running it on a desktop
+### <a id="running-on-desktop"></a>Running it on a desktop
 
 `tools/run-local.sh` runs the real app on an ordinary Linux box, so UI and API work doesn't need a flash-and-look cycle for every change. There's no `/dev/fb0` to draw into, so the app is pointed at a plain malloc'd buffer of the same size and reads keys from the terminal instead of `/dev/input/eventN`; every frame is dumped and converted to a PNG by `tools/raw_to_png.py` (stdlib `zlib` only — no image library needed).
 
@@ -93,7 +119,7 @@ The underlying switches are plain environment variables if you'd rather drive th
 
 ---
 
-## Installation
+## <a id="installation"></a>Installation
 
 1. Copy these files (from a downloaded release zip, or your own build) to `/media/fat/misterfin/` on your MiSTer:
 
@@ -121,7 +147,7 @@ The underlying switches are plain environment variables if you'd rather drive th
 
 ---
 
-## Configuring `jellyfin.conf`
+## <a id="configuring-jellyfin-conf"></a>Configuring `jellyfin.conf`
 
 Create `/media/fat/misterfin/jellyfin.conf`. The only line you actually need is your server:
 
@@ -144,7 +170,9 @@ If you do want to change it, it's recognised wherever it appears in the file —
 
 The main reason to set it is a constrained network: the default asks the server for about 12 Mbps (~1.5 MB/s — trivial over the wired connection MiSTers normally use, but potentially too much for a weak WiFi bridge). If playback stutters or audio drifts out of sync, set `480x270@8000000` — the original default from earlier releases, which also selects the exact scaling path those releases used.
 
-### Using an API key instead
+**Troubleshooting a bug?** Add a line containing just `DEBUGLOG` (also recognised wherever it appears) and MiSTerFin writes `/media/fat/misterfin/debug.log` — one line per server request (method, endpoint, ok/fail, timing), truncated fresh on every launch. Off by default, and never includes your server URL, credentials, or anything from a request's query string, so it's safe to attach to a bug report as-is. See `jellyfin.conf.example` for the full details.
+
+### <a id="using-api-key"></a>Using an API key instead
 
 Still supported, and unchanged if you already have one set up:
 
@@ -169,11 +197,11 @@ There is no on-screen keyboard for the server URL — edit the file over SSH (us
 
 ---
 
-## Controls
+## <a id="controls"></a>Controls
 
 Button labels below follow Xbox-style naming (bottom face button = A, right face button = B) — this matches most controllers, including generic/8BitDo pads in Xbox mode. Nintendo/SNES-style controllers are the notable exception: their A/B (and X/Y) positions are swapped relative to Xbox, so on those pads the button positions are reversed from the labels here.
 
-### Browser
+### <a id="browser"></a>Browser
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | Left / Right | Left / Right | Navigate the home screen's library carousel |
@@ -183,20 +211,20 @@ Button labels below follow Xbox-style naming (bottom face button = A, right face
 | A | Esc / Backspace / Z | Back (opens an exit-confirm dialog from the top-level library screen — A cancels, B confirms) |
 | START | Pause / Home | About screen |
 
-### About screen (START)
+### <a id="about-screen"></a>About screen (START)
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | B | Enter / X | Install the update, if one's available (applied on next launch) |
 | A | Esc / Backspace / Z | Back |
 
-### Info screen (movies/episodes)
+### <a id="info-screen"></a>Info screen (movies/episodes)
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | B | Enter / X | Play (resumes automatically if a resume position exists) |
 | SELECT | Tab | Restart from the beginning (only shown if a resume position exists) |
 | A | Esc / Backspace / Z | Back to browser |
 
-### During video playback
+### <a id="during-playback"></a>During video playback
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | B | Enter / X | Pause / resume |
@@ -206,7 +234,7 @@ Button labels below follow Xbox-style naming (bottom face button = A, right face
 | R | PageDown | VSync OFF |
 | A | Esc / Backspace / Z | Stop, back to browser |
 
-### Track picker (SELECT during video playback)
+### <a id="track-picker"></a>Track picker (SELECT during video playback)
 
 Two tabs — **AUDIO** and **SUBTITLES** — switched with the shoulder buttons.
 
@@ -220,9 +248,9 @@ Two tabs — **AUDIO** and **SUBTITLES** — switched with the shoulder buttons.
 
 A `>` marks the track currently playing. Changing the **subtitle** track is instant for text-based tracks (rendered client-side). Changing the **audio** track always restarts the stream at the current position — Jellyfin transcodes one chosen audio stream into what it sends, so there's no way to switch it client-side the way a subtitle can be. Changing both at once costs a single restart, not two.
 
-VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom. In [true interlaced mode](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv) the L/R VSync toggle isn't offered at all — video there is always tear-free via hardware page-flip, independent of VSync.
+VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing for a bit more decode headroom. In [true interlaced mode](docs/DISPLAY_COMPATIBILITY.md#interlaced-output) the L/R VSync toggle isn't offered at all — video there is always tear-free via hardware page-flip, independent of VSync.
 
-### Now playing (music) — selecting a track plays it immediately, no separate info screen
+### <a id="now-playing"></a>Now playing (music) — selecting a track plays it immediately, no separate info screen
 | Button | Keyboard | Action |
 |--------|----------|--------|
 | B | Enter / X | Pause / resume |
@@ -237,7 +265,7 @@ A keyboard works standalone, with no gamepad attached.
 
 ---
 
-## Known limitations
+## <a id="known-limitations"></a>Known limitations
 
 Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, including Music), resume position, cover art, subtitles, video playback (transcoded over TS), and music playback (direct-played FLAC/MP3) all confirmed working end-to-end on real MiSTer hardware.
 
@@ -256,15 +284,15 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ---
 
-## Changelog
+## <a id="changelog"></a>Changelog
 
-### v0.9.6
-- True interlaced (576i/480i) output, via a standalone core that doesn't touch any MiSTer system files — switch live with a button combo, reverts automatically on reboot (see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv))
+### <a id="v0-9-6"></a>v0.9.6
+- True interlaced (576i/480i) output, via a standalone core that doesn't touch any MiSTer system files — switch live with a button combo, reverts automatically on reboot (see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output))
 - Video in that mode is genuinely tear-free, using a hardware page-flip technique — no FPGA/core changes involved
 - MiSTerFin automatically adapts its UI, video letterboxing, and on-screen text to the real interlaced framebuffer resolution — no configuration needed
 - Confirmed working over SCART and Component/YPbPr, both PAL and NTSC
 
-### v0.9.5
+### <a id="v0-9-5"></a>v0.9.5
 - Sharper video out of the box — the default transcode is now full standard-definition resolution (720x576 @ 12 Mbps, up from 480x270 @ 8 Mbps; applies to PAL and NTSC alike), measured on hardware with plenty of CPU headroom left
 - Correct letterboxing for any transcode profile, not just the default
 - Files already stored in the requested format now always get a clean transcode (previously they could pass through as raw interlaced video and play slow and glitchy)
@@ -272,7 +300,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - Music: the immersive now-playing cover is the same physical size on NTSC as on PAL
 - New guide: experimental interlaced (576i/480i) CRT output — smoother, broadcast-style motion on analog outputs, using patched cores by iwalton3
 
-### v0.9.4
+### <a id="v0-9-4"></a>v0.9.4
 - **Quick Connect sign-in** — no API key or admin dashboard needed; approve a code from any signed-in Jellyfin device (API keys still work)
 - **Continue Watching and Next Up** rows on the home screen
 - **Alternate audio track selection** — switch audio streams, not just subtitles
@@ -286,7 +314,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - Optional transcode resolution/bitrate override in `jellyfin.conf` for experimentation — the default is tuned and works correctly out of the box
 - Controllers keep working after a disconnect/reconnect
 
-### v0.9.3
+### <a id="v0-9-3"></a>v0.9.3
 - Redesigned info screen — full-height backdrop art, bigger logo, star rating
 - Home screen loads faster — library covers now cache to the SD card and prefetch in the background
 - No more black screen on startup — shows a loading indicator instead
@@ -294,35 +322,40 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - Jellyfin dashboard now correctly shows device name and app version
 - Display compatibility guide now also covers PAL 288p@100Hz on VGA CRT monitors
 
-### v0.9.2
+### <a id="v0-9-2"></a>v0.9.2
 - Fixed video corruption (comb/tearing artifacts) on NTSC displays
 - Various NTSC UI polish — margins, list size, music player cover
 - Display compatibility guide now also covers VGA CRT monitors (240p@120Hz)
 
-### v0.9.1
+### <a id="v0-9-1"></a>v0.9.1
 - NTSC display support — UI now adapts correctly instead of looking stretched
 - New display compatibility guide for CRT/SCART/component setups having trouble getting picture
 
-### v0.9
+### <a id="v0-9"></a>v0.9
 - First public preview release
 
 ---
 
-## Credits
+## <a id="credits"></a>Credits
 
-MiSTerFin is made by [Pudding Studio](https://pudding.studio).
+MiSTerFin made over the weekends at [Pudding Studio](https://pudding.studio).
 
-Quick Connect sign-in, alternate audio track selection, Continue Watching / Next Up, the real JSON parser, large-library pagination, the subtitle handling improvements, a configurable transcode profile, the controller-reconnect hardening, an off-hardware test harness, and a thorough security-hardening pass were contributed by **[Izzie Walton (@iwalton3)](https://github.com/iwalton3)** in [#6](https://github.com/puddingstudio/MiSTerFin/pull/6) — a substantial contribution, tested end-to-end on real hardware. Thank you.
+**[Izzie Walton (@iwalton3)](https://github.com/iwalton3)** — thank you:
 
-True interlaced (480i/576i) output is also thanks to the same contributor — a [standalone interlaced menu core](https://github.com/iwalton3/Menu_MiSTer/releases/tag/v0.0.1) that adds real scaler-level interlaced scanout without touching `Main_MiSTer` or your main `menu.rbf`. See the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#true-interlaced-output-576i480i-on-a-crt-tv) for setup.
+- Quick Connect sign-in, alternate audio track selection, Continue Watching / Next Up, the real JSON parser, large-library pagination, the subtitle handling improvements, a configurable transcode profile, the controller-reconnect hardening, an off-hardware test harness, and a thorough security-hardening pass — a substantial contribution, tested end-to-end on real hardware, in [#6](https://github.com/puddingstudio/MiSTerFin/pull/6)
+- True interlaced (480i/576i) output — a [standalone interlaced menu core](https://github.com/iwalton3/Menu_MiSTer/releases/tag/v0.0.1) that adds real scaler-level interlaced scanout without touching `Main_MiSTer` or your main `menu.rbf`. See the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output) for setup
+
+## <a id="thanks"></a>Thanks
+
+Thanks to everyone who's filed a bug report, feature request, or bit of feedback — it's shaped a lot of what MiSTerFin looks like today.
 
 ---
 
-## Licence
+## <a id="licence"></a>Licence
 
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free to use, share, and modify, non-commercial only.
 
 ---
 
-| <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio<br><br>*with the power of open source*<br>major contributions by [Izzie Walton (@iwalton3)](https://github.com/iwalton3) |
+| <a href="https://pudding.studio"><img src=".github/images/pudding.gif" width="100"></a> | *made over the weekends at pudding*<br>https://pudding.studio |
 |:---:|:---|
