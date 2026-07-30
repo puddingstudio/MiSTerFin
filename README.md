@@ -19,6 +19,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Running it on a desktop](#running-on-desktop)
 - [Installation](#installation)
 - [Configuring `jellyfin.conf`](#configuring-jellyfin-conf)
+  - [Using Quick Connect](#using-quick-connect)
   - [Using an API key instead](#using-api-key)
 - [Controls](#controls)
   - [Browser](#browser)
@@ -157,12 +158,6 @@ http://<your-jellyfin-ip>:8096
 PAL
 ```
 
-On first launch MiSTerFin shows a **Quick Connect** code. Open Jellyfin on any device where you're already signed in, go to your user menu → Quick Connect, and type the code in. That's it — the resulting login is saved to `token.conf` next to the config, so it's a one-time step. If the login is ever revoked, the app notices and asks again by itself.
-
-Two small files get written next to `jellyfin.conf` and don't need creating yourself: `token.conf` (the saved login) and `device.conf` (a random GUID identifying this install to the server). Delete `token.conf` to sign out. Don't copy `device.conf` between two MiSTers that use the same Jellyfin account — Jellyfin logs out any existing session sharing a device id, so they'd take turns signing each other out.
-
-Quick Connect must be enabled server-side (Dashboard → General → Quick Connect); it's on by default on most installs. If it's off, MiSTerFin says so and tells you the alternative.
-
 **TV mode** is `PAL` or `NTSC`, optional, defaults to `PAL`. It's recognised wherever it appears in the file, so you don't have to pad the lines above it.
 
 **Transcode profile** is optional and you normally shouldn't touch it. The default (`720x576@12000000` — full standard-definition source resolution, for PAL and NTSC alike; the video is scaled to exactly fit whichever mode your MiSTer outputs) is the tuned, known-good value and is what MiSTerFin uses if you leave this out — measured on hardware across widescreen and 4:3 content with no dropped frames, no A/V drift, and plenty of CPU headroom left. The setting exists as a tuning knob, not something a normal setup needs to set.
@@ -172,6 +167,16 @@ If you do want to change it, it's recognised wherever it appears in the file —
 The main reason to set it is a constrained network: the default asks the server for about 12 Mbps (~1.5 MB/s — trivial over the wired connection MiSTers normally use, but potentially too much for a weak WiFi bridge). If playback stutters or audio drifts out of sync, set `480x270@8000000` — the original default from earlier releases, which also selects the exact scaling path those releases used.
 
 **Troubleshooting a bug?** Add a line containing just `DEBUGLOG` (also recognised wherever it appears) and MiSTerFin writes `/media/fat/misterfin/debug.log` — one line per server request (method, endpoint, ok/fail, timing), truncated fresh on every launch. Off by default, and never includes your server URL, credentials, or anything from a request's query string, so it's safe to attach to a bug report as-is. See `jellyfin.conf.example` for the full details.
+
+### <a id="using-quick-connect"></a>Using Quick Connect
+
+The default and preferred way to sign in — nothing to type on the config side beyond the server URL above.
+
+On first launch MiSTerFin shows a **Quick Connect** code. Open Jellyfin on any device where you're already signed in, go to your user menu → Quick Connect, and type the code in. That's it — the resulting login is saved to `token.conf` next to the config, so it's a one-time step. If the login is ever revoked, the app notices and asks again by itself.
+
+Two small files get written next to `jellyfin.conf` and don't need creating yourself: `token.conf` (the saved login) and `device.conf` (a random GUID identifying this install to the server). Delete `token.conf` to sign out. Don't copy `device.conf` between two MiSTers that use the same Jellyfin account — Jellyfin logs out any existing session sharing a device id, so they'd take turns signing each other out.
+
+Quick Connect must be enabled server-side (Dashboard → General → Quick Connect); it's on by default on most installs. If it's off, MiSTerFin says so and tells you the alternative.
 
 ### <a id="using-api-key"></a>Using an API key instead
 
