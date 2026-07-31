@@ -321,6 +321,26 @@ static void cursor_show(void)
     if (sf >= 0) { write(sf, "1", 1); close(sf); }
 }
 
+/* Byte-for-byte file comparison (chunked, no allocation beyond the two
+ * stack buffers). Any I/O error reads as "not identical" — used for the
+ * Zaparoo core detection below, where a false negative just means the
+ * standard video path, never a wrong one. */
+static int files_identical(const char *a, const char *b)
+{
+    FILE *fa = fopen(a, "rb"), *fb_ = fopen(b, "rb");
+    int same = (fa && fb_);
+    while (same) {
+        unsigned char ba[65536], bb[65536];
+        size_t na = fread(ba, 1, sizeof(ba), fa);
+        size_t nb = fread(bb, 1, sizeof(bb), fb_);
+        if (na != nb || memcmp(ba, bb, na) != 0) same = 0;
+        else if (na < sizeof(ba)) break;   /* EOF on both, all equal */
+    }
+    if (fa) fclose(fa);
+    if (fb_) fclose(fb_);
+    return same;
+}
+
 static void fmt_time(char *buf, size_t sz, double secs)
 {
     if (secs < 0) secs = 0;
@@ -4886,24 +4906,41 @@ int main(int argc, char **argv)
         draw_setup_screen(&fb, g_setup_reason);
     }
 
-    /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu core
-     * (same guard MiSTerDVD uses — running the DDR copy loop against standard
-     * menu.rbf adds bus contention without benefit).
+    /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu
+     * core (same idea as MiSTerDVD's guard — running the DDR copy loop
+     * against a core that never reads it adds bus contention without
+     * benefit).
      *
-     * The size check reads the menu.rbf FILE, but that's only what boots by
-     * default — a manually loaded core (the standalone interlaced one, most
-     * likely) is what's actually running, and the file check can't see that.
-     * The framebuffer geometry can: the interlaced core always presents a
-     * 576/480-line buffer (fb.line_double), and the Zaparoo DDR path belongs
-     * to a progressive menu core by definition. Without this, a user with
-     * the Zaparoo core installed as menu.rbf (MiSTerDVD's own install path)
-     * who watches through the interlaced core would burn a per-frame DDR
-     * copy + vsync wait on a scanout path the loaded core never reads —
-     * precisely in the mode with the least CPU headroom to spare. */
+     * Detected by comparing menu.rbf's CONTENT against the installed
+     * Zaparoo copy (/media/fat/zaparoo/menu_zaparoo.rbf — the exact file
+     * MiSTerDVD's install script copies into place), so detection survives
+     * Zaparoo releasing a new build. The old exact-size check stays as a
+     * fallback for a card where the zaparoo/ folder was deleted after
+     * install. Size compare gates the byte compare, so the common
+     * stock-core case costs one stat().
+     *
+     * The file checks only reflect what boots by default — a manually
+     * loaded core (the standalone interlaced one, most likely) is what's
+     * actually running, and no file check can see that. The framebuffer
+     * geometry can: the interlaced core always presents a 576/480-line
+     * buffer (fb.line_double), and the Zaparoo DDR path belongs to a
+     * progressive menu core by definition. Without that gate, a user with
+     * the Zaparoo core installed as menu.rbf who watches through the
+     * interlaced core would burn a per-frame DDR copy + vsync wait on a
+     * scanout path the loaded core never reads — precisely in the mode
+     * with the least CPU headroom to spare. */
     {
         struct stat mst;
-        int zaparoo_active = (stat("/media/fat/menu.rbf", &mst) == 0 &&
-                              mst.st_size == 2513448);
+        int zaparoo_active = 0;
+        if (stat("/media/fat/menu.rbf", &mst) == 0) {
+            struct stat zst;
+            if (stat("/media/fat/zaparoo/menu_zaparoo.rbf", &zst) == 0 &&
+                zst.st_size == mst.st_size)
+                zaparoo_active = files_identical("/media/fat/menu.rbf",
+                                                 "/media/fat/zaparoo/menu_zaparoo.rbf");
+            if (!zaparoo_active && mst.st_size == 2513448)
+                zaparoo_active = 1;   /* legacy build, zaparoo/ folder gone */
+        }
         if (zaparoo_active && !fb.line_double && ddr_init() == 0)
             ddr_set_mode(strcasecmp(g_cfg.tv_mode, "NTSC") == 0 ? 0 : 2);
     }
