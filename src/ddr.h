@@ -8,10 +8,14 @@
  * But the Zaparoo Project (https://zaparoo.org) maintains a dual-mode fork
  * of the menu core (menu_zaparoo.rbf, feat/dual-mode-native-fb) that can
  * ALSO scan video out natively from DDR, and users who installed it (e.g.
- * via MiSTerDVD's install-menu-rbf.sh) get tear-free native-resolution
- * playback for free. This file is MiSTerFin's side of that protocol, so
- * the app works on both cores and quietly takes the better video path
- * when the Zaparoo core is what's installed. Detection is main.c's
+ * via MiSTerDVD's install-menu-rbf.sh) get double-buffered, structurally
+ * tear-free playback with broadcast-style native scanout. That is a
+ * trade-off rather than an upgrade over the standard path (which is
+ * already tear-free in normal use via the mplayer vsync wait): the native
+ * modes below scan out at 352 pixels wide, a downscale from the 640-wide
+ * framebuffer. This file is MiSTerFin's side of that protocol, so the app
+ * works on both cores and uses the native path when the Zaparoo core is
+ * what's installed. Detection is main.c's
  * exact-size check on /media/fat/menu.rbf; on a stock core nothing here
  * ever runs.
  *
