@@ -34,6 +34,12 @@ where it lives and under what terms. MiSTerFin's own code is licensed
   implementation of its DDR native-video protocol; when that core is
   installed, playback uses it automatically. See the note in `src/ddr.h`.
 
+- **[Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer)** — the
+  MiSTer-devel main firmware, GPL. `src/fb.c`'s FPGA SPI protocol (the
+  vsync wait and the framebuffer page flip — register addresses, command
+  words, handshake sequence) is this project's own implementation of the
+  protocol as defined by Main_MiSTer's source; no code was copied.
+
 - **[Interlaced Menu core](https://github.com/iwalton3/Menu_MiSTer/releases/tag/v0.0.1)**
   — Izzie Walton's GPL fork of Menu_MiSTer adding true 576i/480i scanout,
   downloaded separately by users who want interlaced output (see the
