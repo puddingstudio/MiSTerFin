@@ -30,7 +30,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
@@ -291,6 +291,15 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## <a id="changelog"></a>Changelog
+
+### <a id="v0-9-7"></a>v0.9.7
+- New opt-in `DEBUGLOG` line in `jellyfin.conf` writes `/media/fat/misterfin/debug.log` (method/endpoint/ok-fail/timing per server request) — off by default, never logs your server URL or credentials, safe to attach to a bug report
+- Fixed "Nothing here" showing up on large libraries — a slow/failed request (common on a series with a lot of seasons/episodes) was being treated as a genuinely empty list instead of falling back to what was already loaded
+- Fixed Quick Connect wrongly reporting itself disabled on a network hiccup instead of just failing/offering a retry
+- MiSTerFin now pauses a running BGM script (bgm.sh and derivatives) automatically while it's running, and resumes it exactly where it left off on exit
+- Dev/pre-release builds no longer show up on the About screen as if they were the latest official release
+- New confirmed display combo: MiSTer FPGA IO Direct (HDMI-to-VGA DAC), RGB mode
+- [MiSTer Companion](https://github.com/Anime0t4ku/mister-companion) now offers one-click install/update/uninstall for MiSTerFin
 
 ### <a id="v0-9-6"></a>v0.9.6
 - True interlaced (576i/480i) output, via a standalone core that doesn't touch any MiSTer system files — switch live with a button combo, reverts automatically on reboot (see the [display compatibility guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output))
