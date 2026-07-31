@@ -15,9 +15,9 @@
  * modes below scan out at 352 pixels wide, a downscale from the 640-wide
  * framebuffer. This file is MiSTerFin's side of that protocol, so the app
  * works on both cores and uses the native path when the Zaparoo core is
- * what's installed. Detection is main.c's
- * exact-size check on /media/fat/menu.rbf; on a stock core nothing here
- * ever runs.
+ * what's installed. Detection is main.c's content comparison of
+ * /media/fat/menu.rbf against the installed Zaparoo copy; on a stock core
+ * nothing here ever runs.
  *
  * The FPGA core reads frames from DDR instead of the framebuffer when the
  * control word contains the magic 0x5A50.  Without the Zaparoo menu.rbf
