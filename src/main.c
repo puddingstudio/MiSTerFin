@@ -1660,6 +1660,15 @@ static void draw_about(FBDev *fb) { draw_about_frame(fb, 1); }
  * starfield/cover-art chrome as the About screen (so it's not a jarring,
  * differently-styled dead end), with the About screen's own description
  * text swapped out for setup instructions. */
+/* True when the server is https:// but TLS verification hasn't been opted
+ * out of — so a connection failure might really be a self-signed cert the
+ * user needs to allow with INSECURE_TLS (see jf_add_tls_args). Empty/http
+ * servers return 0, so the hint only appears where it can actually apply. */
+static int server_https_needs_insecure_hint(void)
+{
+    return !g_cfg.insecure_tls && strncasecmp(g_cfg.server, "https", 5) == 0;
+}
+
 static void draw_setup_screen(FBDev *fb, const char *reason)
 {
     fb_clear(fb);
@@ -1879,6 +1888,14 @@ static void draw_quick_connect(FBDev *fb)
         const char *l2 = "B: try again";
         draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_ERR);
         cur_y += sch + lsp * 2;
+        /* An https server that can't be reached with verification on is
+         * most likely a self-signed cert — surface the fix here too, since
+         * a saved-token or QC user never touches the setup screen above. */
+        if (server_https_needs_insecure_hint()) {
+            const char *lt = "If HTTPS self-signed, set INSECURE_TLS in jellyfin.conf";
+            draw_text(fb, (fb->width - text_width(fb, lt, s1)) / 2, cur_y, lt, s1, COL_HINT);
+            cur_y += sch + lsp * 2;
+        }
         draw_text(fb, (fb->width - text_width(fb, l2, s1)) / 2, cur_y, l2, s1, COL_ITEM);
         break;
     }
@@ -4700,9 +4717,16 @@ int main(int argc, char **argv)
          * blame the config for that, it might be perfectly correct and
          * the server's just down/wrong URL. 0 = server answered but no
          * user matched, which really is a config problem. */
-        snprintf(g_setup_reason, sizeof(g_setup_reason),
-                 resolved == -1 ? "Can't connect to server (check server URL)"
-                                : "Username not found on server (check spelling)");
+        if (resolved == -1 && server_https_needs_insecure_hint())
+            /* An https server we couldn't reach with verification on is most
+             * likely a self-signed cert — point at the fix rather than the
+             * URL. */
+            snprintf(g_setup_reason, sizeof(g_setup_reason),
+                     "Can't reach server - if HTTPS self-signed, set INSECURE_TLS");
+        else
+            snprintf(g_setup_reason, sizeof(g_setup_reason),
+                     resolved == -1 ? "Can't connect to server (check server URL)"
+                                    : "Username not found on server (check spelling)");
         draw_setup_screen(&fb, g_setup_reason);
     }
 
