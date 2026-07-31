@@ -375,6 +375,8 @@ Thanks to everyone who's filed a bug report, feature request, or bit of feedback
 
 Thanks also to [theypsilon](https://github.com/theypsilon) for the [MultiDatabases_MiSTer integration](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin), and to [Anime0t4ku](https://github.com/Anime0t4ku) for building MiSTerFin support into [MiSTer Companion](https://github.com/Anime0t4ku/mister-companion).
 
+MiSTerFin also stands on some excellent open-source work — stb_image, font8x8, MPlayer, and the Zaparoo Project's dual-mode menu core among them. The full list, with licences and where each piece lives, is in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+
 ---
 
 ## <a id="licence"></a>Licence
