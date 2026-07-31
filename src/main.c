@@ -4888,12 +4888,23 @@ int main(int argc, char **argv)
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu core
      * (same guard MiSTerDVD uses — running the DDR copy loop against standard
-     * menu.rbf adds bus contention without benefit). */
+     * menu.rbf adds bus contention without benefit).
+     *
+     * The size check reads the menu.rbf FILE, but that's only what boots by
+     * default — a manually loaded core (the standalone interlaced one, most
+     * likely) is what's actually running, and the file check can't see that.
+     * The framebuffer geometry can: the interlaced core always presents a
+     * 576/480-line buffer (fb.line_double), and the Zaparoo DDR path belongs
+     * to a progressive menu core by definition. Without this, a user with
+     * the Zaparoo core installed as menu.rbf (MiSTerDVD's own install path)
+     * who watches through the interlaced core would burn a per-frame DDR
+     * copy + vsync wait on a scanout path the loaded core never reads —
+     * precisely in the mode with the least CPU headroom to spare. */
     {
         struct stat mst;
         int zaparoo_active = (stat("/media/fat/menu.rbf", &mst) == 0 &&
                               mst.st_size == 2513448);
-        if (zaparoo_active && ddr_init() == 0)
+        if (zaparoo_active && !fb.line_double && ddr_init() == 0)
             ddr_set_mode(strcasecmp(g_cfg.tv_mode, "NTSC") == 0 ? 0 : 2);
     }
 
