@@ -2567,6 +2567,25 @@ static double carousel_ease(double t)
     return 1.0 - inv * inv * inv;
 }
 
+/* One quiet line under the title when a newer release exists — home
+ * carousel only, the list view stays clean. START already opens the About
+ * screen from anywhere, and that's where the install button lives, so
+ * this is a signpost rather than a new path. Hidden while a download is
+ * running or applied: About is telling that story to whoever started it.
+ * Drawn by BOTH the settled carousel frame and every slide-animation
+ * frame — left out of the animation it blinked off during each
+ * LEFT/RIGHT transition while the title/clock/hints stayed put. */
+static void draw_carousel_update_notice(FBDev *fb)
+{
+    UpdateState  us;
+    InstallState is;
+    update_get_state(&us, &is, NULL, 0);
+    if (us == UPD_AVAILABLE && is == INST_IDLE) {
+        const char *upd = "START:update available";
+        draw_text(fb, SAFE_X, SAFE_Y + 20, upd, 1, COL_HINT);
+    }
+}
+
 /* LEFT/RIGHT slide between old_sel and new_sel. Cards slide (eased) across
  * the whole animation; the background grid fades to black at the midpoint
  * and back in — which is also exactly when the grid is switched to the new
@@ -2597,6 +2616,7 @@ static void carousel_slide_animate(FBDev *fb, int old_sel, int new_sel)
         fb_fill_rect_alpha(fb, 0, 0, fb->width, fb->height, 0, 0, 0, black_alpha);
         draw_grid_gradient(fb);
         draw_top_bar(fb, "MiSTerFin");
+        draw_carousel_update_notice(fb);
         draw_carousel_cards(fb, visual, cy);
         draw_carousel_hint(fb);
         fb_flip(fb);
@@ -2620,7 +2640,7 @@ static void draw_browse_carousel(FBDev *fb)
     draw_grid_background(fb);
     draw_grid_gradient(fb);
     draw_top_bar(fb, "MiSTerFin");
-
+    draw_carousel_update_notice(fb);
     draw_carousel_cards(fb, (double)g_sel, carousel_cy(fb));
     draw_carousel_hint(fb);
 
