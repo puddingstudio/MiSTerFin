@@ -14,6 +14,20 @@
 #ifndef APP_VERSION
 #define APP_VERSION "dev"
 #endif
+
+/* Absolute path so a planted "curl" earlier in PATH can't be run in our
+ * place — this process is root on a MiSTer. /usr/bin/curl is where the
+ * stock image ships it (also symlinked at /bin/curl); if it's ever
+ * missing, execv fails and the request fails cleanly, same as any other
+ * transport error. */
+#define CURL_BIN "/usr/bin/curl"
+
+/* Hard ceiling on a single captured response. Legit Jellyfin JSON for one
+ * page of a large library is well under this; the cap only ever trips on a
+ * runaway/hostile stream, which would otherwise grow the heap until the
+ * kernel OOM-kills something. A capped request just fails and the caller
+ * falls back the same way it does for any dropped connection. */
+#define JF_MAX_RESPONSE (32 * 1024 * 1024)
 /* Client/Device/Version identify us to Jellyfin's own Dashboard → Devices
  * list — without them the server had nothing to go on beyond the bare token
  * and showed up as a generic/guessed name instead of "MiSTerFin". DeviceId is
@@ -504,7 +518,7 @@ static char *jf_curl_run(char *const argv[], int capture, int *exit_ok)
             if (!capture) dup2(devnull, STDOUT_FILENO);
             close(devnull);
         }
-        execvp("curl", argv);
+        execv(CURL_BIN, argv);
         _exit(127);
     }
 
@@ -517,6 +531,7 @@ static char *jf_curl_run(char *const argv[], int capture, int *exit_ok)
         if (buf) {
             for (;;) {
                 if (len + 1 >= cap) {
+                    if (cap >= JF_MAX_RESPONSE) { free(buf); buf = NULL; len = 0; break; }
                     size_t ncap = cap * 2;
                     char *grown = (char *)realloc(buf, ncap);
                     if (!grown) { free(buf); buf = NULL; len = 0; break; }
@@ -665,18 +680,26 @@ static int jf_fetch(const JfConfig *cfg, const char *path_and_query, JfResponse 
  * written to a temp file to avoid quoting issues in the curl command line. */
 static void jf_post_json(const JfConfig *cfg, const char *path, const char *json_body)
 {
+    /* mkstemp, not a getpid()-based name: the pid is identical across
+     * threads (so two concurrent POSTs would clash) and predictable (so a
+     * pre-planted symlink at the path would be followed by this root
+     * process). mkstemp creates the file itself with O_EXCL and a random
+     * suffix, closing both. */
     char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), "/tmp/misterfin_post_%d.json", getpid());
-
-    FILE *f = fopen(tmp_path, "w");
-    if (!f) return;
-    fputs(json_body, f);
-    fclose(f);
+    snprintf(tmp_path, sizeof(tmp_path), "/tmp/misterfin_post_XXXXXX");
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp_path); return; }
+    /* A short write here means a truncated/invalid body, so don't send it —
+     * the earlier version could POST a partial JSON payload silently. */
+    int ok = (fputs(json_body, f) >= 0);
+    if (fclose(f) != 0) ok = 0;
 
     /* Reuses the same no-shell path as every other request — see
      * jf_curl_run. The response is discarded, but the arguments still carry
      * the server-issued token. */
-    free(jf_request_alloc(cfg, "POST", path, tmp_path, 5));
+    if (ok) free(jf_request_alloc(cfg, "POST", path, tmp_path, 5));
     unlink(tmp_path);
 }
 
@@ -937,11 +960,16 @@ static int jf_post_fetch(const JfConfig *cfg, const char *path,
 
     char tmp_path[64] = "";
     if (json_body) {
-        snprintf(tmp_path, sizeof(tmp_path), "/tmp/misterfin_qc_%d.json", getpid());
-        FILE *f = fopen(tmp_path, "w");
-        if (!f) return 0;
-        fputs(json_body, f);
-        fclose(f);
+        /* mkstemp for the same reason as jf_post_json — unique per call,
+         * not a followable predictable path. */
+        snprintf(tmp_path, sizeof(tmp_path), "/tmp/misterfin_qc_XXXXXX");
+        int fd = mkstemp(tmp_path);
+        if (fd < 0) return 0;
+        FILE *f = fdopen(fd, "w");
+        if (!f) { close(fd); unlink(tmp_path); return 0; }
+        int ok = (fputs(json_body, f) >= 0);
+        if (fclose(f) != 0) ok = 0;
+        if (!ok) { unlink(tmp_path); return 0; }
     }
 
     r->text = jf_request_alloc(cfg, "POST", path, json_body ? tmp_path : NULL, 10);
