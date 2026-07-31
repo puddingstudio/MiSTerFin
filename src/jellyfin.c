@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #ifndef APP_VERSION
@@ -615,6 +616,40 @@ static void jf_log_request(const char *method, const char *path_and_query,
     fflush(g_jf_log);   /* request rate is low; a crash right after must not lose this line */
 }
 
+/* First CA bundle that actually exists on disk, or NULL. Stock MiSTer curl
+ * has no working default CA path — verifying an HTTPS server fails with
+ * "unable to get local issuer certificate" even though a perfectly good
+ * bundle ships in the image, so a verified request has to point --cacert at
+ * one explicitly. (The updater in update.c needs this too and keeps its own
+ * copy; kept separate so each translation unit stays self-contained.) */
+static const char *jf_ca_bundle(void)
+{
+    static const char *const cands[] = {
+        "/etc/ssl/certs/cacert.pem",
+        "/etc/ssl/cert.pem",
+        "/usr/lib/python3.9/site-packages/certifi/cacert.pem",
+        NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        struct stat st;
+        if (stat(cands[i], &st) == 0 && st.st_size > 0) return cands[i];
+    }
+    return NULL;
+}
+
+/* Appends the TLS-verification flags to a curl argv being built, returning
+ * the new element count. INSECURE_TLS in the config => "-k" (skip
+ * verification, for a self-signed home server); otherwise verify, pointing
+ * --cacert at a real bundle so verification can actually succeed on this
+ * platform. Plain http:// requests ignore all of this. */
+static int jf_add_tls_args(const JfConfig *cfg, const char **argv, int n)
+{
+    if (cfg->insecure_tls) { argv[n++] = "-k"; return n; }
+    const char *ca = jf_ca_bundle();
+    if (ca) { argv[n++] = "--cacert"; argv[n++] = ca; }
+    return n;
+}
+
 static char *jf_request_alloc(const JfConfig *cfg, const char *method,
                                const char *path_and_query, const char *body_file,
                                int timeout_secs)
@@ -633,10 +668,11 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
 
     /* Built as a plain argv. Each element reaches curl exactly as written,
      * with no quoting, escaping or word splitting anywhere in between. */
-    const char *argv[20];
+    const char *argv[24];
     int n = 0;
     argv[n++] = "curl";
-    argv[n++] = "-sfk";
+    argv[n++] = "-sf";
+    n = jf_add_tls_args(cfg, argv, n);
     argv[n++] = "--max-time";
     argv[n++] = timeout;
     if (method) { argv[n++] = "-X"; argv[n++] = method; }
@@ -768,6 +804,12 @@ int jf_config_load(JfConfig *cfg)
          * is ever literally the string "DEBUGLOG". See jf_log_init. */
         if (!strcasecmp(line, "DEBUGLOG")) {
             cfg->debug_log = 1;
+            continue;
+        }
+
+        /* Same treatment again — a real config value is never this literal. */
+        if (!strcasecmp(line, "INSECURE_TLS")) {
+            cfg->insecure_tls = 1;
             continue;
         }
 
@@ -1375,9 +1417,15 @@ int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char 
     if (!jf_item_image_url(cfg, item_id, image_type, tag, max_width, url, sizeof(url))) return 0;
 
     /* No shell — see jf_curl_run. The URL embeds an image tag that came
-     * from server JSON. */
-    const char *argv[] = { "curl", "-sfLk", "--max-time", "15",
-                           url, "-o", dest_path, NULL };
+     * from server JSON. -L follows redirects; TLS verification per config
+     * (see jf_add_tls_args). */
+    const char *argv[12];
+    int n = 0;
+    argv[n++] = "curl"; argv[n++] = "-sfL";
+    n = jf_add_tls_args(cfg, argv, n);
+    argv[n++] = "--max-time"; argv[n++] = "15";
+    argv[n++] = url; argv[n++] = "-o"; argv[n++] = dest_path;
+    argv[n] = NULL;
     int ok = 0;
     jf_curl_run((char *const *)argv, 0, &ok);
     return ok;
@@ -1512,8 +1560,13 @@ int jf_download_subtitle(const JfConfig *cfg, const char *item_id,
     snprintf(url, sizeof(url), "%s/Videos/%s/%s/Subtitles/%d/Stream.srt?ApiKey=%s",
               cfg->server, safe_id, safe_msid, sub_index, cfg->token);
 
-    const char *argv[] = { "curl", "-sfLk", "--max-time", "15",
-                           url, "-o", dest_path, NULL };
+    const char *argv[12];
+    int n = 0;
+    argv[n++] = "curl"; argv[n++] = "-sfL";
+    n = jf_add_tls_args(cfg, argv, n);
+    argv[n++] = "--max-time"; argv[n++] = "15";
+    argv[n++] = url; argv[n++] = "-o"; argv[n++] = dest_path;
+    argv[n] = NULL;
     int ok = 0;
     jf_curl_run((char *const *)argv, 0, &ok);
     return ok;

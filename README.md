@@ -168,6 +168,8 @@ The main reason to set it is a constrained network: the default asks the server 
 
 **Troubleshooting a bug?** Add a line containing just `DEBUGLOG` (also recognised wherever it appears) and MiSTerFin writes `/media/fat/misterfin/debug.log` — one line per server request (method, endpoint, ok/fail, timing), truncated fresh on every launch. Off by default, and never includes your server URL, credentials, or anything from a request's query string, so it's safe to attach to a bug report as-is. See `jellyfin.conf.example` for the full details.
 
+**HTTPS with a self-signed certificate?** MiSTerFin verifies your server's TLS certificate by default. If your server is `https://` with a self-signed cert, add a line containing just `INSECURE_TLS` to skip verification. A plain `http://` server (the usual setup) doesn't use TLS and ignores this.
+
 ### <a id="using-quick-connect"></a>Using Quick Connect
 
 The default and preferred way to sign in — nothing to type on the config side beyond the server URL above.

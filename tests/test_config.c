@@ -69,6 +69,15 @@ int main(void) {
     tlog("DEBUGLOG not read as a credential", "http://s:8096\nkey123\nbob\nDEBUGLOG\nPAL\n",
          1, "key123", "bob");
 
+    /* INSECURE_TLS: off by default, recognised anywhere, never a credential. */
+    { JfConfig c; FILE *f=fopen("./jellyfin.conf","w"); fputs("http://s:8096\nPAL\n",f); fclose(f);
+      jf_config_load(&c); checks++;
+      if (c.insecure_tls != 0) { fails++; printf("  FAIL insecure default should be 0, got %d\n", c.insecure_tls); } }
+    { JfConfig c; FILE *f=fopen("./jellyfin.conf","w"); fputs("http://s:8096\nINSECURE_TLS\nkey123\nbob\nPAL\n",f); fclose(f);
+      jf_config_load(&c); checks++;
+      if (!(c.insecure_tls==1 && !strcmp(c.api_key,"key123") && !strcmp(c.username,"bob")))
+        { fails++; printf("  FAIL INSECURE_TLS: insecure=%d key=\"%s\" user=\"%s\"\n", c.insecure_tls, c.api_key, c.username); } }
+
     printf("profile: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

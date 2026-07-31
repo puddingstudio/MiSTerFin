@@ -208,6 +208,11 @@ typedef struct {
     /* "DEBUGLOG" config line — see jf_log_init. Off unless the user opted
      * in, so nothing is ever written without them asking for it. */
     int  debug_log;
+    /* "INSECURE_TLS" config line. Default 0 = verify the server's HTTPS
+     * certificate; 1 = skip verification (curl -k), for a home server with
+     * a self-signed cert. Only matters for https:// servers — a plain
+     * http:// server (the common case) is unaffected either way. */
+    int  insecure_tls;
 } JfConfig;
 
 /* One in-flight Quick Connect request. */

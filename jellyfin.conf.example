@@ -57,3 +57,14 @@ PAL
 # the file to the report instead of walking through an SSH session together.
 #
 # DEBUGLOG
+
+
+# ── HTTPS with a self-signed certificate ────────────────────────────────────
+# MiSTerFin verifies your server's TLS certificate by default. If your
+# Jellyfin server is https:// with a self-signed certificate, that
+# verification will fail — add a line containing just INSECURE_TLS
+# (case-insensitive, works anywhere in this file) to skip it. Only needed for
+# https with a self-signed cert; a plain http:// server (the usual setup)
+# doesn't use TLS at all and ignores this.
+#
+# INSECURE_TLS
