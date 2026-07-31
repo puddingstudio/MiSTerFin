@@ -3667,6 +3667,80 @@ static void submenu_confirm(FBDev *fb)
     if (new_sub != g_current_sub_index) subtitle_apply(fb, new_sub);
 }
 
+/* The submenu's whole input frame, lifted verbatim from the main loop so
+ * the menu's state stays module-internal. Every path used to end in
+ * `continue`; the caller preserves that by `continue`-ing right after this
+ * returns, so the confirm/close paths still skip the usleep exactly as
+ * before (their input_drain + immediate next poll was deliberate).  */
+static void submenu_handle_input(FBDev *fb, int inp, int nav_repeat, double loop_now)
+{
+    static double last_nav_press = 0.0;
+    int n_opts   = submenu_option_count();
+    int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
+    int *sel     = is_audio ? &g_submenu_audio_sel : &g_submenu_sub_sel;
+
+    /* Shoulder buttons switch tabs, leaving LEFT/RIGHT free for
+     * subtitle sync (which needs to stay a fine repeated nudge, and
+     * has no audio equivalent to share the keys with). */
+    if (inp & INP_L) submenu_switch_tab(SUBMENU_TAB_AUDIO);
+    if (inp & INP_R) submenu_switch_tab(SUBMENU_TAB_SUBS);
+
+    int menu_inp = inp | nav_repeat;   /* held UP/DOWN walks the list, held LEFT/RIGHT keeps nudging sync */
+    if ((menu_inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
+        loop_now - last_nav_press > 0.15) {
+        last_nav_press = loop_now;
+        if (menu_inp & INP_UP)    { if (*sel > 0) (*sel)--; }
+        if (menu_inp & INP_DOWN)  { if (*sel < n_opts - 1) (*sel)++; }
+        /* Live-tunable on top of the fixed baseline (AUDIO_DELAY_SEC
+         * + SUBTITLE_SYNC_FUDGE_SEC + g_play_offset) — for whatever
+         * that fixed default doesn't cover on a specific subtitle
+         * file. Applies immediately if a subtitle is already
+         * loaded. Subtitle tab only: there's nothing for it to mean
+         * on the audio tab, and silently changing subtitle timing
+         * from a screen not showing it would be a surprise. */
+        if (!is_audio && (menu_inp & INP_LEFT))  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
+        if (!is_audio && (menu_inp & INP_RIGHT)) { g_sub_delay_extra += 0.1; sub_delay_send(); }
+    }
+    if (inp & INP_A) { submenu_confirm(fb); input_drain(); return; }
+    /* SELECT also closes — a SELECT press while already open was a
+     * silent no-op before (it only opens from the STATE_PLAYING
+     * switch below, which this block's own `continue` never
+     * reaches while visible), so a second SELECT looked like "the
+     * menu doesn't open". B still means an explicit cancel too.
+     *
+     * Ignored for a moment after opening, though. The press that
+     * opens this menu can be reported twice — a pad that enumerates
+     * as several event nodes, or MiSTer's own OSD echoing physical
+     * input onto a second virtual device, both do that — and if the
+     * duplicate lands in a later poll than the original it arrives
+     * here and closes the menu immediately. Draining on open only
+     * discards what was already queued at that instant, so a
+     * duplicate a few milliseconds behind still gets through; the
+     * menu then flickers open and shut and reads as "the button
+     * doesn't reliably work". */
+    if ((inp & (INP_B | INP_SELECT)) &&
+        loop_now - g_submenu_opened_at > SUBMENU_IGNORE_CLOSE_SEC) {
+        submenu_close(); input_drain(); return;
+    }
+    /* Redraw every single frame, unconditionally — mplayer writes
+     * video frames directly to fb->mem (bypassing our fb->back
+     * entirely) and was confirmed on hardware to still do so
+     * periodically even while "paused" for the overlay, silently
+     * erasing this box between redraws. Only redrawing on input
+     * change (an earlier version of this) meant the box could go
+     * invisible while g_submenu_visible was still 1 underneath —
+     * so LEFT/RIGHT looked like it should be seeking (this block
+     * is exactly what intercepts LEFT/RIGHT for sync instead of
+     * letting it reach the seek handler below), but the menu was
+     * still silently open. Constant redraw keeps the box visibly
+     * pinned the whole time it's actually open, so that state is
+     * never invisible. */
+    draw_submenu(fb);
+    usleep(16000);
+    return;
+}
+
+
 /* play_position() plus whatever seek is currently accumulating but hasn't
  * fired yet, clamped to the title's actual runtime — used both to show a
  * live-updating target while accumulating (draw_paused/draw_timeline) and
@@ -3722,6 +3796,88 @@ static void seek_accumulate(double delta, double now)
     snprintf(osd, sizeof(osd), "%s %ds  -  %s / %s",
              g_seek_accum >= 0 ? ">>" : "<<", secs, cur, tot);
     osd_flash(osd, 0);
+}
+
+/* One frame of video-playback input handling, lifted verbatim from the
+ * main loop's STATE_PLAYING case. Returns PLAYER_FRAME_PLAYING while the
+ * title keeps playing, PLAYER_FRAME_ENDED once it stopped (naturally or
+ * via B) with reporting/g_info_item bookkeeping already done — the caller
+ * owns the transition back to browse — and PLAYER_FRAME_HANDLED when the
+ * frame ended inside the submenu-open path, which must skip the caller's
+ * end-of-loop work (a pending accumulated seek must not fire under the
+ * just-opened menu, exactly as the original `continue` guaranteed). */
+#define PLAYER_FRAME_ENDED   0
+#define PLAYER_FRAME_PLAYING 1
+#define PLAYER_FRAME_HANDLED 2
+static int player_handle_input(FBDev *fb, int inp, double loop_now)
+{
+    if (!player_running()) {
+        /* mplayer exited on its own (end of title) — its uninit
+         * already flipped back to page 0; this wakes Main up and
+         * clears the flag (no-op unless engaged). */
+        pageflip_end();
+        double pos = play_position();
+        int watched = playback_watched(g_info_item.runtime_ticks, pos);
+        jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                           (int64_t)(pos * 10000000.0), watched);
+        g_info_item.played = watched;
+        g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        return PLAYER_FRAME_ENDED;
+    } else if (inp & INP_B) {
+        double pos = play_position();
+        int watched = playback_watched(g_info_item.runtime_ticks, pos);
+        jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                           (int64_t)(pos * 10000000.0), watched);
+        g_info_item.played = watched;
+        g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        player_stop();
+        return PLAYER_FRAME_ENDED;
+    } else if (g_paused) {
+        if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
+        if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+        if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        if (inp & INP_A) player_pause_toggle();
+        if (!g_pageflip_mode) {
+            if (inp & INP_L) {
+                int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                if (vf >= 0) close(vf);
+                osd_flash("VSync: ON", 1);
+            }
+            if (inp & INP_R) {
+                unlink(VSYNC_FLAG);
+                osd_flash("VSync: OFF", 1);
+            }
+        }
+        /* seek_pending_target() reflects any not-yet-fired
+         * accumulated seek too, so this timeline moves live as the
+         * user taps LEFT/RIGHT instead of waiting for the debounce
+         * to actually fire the restart. */
+        draw_paused(fb, g_info_item.name, seek_pending_target());
+    } else {
+        if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
+        if (inp & INP_A) player_pause_toggle();
+        if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+        if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        if (!g_pageflip_mode) {
+            if (inp & INP_L) {
+                int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                if (vf >= 0) close(vf);
+                osd_flash("VSync: ON", 0);
+            }
+            if (inp & INP_R) {
+                unlink(VSYNC_FLAG);
+                osd_flash("VSync: OFF", 0);
+            }
+        }
+
+        if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+            g_last_progress_report = loop_now;
+            report_progress_async(g_info_item.id, g_play_session_id,
+                                  (int64_t)(play_position() * 10000000.0), 0);
+        }
+    }
+    
+    return PLAYER_FRAME_PLAYING;
 }
 
 static void play(FBDev *fb, const char *item_id, double offset_secs)
@@ -4808,69 +4964,7 @@ int main(int argc, char **argv)
         }
 
         if (g_submenu_visible) {
-            static double last_nav_press = 0.0;
-            int n_opts   = submenu_option_count();
-            int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
-            int *sel     = is_audio ? &g_submenu_audio_sel : &g_submenu_sub_sel;
-
-            /* Shoulder buttons switch tabs, leaving LEFT/RIGHT free for
-             * subtitle sync (which needs to stay a fine repeated nudge, and
-             * has no audio equivalent to share the keys with). */
-            if (inp & INP_L) submenu_switch_tab(SUBMENU_TAB_AUDIO);
-            if (inp & INP_R) submenu_switch_tab(SUBMENU_TAB_SUBS);
-
-            int menu_inp = inp | nav_repeat;   /* held UP/DOWN walks the list, held LEFT/RIGHT keeps nudging sync */
-            if ((menu_inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
-                loop_now - last_nav_press > 0.15) {
-                last_nav_press = loop_now;
-                if (menu_inp & INP_UP)    { if (*sel > 0) (*sel)--; }
-                if (menu_inp & INP_DOWN)  { if (*sel < n_opts - 1) (*sel)++; }
-                /* Live-tunable on top of the fixed baseline (AUDIO_DELAY_SEC
-                 * + SUBTITLE_SYNC_FUDGE_SEC + g_play_offset) — for whatever
-                 * that fixed default doesn't cover on a specific subtitle
-                 * file. Applies immediately if a subtitle is already
-                 * loaded. Subtitle tab only: there's nothing for it to mean
-                 * on the audio tab, and silently changing subtitle timing
-                 * from a screen not showing it would be a surprise. */
-                if (!is_audio && (menu_inp & INP_LEFT))  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
-                if (!is_audio && (menu_inp & INP_RIGHT)) { g_sub_delay_extra += 0.1; sub_delay_send(); }
-            }
-            if (inp & INP_A) { submenu_confirm(&fb); input_drain(); continue; }
-            /* SELECT also closes — a SELECT press while already open was a
-             * silent no-op before (it only opens from the STATE_PLAYING
-             * switch below, which this block's own `continue` never
-             * reaches while visible), so a second SELECT looked like "the
-             * menu doesn't open". B still means an explicit cancel too.
-             *
-             * Ignored for a moment after opening, though. The press that
-             * opens this menu can be reported twice — a pad that enumerates
-             * as several event nodes, or MiSTer's own OSD echoing physical
-             * input onto a second virtual device, both do that — and if the
-             * duplicate lands in a later poll than the original it arrives
-             * here and closes the menu immediately. Draining on open only
-             * discards what was already queued at that instant, so a
-             * duplicate a few milliseconds behind still gets through; the
-             * menu then flickers open and shut and reads as "the button
-             * doesn't reliably work". */
-            if ((inp & (INP_B | INP_SELECT)) &&
-                loop_now - g_submenu_opened_at > SUBMENU_IGNORE_CLOSE_SEC) {
-                submenu_close(); input_drain(); continue;
-            }
-            /* Redraw every single frame, unconditionally — mplayer writes
-             * video frames directly to fb->mem (bypassing our fb->back
-             * entirely) and was confirmed on hardware to still do so
-             * periodically even while "paused" for the overlay, silently
-             * erasing this box between redraws. Only redrawing on input
-             * change (an earlier version of this) meant the box could go
-             * invisible while g_submenu_visible was still 1 underneath —
-             * so LEFT/RIGHT looked like it should be seeking (this block
-             * is exactly what intercepts LEFT/RIGHT for sync instead of
-             * letting it reach the seek handler below), but the menu was
-             * still silently open. Constant redraw keeps the box visibly
-             * pinned the whole time it's actually open, so that state is
-             * never invisible. */
-            draw_submenu(&fb);
-            usleep(16000);
+            submenu_handle_input(&fb, inp, nav_repeat, loop_now);
             continue;
         }
 
@@ -5098,79 +5192,17 @@ int main(int argc, char **argv)
             }
             break;
 
-        case STATE_PLAYING:
-            if (!player_running()) {
-                /* mplayer exited on its own (end of title) — its uninit
-                 * already flipped back to page 0; this wakes Main up and
-                 * clears the flag (no-op unless engaged). */
-                pageflip_end();
-                double pos = play_position();
-                int watched = playback_watched(g_info_item.runtime_ticks, pos);
-                jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                                   (int64_t)(pos * 10000000.0), watched);
-                g_info_item.played = watched;
-                g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        case STATE_PLAYING: {
+            int r = player_handle_input(&fb, inp, loop_now);
+            if (r == PLAYER_FRAME_HANDLED) continue;
+            if (r == PLAYER_FRAME_ENDED) {
                 playing = 0;
                 state = STATE_BROWSE;
                 refetch_frame_keep_selection(&fb);
                 draw_browse(&fb);
-            } else if (inp & INP_B) {
-                double pos = play_position();
-                int watched = playback_watched(g_info_item.runtime_ticks, pos);
-                jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                                   (int64_t)(pos * 10000000.0), watched);
-                g_info_item.played = watched;
-                g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
-                player_stop();
-                playing = 0;
-                state = STATE_BROWSE;
-                refetch_frame_keep_selection(&fb);
-                draw_browse(&fb);
-            } else if (g_paused) {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
-                if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
-                if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
-                if (inp & INP_A) player_pause_toggle();
-                if (!g_pageflip_mode) {
-                    if (inp & INP_L) {
-                        int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                        if (vf >= 0) close(vf);
-                        osd_flash("VSync: ON", 1);
-                    }
-                    if (inp & INP_R) {
-                        unlink(VSYNC_FLAG);
-                        osd_flash("VSync: OFF", 1);
-                    }
-                }
-                /* seek_pending_target() reflects any not-yet-fired
-                 * accumulated seek too, so this timeline moves live as the
-                 * user taps LEFT/RIGHT instead of waiting for the debounce
-                 * to actually fire the restart. */
-                draw_paused(&fb, g_info_item.name, seek_pending_target());
-            } else {
-                if (inp & INP_SELECT) { submenu_open(&fb); draw_submenu(&fb); input_drain(); continue; }
-                if (inp & INP_A) player_pause_toggle();
-                if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
-                if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
-                if (!g_pageflip_mode) {
-                    if (inp & INP_L) {
-                        int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                        if (vf >= 0) close(vf);
-                        osd_flash("VSync: ON", 0);
-                    }
-                    if (inp & INP_R) {
-                        unlink(VSYNC_FLAG);
-                        osd_flash("VSync: OFF", 0);
-                    }
-                }
-
-                if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
-                    g_last_progress_report = loop_now;
-                    report_progress_async(g_info_item.id, g_play_session_id,
-                                          (int64_t)(play_position() * 10000000.0), 0);
-                }
             }
             break;
+        }
 
         case STATE_PLAYING_AUDIO: {
             JfItem *cur = &g_items[g_audio_queue_pos];
