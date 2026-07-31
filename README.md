@@ -72,7 +72,7 @@ Grab the latest release zip from the [Releases](../../releases) page and skip st
 
 Prefer updating through a MiSTer Downloader? There's also a community-maintained [MiSTerFin database](https://github.com/theypsilon/MultiDatabases_MiSTer/tree/main/misterfin) for [Downloader](https://github.com/MiSTer-devel/Downloader_MiSTer) — install it once and future updates get picked up automatically alongside your other MiSTer Downloader-managed content, as an alternative to the in-app updater above. [MiSTer Companion](https://github.com/Anime0t4ku/mister-companion) builds on that same database to offer one-click install/update/uninstall for MiSTerFin from its own GUI.
 
-Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbdev:/dev/fb0`) and works on any menu core.
+Video output goes through the standard MiSTer framebuffer path (`mplayer -vo fbdev:/dev/fb0`) and works on any menu core. If the [Zaparoo Project](https://zaparoo.org)'s dual-mode menu core (`menu_zaparoo.rbf`) happens to be installed as your menu core, MiSTerFin detects it and automatically uses its DDR native-video path during playback — tear-free, native-resolution output with no configuration; on the stock core that path simply stays off.
 
 ---
 

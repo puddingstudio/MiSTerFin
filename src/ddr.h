@@ -3,9 +3,21 @@
 
 /* Zaparoo native-video DDR double-buffer writer (v2 protocol).
  *
- * The FPGA core (menu_zaparoo.rbf, feat/dual-mode-native-fb) reads frames
- * from DDR instead of the framebuffer when the control word contains the
- * magic 0x5A50.  Without the Zaparoo menu.rbf these writes are harmless.
+ * WHY THIS EXISTS: MiSTerFin works on the standard menu core through the
+ * ordinary framebuffer→scaler path — none of this file is needed for that.
+ * But the Zaparoo Project (https://zaparoo.org) maintains a dual-mode fork
+ * of the menu core (menu_zaparoo.rbf, feat/dual-mode-native-fb) that can
+ * ALSO scan video out natively from DDR, and users who installed it (e.g.
+ * via MiSTerDVD's install-menu-rbf.sh) get tear-free native-resolution
+ * playback for free. This file is MiSTerFin's side of that protocol, so
+ * the app works on both cores and quietly takes the better video path
+ * when the Zaparoo core is what's installed. Detection is main.c's
+ * exact-size check on /media/fat/menu.rbf; on a stock core nothing here
+ * ever runs.
+ *
+ * The FPGA core reads frames from DDR instead of the framebuffer when the
+ * control word contains the magic 0x5A50.  Without the Zaparoo menu.rbf
+ * these writes are harmless (the core never looks at that region).
  *
  * DDR layout (ARM byte addresses):
  *   0x3A000000  control block (64-bit beat):
