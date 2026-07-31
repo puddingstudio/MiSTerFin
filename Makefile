@@ -1,4 +1,4 @@
-SRCS = src/main.c src/fb.c src/ddr.c src/jellyfin.c src/json.c src/subtitles.c
+SRCS = src/main.c src/fb.c src/ddr.c src/jellyfin.c src/json.c src/subtitles.c src/update.c
 
 TARGET     = misterfin
 TARGET_ARM = misterfin-arm
