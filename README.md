@@ -30,7 +30,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
@@ -293,6 +293,13 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## <a id="changelog"></a>Changelog
+
+### <a id="v0-9-8"></a>v0.9.8
+- Updates are now visible from the home screen — a quiet "START:update available" line appears under the title whenever a newer release exists (home carousel only; disappears once you're up to date)
+- HTTPS connections to your Jellyfin server are now **verified by default**. If your server uses a self-signed certificate, add a line containing just `INSECURE_TLS` to `jellyfin.conf` — and if MiSTerFin can't connect to an https server, it now says exactly that on screen instead of a generic error. Plain `http://` setups are unaffected
+- Transport hardening: curl is invoked by absolute path, response sizes are capped, and temp files use unpredictable names
+- The Zaparoo native-video core is now detected by file content instead of a hardcoded size, so detection survives future Zaparoo releases — and the DDR path correctly stays off under the standalone interlaced core, where it only wasted CPU
+- Internal code hygiene — no behavior changes
 
 ### <a id="v0-9-7"></a>v0.9.7
 - New opt-in `DEBUGLOG` line in `jellyfin.conf` writes `/media/fat/misterfin/debug.log` (method/endpoint/ok-fail/timing per server request) — off by default, never logs your server URL or credentials, safe to attach to a bug report
