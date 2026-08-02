@@ -346,7 +346,6 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ### <a id="unreleased"></a>Unreleased
 - New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound
 - The setup/Quick Connect error screens are clearer: "Can't connect to server" now shows the configured server URL instead of suggesting you add an API key/username you may not need, and A now reliably exits everywhere it's hinted (a couple of these screens only accepted B before). Where Quick Connect also offers "B: try again", B still retries rather than exiting, same as before
-- Documented all third-party code and components (`docs/THIRD_PARTY.md`)
 - `DEBUGLOG` now also captures one-shot startup/playback diagnostics — framebuffer geometry, input devices found, the relevant `MiSTer.ini` display settings, menu core/DDR state, the update check result, and the transcode profile used each time something plays — on top of the per-request log it already had
 - Animated home-screen background — the cover mosaic behind the library carousel now slowly crawls sideways, each row in the opposite direction, perfectly smooth (subpixel-stepped and paced to the display's real refresh)
 - Square album covers for music — a music library's background grid now uses square cells matching album art; movies/TV keep the portrait poster cells, both now with the exact right shape on PAL and NTSC alike
