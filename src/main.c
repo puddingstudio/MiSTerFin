@@ -37,6 +37,7 @@
 #include "update.h"
 #include "input.h"
 #include "draw.h"
+#include "screenshot.h"
 #include "util.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
@@ -4986,6 +4987,7 @@ int main(int argc, char **argv)
     int spinner_frame_ctr = 0;
     int about_visible = 0;
     double last_about_press = 0.0;
+    double screenshot_flash_until = 0.0;
     if (state == STATE_BROWSE) draw_browse(&fb);
 
     double last_input_rescan = 0.0;
@@ -4996,6 +4998,49 @@ int main(int argc, char **argv)
          * input_repeat()'s own comment for why it isn't just part of inp. */
         int nav_repeat = input_repeat();
         double loop_now = now_sec();
+
+        /* Screenshot: fires once on the transition into "both held", from
+         * ANY screen — checked unconditionally here rather than inside the
+         * state switch below, which several states short-circuit past via
+         * `continue` before reaching a common tail.
+         *
+         * A human two-finger press is never perfectly simultaneous, and
+         * this loop can run faster than the few milliseconds of stagger
+         * between them — confirmed on hardware as SELECT's edge alone
+         * reaching the video submenu (or About, or the root list toggle)
+         * a frame or two before input_select_start_held() ever sees START
+         * down too. So neither bit is allowed downstream the instant
+         * input_poll() reports it: each is held back for COMBO_WINDOW to
+         * give the other a chance to arrive. If the chord completes within
+         * that window the screenshot fires and both buffered edges are
+         * dropped (never delivered as an ordinary press); otherwise the
+         * lone edge is released into `inp`, on whatever later frame the
+         * window lapses, exactly as if it had just been pressed then. */
+        {
+            #define COMBO_WINDOW 0.12
+            static int screenshot_combo_was_held = 0;
+            static double pending_select_t = -1.0, pending_start_t = -1.0;
+
+            if (inp & INP_SELECT) { pending_select_t = loop_now; inp &= ~INP_SELECT; }
+            if (inp & INP_START)  { pending_start_t  = loop_now; inp &= ~INP_START;  }
+
+            int held = input_select_start_held();
+            if (held && !screenshot_combo_was_held) {
+                screenshot_take(&fb);
+                screenshot_flash_until = loop_now + 1.5;
+                pending_select_t = pending_start_t = -1.0;
+            }
+            screenshot_combo_was_held = held;
+
+            if (pending_select_t >= 0.0 && loop_now - pending_select_t > COMBO_WINDOW) {
+                inp |= INP_SELECT;
+                pending_select_t = -1.0;
+            }
+            if (pending_start_t >= 0.0 && loop_now - pending_start_t > COMBO_WINDOW) {
+                inp |= INP_START;
+                pending_start_t = -1.0;
+            }
+        }
 
         /* Re-scan /dev/input every few seconds — a wireless pad that idles
          * out and reconnects (confirmed behavior for some 8BitDo/Bluetooth
@@ -5025,7 +5070,12 @@ int main(int argc, char **argv)
                 redraw_current_screen(&fb, state);
             } else {
                 if (inp & INP_A) update_start_install();
-                draw_about(&fb);   /* redraw every frame to pick up update state */
+                /* Redraw every frame to pick up update state — except right
+                 * after a screenshot taken while About was already open,
+                 * where that same unconditional redraw would otherwise
+                 * overwrite screenshot_take()'s "Screenshot saved" flash
+                 * before it was ever visible. */
+                if (loop_now >= screenshot_flash_until) draw_about(&fb);
             }
             usleep(16000);
             continue;

@@ -45,6 +45,14 @@ int input_repeat(void);
  * can't act on the new one. */
 void input_drain(void);
 
+/* True while SELECT and START are both physically held right now, on any
+ * device (queried the same EVIOCGKEY way input_repeat's direction-holding
+ * check is) — the screenshot combo. A held-state query rather than an
+ * edge, so the two don't have to land in the same input_poll() frame to
+ * count; the caller is responsible for firing on the transition into
+ * "held" rather than every frame it stays true. */
+int input_select_start_held(void);
+
 void input_close(void);
 
 #endif

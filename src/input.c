@@ -542,6 +542,31 @@ static void input_repeat_reset(void)
  * control. Reading the state directly makes all of those unrepresentable:
  * there is no accumulated state to go wrong, and a device that has gone away
  * simply fails the ioctl and contributes nothing. */
+int input_select_start_held(void)
+{
+    int select_down = 0, start_down = 0;
+    for (int i = 0; i < input_count; i++) {
+        unsigned long keys[INPUT_NLONGS(KEY_MAX + 1)];
+        memset(keys, 0, sizeof(keys));
+        if (ioctl(input_fds[i], EVIOCGKEY(sizeof(keys)), keys) < 0) continue;
+        if (INPUT_TEST_BIT(keys, BTN_SELECT) || INPUT_TEST_BIT(keys, KEY_TAB))
+            select_down = 1;
+        if (INPUT_TEST_BIT(keys, BTN_START) || INPUT_TEST_BIT(keys, KEY_PAUSE) ||
+            INPUT_TEST_BIT(keys, KEY_HOME))
+            start_down = 1;
+    }
+    if (input_debug) {
+        static int last_sel = -1, last_start = -1;
+        if (select_down != last_sel || start_down != last_start) {
+            fprintf(stderr, "[input] select_start_held: select=%d start=%d\n",
+                    select_down, start_down);
+            last_sel = select_down;
+            last_start = start_down;
+        }
+    }
+    return select_down && start_down;
+}
+
 static int input_nav_held(void)
 {
     int mask = 0;
