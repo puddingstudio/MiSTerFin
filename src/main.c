@@ -106,6 +106,13 @@ static void on_signal(int s) { (void)s; g_running = 0; }
 
 static char g_setup_reason[64];   /* set once at startup, redrawn every frame by draw_setup_screen() */
 
+/* Which body draw_setup_screen() shows below the reason line. A network
+ * failure isn't a credential problem — telling someone mid-Quick-Connect
+ * setup to go add an api_key/username is solving the wrong problem, so that
+ * case gets the configured URL back instead, to check for a typo/stale IP. */
+typedef enum { SETUP_HELP_CONFIG, SETUP_HELP_CONNECTION } SetupHelpKind;
+static SetupHelpKind g_setup_help;   /* set alongside g_setup_reason, same lifetime */
+
 static void cursor_show(void);  /* forward decl for emergency_cleanup */
 
 /* ── MiSTer page-flip playback (interlaced full-frame modes) ──────────────
@@ -1690,7 +1697,7 @@ static int server_https_needs_insecure_hint(void)
     return !g_cfg.insecure_tls && strncasecmp(g_cfg.server, "https", 5) == 0;
 }
 
-static void draw_setup_screen(FBDev *fb, const char *reason)
+static void draw_setup_screen(FBDev *fb, const char *reason, SetupHelpKind help)
 {
     fb_clear(fb);
     draw_starfield(fb);
@@ -1709,7 +1716,7 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
     const int ts = 2, s1 = 1;
     const int tch = 8 * ts, sch = 8 * s1, img_gap = 10, lsp = 6;
 
-    int cur_y = SAFE_Y;
+    int img_h_box = 0, img_w_box = 0;
     if (img_px && img_w > 0 && img_h > 0) {
         int max_w = fb->width - 2 * SAFE_X;
         /* Solved from the space available down to the hint bar (title +
@@ -1721,9 +1728,26 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
         int max_h = fb->height - 156;
         if (max_h > 110) max_h = 110;
         if (max_h < 50) max_h = 50;
-        int img_h_box = max_h < img_h ? max_h : img_h;
-        int img_w_box = (int)((double)img_w / img_h * img_h_box * par_correction(fb) + 0.5);
+        img_h_box = max_h < img_h ? max_h : img_h;
+        img_w_box = (int)((double)img_w / img_h * img_h_box * par_correction(fb) + 0.5);
         if (img_w_box > max_w) { img_h_box = img_h_box * max_w / img_w_box; img_w_box = max_w; }
+    }
+
+    int cur_y = SAFE_Y;
+    /* The connection-check body below is half the lines of the config-
+     * instructions one, so top-anchoring it the same way (as tuned for the
+     * longer body, above) left everything bunched up with a big empty gap
+     * before the fixed "A: exit" hint. Center the whole block — image,
+     * title, reason, and body — in the space between the top safe margin
+     * and that hint instead, on both PAL and NTSC. */
+    if (help == SETUP_HELP_CONNECTION) {
+        int content_h = (img_h_box ? img_h_box + img_gap : 0)
+                       + (tch + lsp) + (sch + lsp * 2) + 2 * (sch + lsp);
+        int avail = (fb->height - 8 - SAFE_Y_BOT) - SAFE_Y;
+        if (avail > content_h) cur_y += (avail - content_h) / 2;
+    }
+
+    if (img_h_box > 0) {
         blit_fit_centered(fb, img_px, img_w, img_h,
                            fb->width / 2, cur_y + img_h_box / 2, img_w_box, img_h_box, 255);
         cur_y += img_h_box + img_gap;
@@ -1734,13 +1758,21 @@ static void draw_setup_screen(FBDev *fb, const char *reason)
     draw_text(fb, (fb->width - text_width(fb, reason, s1)) / 2, cur_y, reason, s1, COL_ERR);
     cur_y += sch + lsp * 2;
 
-    const char *l1 = "Create /media/fat/misterfin/jellyfin.conf with:";
-    draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
-    cur_y += sch + lsp;
-    static const char *fields[] = { "server_url", "api_key", "username" };
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        draw_text(fb, (fb->width - text_width(fb, fields[i], s1)) / 2, cur_y, fields[i], s1, COL_ITEM);
+    if (help == SETUP_HELP_CONNECTION) {
+        const char *l1 = "Check the server URL in jellyfin.conf:";
+        draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
         cur_y += sch + lsp;
+        draw_text(fb, (fb->width - text_width(fb, g_cfg.server, s1)) / 2, cur_y, g_cfg.server, s1, COL_ITEM);
+        cur_y += sch + lsp;
+    } else {
+        const char *l1 = "Create /media/fat/misterfin/jellyfin.conf with:";
+        draw_text(fb, (fb->width - text_width(fb, l1, s1)) / 2, cur_y, l1, s1, COL_HINT);
+        cur_y += sch + lsp;
+        static const char *fields[] = { "server_url", "api_key", "username" };
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+            draw_text(fb, (fb->width - text_width(fb, fields[i], s1)) / 2, cur_y, fields[i], s1, COL_ITEM);
+            cur_y += sch + lsp;
+        }
     }
 
     const char *hint = "A: exit";
@@ -1856,10 +1888,32 @@ static void draw_quick_connect(FBDev *fb)
     const int ts = 2, s1 = 1;
     const int tch = 8 * ts, sch = 8 * s1, lsp = 6;
 
-    /* Laid out from the vertical centre outwards rather than from the top,
-     * so it sits right at both PAL's 288 lines and NTSC's 240 without a
-     * per-resolution case. */
-    int cur_y = fb->height / 2 - 58;
+    /* Body height varies a lot by state — a one-line "Contacting server..."
+     * versus the multi-line code-entry prompt — so it's measured per state
+     * (mirroring the exact spacing used when actually drawing it below) and
+     * the whole block centered around the screen's true middle. A single
+     * fixed offset tuned only for the tallest case (QC_WAITING) left every
+     * shorter state sitting visibly high, with a big gap before the bottom
+     * "A: exit" hint. */
+    int body_h;
+    switch (state) {
+    case QC_STARTING:
+    case QC_AUTHENTICATED:
+        body_h = sch;
+        break;
+    case QC_WAITING:
+        body_h = (sch + lsp) + (sch + lsp * 3) + (8 * 3 + lsp * 3) + sch;
+        break;
+    case QC_UNAVAILABLE:
+        body_h = (sch + lsp * 2) + (sch + lsp) + sch;
+        break;
+    case QC_FAILED:
+    default:
+        body_h = (sch + lsp * 2) + sch;
+        if (server_https_needs_insecure_hint()) body_h += sch + lsp * 2;
+        break;
+    }
+    int cur_y = fb->height / 2 - ((tch + lsp * 2) + body_h) / 2;
 
     static const char title[] = "Quick Connect";
     draw_text(fb, (fb->width - text_width(fb, title, ts)) / 2, cur_y, title, ts, COL_TITLE);
@@ -4899,7 +4953,8 @@ int main(int argc, char **argv)
     if (resolved == STARTUP_CONFIG_MISSING) {
         state = STATE_CONFIG_ERROR;
         snprintf(g_setup_reason, sizeof(g_setup_reason), "jellyfin.conf not found or incomplete");
-        draw_setup_screen(&fb, g_setup_reason);
+        g_setup_help = SETUP_HELP_CONFIG;
+        draw_setup_screen(&fb, g_setup_reason, g_setup_help);
     } else if (resolved == STARTUP_NEED_QUICK_CONNECT) {
         state = STATE_QUICK_CONNECT;
         qc_set_state(QC_STARTING);
@@ -4924,7 +4979,8 @@ int main(int argc, char **argv)
             snprintf(g_setup_reason, sizeof(g_setup_reason),
                      resolved == -1 ? "Can't connect to server (check server URL)"
                                     : "Username not found on server (check spelling)");
-        draw_setup_screen(&fb, g_setup_reason);
+        g_setup_help = (resolved == -1) ? SETUP_HELP_CONNECTION : SETUP_HELP_CONFIG;
+        draw_setup_screen(&fb, g_setup_reason, g_setup_help);
     }
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu
@@ -5089,8 +5145,8 @@ int main(int argc, char **argv)
         switch (state) {
 
         case STATE_CONFIG_ERROR:
-            if (inp & INP_B) { g_running = 0; break; }
-            draw_setup_screen(&fb, g_setup_reason);   /* redrawn every frame for the starfield */
+            if (inp & (INP_A | INP_B)) { g_running = 0; break; }
+            draw_setup_screen(&fb, g_setup_reason, g_setup_help);   /* redrawn every frame for the starfield */
             break;
 
         case STATE_QUICK_CONNECT: {
@@ -5121,7 +5177,7 @@ int main(int argc, char **argv)
                 input_drain();
                 break;
             }
-            if (inp & INP_A) { g_running = 0; break; }
+            if (inp & (INP_A | INP_B)) { g_running = 0; break; }
 
             draw_quick_connect(&fb);   /* every frame, for the starfield */
             break;

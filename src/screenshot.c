@@ -5,11 +5,44 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "screenshot.h"
 #include "draw.h"
 
 #define SCREENSHOT_DIR "/media/fat/screenshots/MiSTerFin"
+#define APLAY_BIN      "/usr/bin/aplay"
+#define SHUTTER_WAV    "/media/fat/misterfin/sfx/shutter.wav"
+
+/* Fire-and-forget playback, so the capture itself never waits on it: an
+ * intermediate child is forked purely to be waited on immediately (near-
+ * instant, since it just forks again and exits), while the actual aplay
+ * process is left double-forked onto init to be reaped whenever it finishes
+ * on its own. Doesn't touch SIGCHLD's global disposition, which would
+ * otherwise break the explicit waitpid() this app already does for mplayer
+ * elsewhere. Missing file/binary is silently a no-op — a sound effect isn't
+ * worth failing the screenshot over. */
+static void play_shutter_sound(void)
+{
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        if (fork() == 0) {
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, 0);
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+            }
+            execl(APLAY_BIN, "aplay", "-q", SHUTTER_WAV, (char *)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+}
 
 /* BMP wants little-endian fields regardless of host order; the MiSTer ARM
  * target is little-endian, but write explicitly rather than assume. */
@@ -37,6 +70,8 @@ static void bmp_put_u16(FILE *f, uint16_t v)
  * (halved) value par_correction expects. */
 void screenshot_take(FBDev *fb)
 {
+    play_shutter_sound();
+
     mkdir("/media/fat/screenshots", 0755);   /* usually already exists — MiSTer's own dir */
     mkdir(SCREENSHOT_DIR, 0755);
 

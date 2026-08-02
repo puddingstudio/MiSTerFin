@@ -101,6 +101,13 @@ deploy: arm
 			assets/about.png root@$(MISTER_HOST):/media/fat/misterfin/about.png; \
 		echo "about.png deployed"; \
 	fi
+	@if [ -d assets/sfx ]; then \
+		sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
+			"mkdir -p /media/fat/misterfin/sfx"; \
+		sshpass -p "1" scp -r -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
+			assets/sfx/. root@$(MISTER_HOST):/media/fat/misterfin/sfx/; \
+		echo "sfx deployed"; \
+	fi
 	@if [ -f mplayer-arm ]; then \
 		sshpass -p "1" scp -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
 			mplayer-arm root@$(MISTER_HOST):/media/fat/misterfin/mplayer-arm; \
