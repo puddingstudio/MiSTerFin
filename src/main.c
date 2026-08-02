@@ -1610,7 +1610,7 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         } else if (us == UPD_AVAILABLE) {
             draw_text(fb, SAFE_X, safe_y - 14, installed, 1, COL_DIM);
             char upd[64];
-            snprintf(upd, sizeof(upd), "%s available   B: install", latest);
+            snprintf(upd, sizeof(upd), "%s available   B: update", latest);
             draw_text(fb, SAFE_X, safe_y, upd, 1, 220, 150, 40);
         } else {
             draw_text(fb, SAFE_X, safe_y, installed, 1, COL_DIM);
@@ -1624,6 +1624,162 @@ static void draw_about_frame(FBDev *fb, int show_footer)
 }
 
 static void draw_about(FBDev *fb) { draw_about_frame(fb, 1); }
+
+/* ── what's-new screen (About -> install) ─────────────────────────────────
+ * Pressing install on the About screen first shows the found release's
+ * GitHub notes, scrollable, with the actual install behind one more
+ * confirm — so an update is never a blind "something will change". The
+ * notes arrive as markdown; this renders them as plain wrapped text with
+ * a light cleanup (headers keep their own color, link targets and
+ * bold/backtick markers are dropped) rather than attempting real
+ * markdown. */
+
+static void draw_top_bar(FBDev *fb, const char *title);   /* defined below with the browse UI */
+
+#define CL_MAX_LINES 300
+#define CL_LINE_H    11
+static char    g_cl_lines[CL_MAX_LINES][200];
+static uint8_t g_cl_hdr[CL_MAX_LINES];
+static int     g_cl_count;
+
+static void cl_push(const char *s, int hdr)
+{
+    if (g_cl_count >= CL_MAX_LINES) return;
+    snprintf(g_cl_lines[g_cl_count], sizeof(g_cl_lines[0]), "%s", s);
+    g_cl_hdr[g_cl_count] = (uint8_t)hdr;
+    g_cl_count++;
+}
+
+/* Strips the markdown that would read as noise on a 640-wide text screen:
+ * "#" header markers (the header-ness survives as a color), "**"/"`"
+ * emphasis markers, and link targets ("[text](url)" keeps just text). */
+static void cl_clean_line(const char *in, char *out, size_t outsz, int *is_hdr)
+{
+    *is_hdr = 0;
+    while (*in == ' ') in++;
+    if (*in == '#') {
+        *is_hdr = 1;
+        while (*in == '#') in++;
+        while (*in == ' ') in++;
+    }
+    size_t j = 0;
+    for (const char *p = in; *p && j < outsz - 3; ) {
+        if (*p == '\r')                { p++; continue; }
+        if (*p == '*')                 { p++; continue; }   /* *emphasis* / **bold** markers */
+        if (*p == '`')                 { p++; continue; }
+        if (*p == '[') {
+            const char *close = strchr(p, ']');
+            if (close && close[1] == '(') {
+                const char *paren = strchr(close + 2, ')');
+                if (paren) {
+                    for (const char *q = p + 1; q < close && j < outsz - 3; q++) out[j++] = *q;
+                    p = paren + 1;
+                    continue;
+                }
+            }
+        }
+        /* The 8x8 font covers Latin-1 only — transliterate the typographic
+         * punctuation GitHub release prose actually uses so it doesn't
+         * render as '?'. */
+        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x80) {
+            unsigned char c3 = (unsigned char)p[2];
+            if (c3 == 0x94 || c3 == 0x93) { out[j++] = '-'; p += 3; continue; }   /* — – */
+            if (c3 == 0x98 || c3 == 0x99) { out[j++] = '\''; p += 3; continue; }  /* ' ' */
+            if (c3 == 0x9C || c3 == 0x9D) { out[j++] = '"'; p += 3; continue; }   /* " " */
+            if (c3 == 0xA6) { out[j++]='.'; out[j++]='.'; out[j++]='.'; p += 3; continue; }  /* … */
+        }
+        out[j++] = *p++;
+    }
+    out[j] = '\0';
+}
+
+/* Greedy word wrap of one cleaned source line into display lines; bullet
+ * continuations get a two-space hang so wrapped bullets still read as one
+ * item. */
+static void cl_wrap_line(FBDev *fb, const char *text, int is_hdr, int max_w)
+{
+    if (!text[0]) { cl_push("", 0); return; }
+    const char *hang = (text[0] == '-' && text[1] == ' ') ? "  " : "";
+
+    char line[200] = "";
+    const char *w = text;
+    while (*w) {
+        const char *e = w;
+        while (*e && *e != ' ') e++;
+
+        char cand[200];
+        snprintf(cand, sizeof(cand), "%s%s%.*s", line, line[0] ? " " : "", (int)(e - w), w);
+        if (line[0] && text_width(fb, cand, 1) > max_w) {
+            cl_push(line, is_hdr);
+            snprintf(line, sizeof(line), "%s%.*s", hang, (int)(e - w), w);
+        } else {
+            snprintf(line, sizeof(line), "%s", cand);
+        }
+        w = *e ? e + 1 : e;
+    }
+    if (line[0]) cl_push(line, is_hdr);
+}
+
+static void changelog_prepare(FBDev *fb)
+{
+    g_cl_count = 0;
+    char body[8192];
+    update_get_changelog(body, sizeof(body));
+
+    int max_w = fb->width - 2 * SAFE_X;
+    char *p = body;
+    while (p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        char cleaned[600];
+        int  is_hdr;
+        cl_clean_line(p, cleaned, sizeof(cleaned), &is_hdr);
+        cl_wrap_line(fb, cleaned, is_hdr, max_w);
+        p = nl ? nl + 1 : NULL;
+    }
+    /* Trim trailing blank lines so max-scroll lands on real content. */
+    while (g_cl_count > 0 && !g_cl_lines[g_cl_count - 1][0]) g_cl_count--;
+    if (g_cl_count == 0) cl_push("(no release notes)", 0);
+}
+
+static int changelog_rows(FBDev *fb)
+{
+    int top    = SAFE_Y + 24;
+    int bottom = fb->height - 8 - SAFE_Y_BOT - 14;
+    return (bottom - top) / CL_LINE_H;
+}
+
+static void draw_changelog(FBDev *fb, int scroll)
+{
+    char latest[32];
+    update_get_state(NULL, NULL, latest, sizeof(latest));
+
+    fb_clear(fb);
+    draw_rain(fb);   /* same falling-rain effect as the music player's background */
+    char title[64];
+    snprintf(title, sizeof(title), "What's new in %s", latest);
+    draw_top_bar(fb, title);
+
+    int rows = changelog_rows(fb);
+    int y = SAFE_Y + 24;
+    for (int i = scroll; i < g_cl_count && i < scroll + rows; i++) {
+        if (!g_cl_lines[i][0]) { y += CL_LINE_H; continue; }
+        if (g_cl_hdr[i]) draw_text(fb, SAFE_X, y, g_cl_lines[i], 1, COL_TITLE);
+        else             draw_text(fb, SAFE_X, y, g_cl_lines[i], 1, COL_ITEM);
+        y += CL_LINE_H;
+    }
+
+    int safe_y = fb->height - 8 - SAFE_Y_BOT;
+    draw_text(fb, SAFE_X, safe_y, "A: back", 1, COL_HINT);
+    if (g_cl_count > rows) {
+        const char *scr = "UP/DOWN: scroll";
+        draw_text(fb, (fb->width - text_width(fb, scr, 1)) / 2, safe_y, scr, 1, COL_HINT);
+    }
+    const char *inst = "B: install update";
+    draw_text(fb, fb->width - text_width(fb, inst, 1) - SAFE_X, safe_y, inst, 1, 220, 150, 40);
+
+    fb_flip(fb);
+}
 
 /* Shown instead of the plain black config-error screen when jellyfin.conf
  * is missing/invalid or the configured username can't be resolved — same
@@ -3081,14 +3237,51 @@ static void subtitle_apply(FBDev *fb, int new_index)
  * a cascade when a burn-in restart was still in flight (each press interrupted
  * the previous restart before it connected, showing as a freeze) — hence a
  * menu with an explicit apply, even though a text-subtitle change is instant. */
-#define SUBMENU_TAB_AUDIO 0
-#define SUBMENU_TAB_SUBS  1
+#define SUBMENU_TAB_AUDIO   0
+#define SUBMENU_TAB_SUBS    1
+#define SUBMENU_TAB_PICTURE 2
+#define SUBMENU_TAB_COUNT   3
 
 static int    g_submenu_visible    = 0;
 static int    g_submenu_tab        = SUBMENU_TAB_SUBS;
 static int    g_submenu_sub_sel    = 0;   /* 0 = Off, i+1 = g_info_item.subs[i] */
 static int    g_submenu_audio_sel  = 0;   /* index into g_info_item.audio[] */
+static int    g_submenu_pic_sel    = 0;   /* 0 = Normal, 1 = the contextual zoom (see g_zoom_mode) */
 static int    g_submenu_was_paused = 0;   /* pause state before the menu opened, to restore on close */
+
+/* Picture mode (the submenu's PICTURE tab, wide files only — a genuine 4:3
+ * file already fills the 4:3 screen, so the tab isn't even shown for one):
+ *
+ *   0  Default — present the file exactly as encoded (the only behavior
+ *      before this existed).
+ *   1  Zoom 4:3 — take the central 4:3 region at full height. Made for 4:3
+ *      content pillarboxed inside a 16:9 encode (the reported real-world
+ *      case: baked black side bars), where it cuts ONLY the bars.
+ *   2  Stretch — fill the screen by stretching a genuinely wide picture
+ *      vertically (the classic TV "full/stretch" mode: no picture lost,
+ *      geometry distorted instead).
+ *
+ * Deliberately NO pixel-analysis auto-detection of which one a file needs:
+ * a dark scene is indistinguishable from a baked bar, so the user's eye is
+ * the judge — default off, effect instantly visible, instantly reversible.
+ * Applied by restarting the stream at the current position (same mechanism
+ * as an audio-track switch); reset to Default whenever a DIFFERENT title
+ * starts (see play()), never persisted. */
+static int    g_zoom_mode = 0;
+#define PICTURE_DAR_WIDE 1.45   /* above = wide file, below = 4:3-ish (1.33 4:3, 1.37 Academy) */
+
+/* The playing item's display aspect ratio, with the same fallback ladder
+ * play()'s -vf math uses (source_aspect, raw dimensions, then a plain 16:9
+ * guess) — the PICTURE tab's zoom label and play()'s chain must agree on
+ * whether a file counts as wide, so they share this. */
+static double item_dar(void)
+{
+    double dar = g_info_item.source_aspect;
+    if (dar <= 0.0 && g_info_item.source_width > 0 && g_info_item.source_height > 0)
+        dar = (double)g_info_item.source_width / (double)g_info_item.source_height;
+    if (dar <= 0.0) dar = 16.0 / 9.0;
+    return dar;
+}
 /* When the menu was opened, so a duplicate of the opening press can't close
  * it again — see the close handling in the main loop. */
 static double g_submenu_opened_at = 0.0;
@@ -3130,7 +3323,18 @@ static int submenu_option_count(void)
 {
     if (g_submenu_tab == SUBMENU_TAB_AUDIO)
         return g_info_item.audio_count;      /* no "off" — video always has audio */
+    if (g_submenu_tab == SUBMENU_TAB_PICTURE)
+        return 3;                            /* Default / Zoom 4:3 / Stretch */
     return g_info_item.sub_count + 1;        /* + "Off" */
+}
+
+/* PICTURE is the last tab and only exists for wide files — a genuine 4:3
+ * file already fills the 4:3 screen, so offering zoom/stretch there would
+ * be nothing but a way to damage a correct picture. */
+static int submenu_tab_count(void)
+{
+    return item_dar() > PICTURE_DAR_WIDE ? SUBMENU_TAB_COUNT
+                                          : SUBMENU_TAB_COUNT - 1;
 }
 
 /* The frame the menu is drawn over, captured once when it opens.
@@ -3176,6 +3380,12 @@ static void submenu_open(FBDev *fb)
     int audio_pos = audio_pos_for_index(g_current_audio_index);
     g_submenu_audio_sel = audio_pos < 0 ? 0 : audio_pos;
 
+    g_submenu_pic_sel = g_zoom_mode;
+    /* The PICTURE tab can be left as the remembered tab from a wide title —
+     * for a 4:3 one it doesn't exist (see submenu_tab_count). */
+    if (g_submenu_tab >= submenu_tab_count())
+        g_submenu_tab = SUBMENU_TAB_SUBS;
+
     /* Open on whichever tab is actually useful. Subtitles stay the default
      * (that's what SELECT has always opened), but on a title with no subtitle
      * tracks at all and a real choice of audio, opening on an empty list
@@ -3205,10 +3415,153 @@ static void submenu_switch_tab(int tab)
     g_submenu_tab = tab;
 }
 
+/* One mini screen of the PICTURE tab's card art, transcribed from the
+ * user's supplied icons: a white-framed screen, black bars, cyan picture,
+ * and a yellow "sun" so the after-state visibly shows the same scene
+ * bigger. 17*s tall; the WIDTH comes from par_correction so the frame
+ * actually LOOKS 4:3 on screen (this platform's pixels aren't square —
+ * drawn at the art's raw 22x17 it read as visibly too tall, per user).
+ * state: 0 = letterboxed (bars top/bottom), 1 = windowboxed (bars all
+ * around), 2 = full bleed after a zoom (sun stays SQUARE on screen — zoom
+ * only enlarges), 3 = blank (the "original/as the source is" screen — no
+ * picture-shape claim, per the user's own art for it), 4 = full bleed
+ * after a stretch (sun keeps its width but grows visibly TALLER — exactly
+ * the distortion stretch costs, and what keeps the two after-states
+ * distinguishable at a glance). */
+static int pic_mini_screen_w(FBDev *fb, int s)
+{
+    return (int)((4.0 / 3.0) * par_correction(fb) * 17 * s + 0.5);
+}
+
+static void pic_mini_screen(FBDev *fb, int x, int y, int s, int state)
+{
+    int w  = pic_mini_screen_w(fb, s);
+    int h  = 17 * s;
+    int ix = x + s, iy = y + s;
+    int iw = w - 2 * s, ih = h - 2 * s;
+    /* Horizontal art unit: the inner width split into the same 20 columns
+     * the original 22x17 art used, so positions transcribe 1:1. */
+    #define PMS_X(u) (ix + iw * (u) / 20)
+
+    fb_fill_rect_alpha(fb, x, y, w, h, 0xE8, 0xE8, 0xE8, 255);
+    fb_fill_rect_alpha(fb, ix, iy, iw, ih, 0x10, 0x10, 0x10, 255);
+    if (state == 3) return;
+
+    /* Sun sizes, in on-screen-square terms: width = height * par. */
+    int sun_small_h = 4 * s, sun_small_w = (int)(sun_small_h * par_correction(fb) + 0.5);
+    int sun_big_h   = 7 * s, sun_big_w   = (int)(sun_big_h * par_correction(fb) + 0.5);
+
+    if (state == 0) {
+        fb_fill_rect_alpha(fb, ix, y + 4 * s, iw, 9 * s, 0x38, 0xC4, 0xF0, 255);
+        fb_fill_rect_alpha(fb, x + (w - sun_small_w) / 2, y + 6 * s,
+                           sun_small_w, sun_small_h, 0xF0, 0xD8, 0x30, 255);
+    } else if (state == 1) {
+        fb_fill_rect_alpha(fb, PMS_X(4), y + 4 * s, PMS_X(16) - PMS_X(4), 9 * s,
+                           0x38, 0xC4, 0xF0, 255);
+        fb_fill_rect_alpha(fb, x + (w - sun_small_w) / 2, y + 6 * s,
+                           sun_small_w, sun_small_h, 0xF0, 0xD8, 0x30, 255);
+    } else if (state == 2) {
+        fb_fill_rect_alpha(fb, ix, iy, iw, ih, 0x38, 0xC4, 0xF0, 255);
+        fb_fill_rect_alpha(fb, x + (w - sun_big_w) / 2, iy + (ih - sun_big_h) / 2,
+                           sun_big_w, sun_big_h, 0xF0, 0xD8, 0x30, 255);
+    } else {
+        /* stretched: the zoom sun's width, ~double its height */
+        int sun_h = 13 * s;
+        fb_fill_rect_alpha(fb, ix, iy, iw, ih, 0x38, 0xC4, 0xF0, 255);
+        fb_fill_rect_alpha(fb, x + (w - sun_big_w) / 2, iy + (ih - sun_h) / 2,
+                           sun_big_w, sun_h, 0xF0, 0xD8, 0x30, 255);
+    }
+    #undef PMS_X
+}
+
+/* The PICTURE tab: three cards (Default / Zoom 4:3 / Stretch) instead of
+ * text rows — each zoom card carries the user's full before->after icon
+ * art, because the icons ARE the explanation of what each mode does. */
+static void draw_submenu_picture(FBDev *fb)
+{
+    int box_w = 470, card_w = 138, card_h = 66, card_gap = 8;
+    int chrome_h = 10 + 15 + 8 + 3 * 12 + 8;
+    int box_h = chrome_h + card_h + 6;
+    int box_x = (fb->width - box_w) / 2, box_y = fb->height / 2 - box_h / 2;
+    fb_fill_rect_alpha(fb, box_x, box_y, box_w, box_h, 0, 0, 0, 225);
+
+    int list_x = box_x + 12, list_y = box_y + 10;
+
+    static const char *const tab_labels[SUBMENU_TAB_COUNT] = {
+        [SUBMENU_TAB_AUDIO]   = "AUDIO",
+        [SUBMENU_TAB_SUBS]    = "SUBTITLES",
+        [SUBMENU_TAB_PICTURE] = "PICTURE",
+    };
+    int x = list_x;
+    for (int t = 0; t < submenu_tab_count(); t++) {
+        if (t == g_submenu_tab) draw_text(fb, x, list_y, tab_labels[t], 1, COL_TITLE);
+        else                    draw_text(fb, x, list_y, tab_labels[t], 1, COL_HINT);
+        x += text_width(fb, tab_labels[t], 1) + 3 * 8;
+    }
+    list_y += 15;
+
+    static const char *const captions[3] = { "Original", "Zoom 4:3", "Stretch" };
+    int cards_x = box_x + (box_w - 3 * card_w - 2 * card_gap) / 2;
+    for (int m = 0; m < 3; m++) {
+        int cx = cards_x + m * (card_w + card_gap);
+        int cy = list_y;
+        int is_sel    = (m == g_submenu_pic_sel);
+        int is_active = (m == g_zoom_mode);
+
+        fb_fill_rect_alpha(fb, cx, cy, card_w, card_h, 0x18, 0x18, 0x18, 255);
+        if (is_sel) {
+            /* Same selection color the list rows use, as a 2px border. */
+            fb_fill_rect_alpha(fb, cx, cy, card_w, 2, COL_SEL_BG, 255);
+            fb_fill_rect_alpha(fb, cx, cy + card_h - 2, card_w, 2, COL_SEL_BG, 255);
+            fb_fill_rect_alpha(fb, cx, cy, 2, card_h, COL_SEL_BG, 255);
+            fb_fill_rect_alpha(fb, cx + card_w - 2, cy, 2, card_h, COL_SEL_BG, 255);
+        }
+
+        /* Art row: Original is the single as-encoded screen; the zoom cards
+         * are before -> after. s=1 keeps a pair inside one card. */
+        int art_y = cy + 8;
+        int sw = pic_mini_screen_w(fb, 1);
+        if (m == 0) {
+            pic_mini_screen(fb, cx + (card_w - sw) / 2, art_y + 8, 1, 3);
+        } else {
+            int arrow_w = 14;
+            int pair_w = sw + arrow_w + sw;
+            int px = cx + (card_w - pair_w) / 2;
+            pic_mini_screen(fb, px, art_y + 8, 1, m == 1 ? 1 : 0);
+            draw_text(fb, px + sw + 3, art_y + 8 + 5, ">", 1, COL_ITEM);
+            pic_mini_screen(fb, px + sw + arrow_w, art_y + 8, 1, m == 1 ? 2 : 4);
+        }
+
+        char cap[16];
+        snprintf(cap, sizeof(cap), "%s%s", is_active ? "> " : "", captions[m]);
+        int cap_x = cx + (card_w - text_width(fb, cap, 1)) / 2;
+        if (is_active)      draw_text(fb, cap_x, cy + card_h - 12, cap, 1, COL_RESUME);
+        else if (is_sel)    draw_text(fb, cap_x, cy + card_h - 12, cap, 1, COL_SEL_FG);
+        else                draw_text(fb, cap_x, cy + card_h - 12, cap, 1, COL_ITEM);
+    }
+    list_y += card_h + 6 + 8;
+
+    const char *hint1 = "LEFT/RIGHT: select picture mode";
+    const char *hint2 = "L/R: switch tab";
+    const char *hint3 = "B: apply    A: cancel";
+    draw_text(fb, box_x + (box_w - text_width(fb, hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
+    list_y += 12;
+    draw_text(fb, box_x + (box_w - text_width(fb, hint2, 1)) / 2, list_y, hint2, 1, COL_HINT);
+    list_y += 12;
+    draw_text(fb, box_x + (box_w - text_width(fb, hint3, 1)) / 2, list_y, hint3, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
 static void draw_submenu(FBDev *fb)
 {
     /* Start from the captured backdrop every time — see g_submenu_bg. */
     submenu_bg_restore(fb);
+
+    if (g_submenu_tab == SUBMENU_TAB_PICTURE) {
+        draw_submenu_picture(fb);
+        return;
+    }
 
     int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
     int n_opts   = submenu_option_count();
@@ -3218,8 +3571,8 @@ static void draw_submenu(FBDev *fb)
      * the "none" message below has somewhere to go. */
     int n_rows   = n_opts > 0 ? n_opts : 1;
     /* The sync readout is subtitle-only — it adjusts subtitle timing, and
-     * there's no audio equivalent worth the row. */
-    int extra_rows = is_audio ? 0 : 1;
+     * there's no audio/picture equivalent worth the row. */
+    int extra_rows = (g_submenu_tab == SUBMENU_TAB_SUBS) ? 1 : 0;
 
     /* Wide enough for a full server-composed audio DisplayTitle — "English -
      * Dolby Digital 5.1 - Default" is 37 characters, and at 8px per glyph
@@ -3248,7 +3601,7 @@ static void draw_submenu(FBDev *fb)
     /* Scroll offset per tab, nudged just far enough to keep the selection on
      * screen — same minimal-movement behaviour as the browse list, rather
      * than re-centring on every keypress. */
-    static int submenu_scroll[2] = { 0, 0 };
+    static int submenu_scroll[SUBMENU_TAB_COUNT] = { 0 };
     int *scroll = &submenu_scroll[g_submenu_tab];
     if (sel < *scroll)          *scroll = sel;
     if (sel >= *scroll + shown) *scroll = sel - shown + 1;
@@ -3262,21 +3615,21 @@ static void draw_submenu(FBDev *fb)
     int list_x = box_x + 12, list_y = box_y + 10;
     int label_max_w = box_w - 24;   /* box_w minus left/right margin, for truncation below */
 
-    /* Tab header — the inactive tab stays visible (dimmed) rather than being
-     * hidden, so there's something on screen telling you the other one is
-     * there and that L/R reaches it. */
+    /* Tab header — the inactive tabs stay visible (dimmed) rather than being
+     * hidden, so there's something on screen telling you the others are
+     * there and that L/R reaches them. */
     {
-        const char *audio_label = "AUDIO";
-        const char *subs_label  = "SUBTITLES";
+        static const char *const tab_labels[SUBMENU_TAB_COUNT] = {
+            [SUBMENU_TAB_AUDIO]   = "AUDIO",
+            [SUBMENU_TAB_SUBS]    = "SUBTITLES",
+            [SUBMENU_TAB_PICTURE] = "PICTURE",
+        };
         int gap = 3 * 8;
-        int audio_x = list_x;
-        int subs_x  = audio_x + text_width(fb, audio_label, 1) + gap;
-        if (is_audio) {
-            draw_text(fb, audio_x, list_y, audio_label, 1, COL_TITLE);
-            draw_text(fb, subs_x,  list_y, subs_label,  1, COL_HINT);
-        } else {
-            draw_text(fb, audio_x, list_y, audio_label, 1, COL_HINT);
-            draw_text(fb, subs_x,  list_y, subs_label,  1, COL_TITLE);
+        int x = list_x;
+        for (int t = 0; t < submenu_tab_count(); t++) {
+            if (t == g_submenu_tab) draw_text(fb, x, list_y, tab_labels[t], 1, COL_TITLE);
+            else                    draw_text(fb, x, list_y, tab_labels[t], 1, COL_HINT);
+            x += text_width(fb, tab_labels[t], 1) + gap;
         }
         /* Only when some of the list is off-screen — otherwise it's noise. */
         if (shown < n_opts) {
@@ -3324,7 +3677,7 @@ static void draw_submenu(FBDev *fb)
         list_y += 15;
     }
 
-    if (!is_audio) {
+    if (g_submenu_tab == SUBMENU_TAB_SUBS) {
         char syncline[32];
         snprintf(syncline, sizeof(syncline), "Sync: %+.1fs", g_sub_delay_extra);
         draw_text(fb, list_x, list_y, syncline, 1, COL_ITEM);
@@ -3334,8 +3687,9 @@ static void draw_submenu(FBDev *fb)
 
     const char *hint1 = is_audio ? "UP/DOWN: select audio track"
                                   : "UP/DOWN: select subtitle";
-    const char *hint2 = is_audio ? "L/R: switch tab"
-                                  : "L/R: switch tab   LEFT/RIGHT: sync";
+    const char *hint2 = (g_submenu_tab == SUBMENU_TAB_SUBS)
+                          ? "L/R: switch tab   LEFT/RIGHT: sync"
+                          : "L/R: switch tab";
     const char *hint3 = "B: apply    A: cancel";
     draw_text(fb, box_x + (box_w - text_width(fb, hint1, 1)) / 2, list_y, hint1, 1, COL_HINT);
     list_y += 12;
@@ -3353,15 +3707,19 @@ static void submenu_confirm(FBDev *fb)
     int new_audio = (g_info_item.audio_count > 0)
                     ? g_info_item.audio[g_submenu_audio_sel].index
                     : g_current_audio_index;
+    int new_zoom = g_submenu_pic_sel;
 
     submenu_close();
 
-    /* An audio change can only be applied by rebuilding the stream URL, so it
-     * subsumes any subtitle change made in the same visit — both get baked
-     * into the one restart rather than restarting twice. */
-    if (new_audio != g_current_audio_index) {
+    /* An audio change can only be applied by rebuilding the stream URL, and
+     * a picture-zoom change by rebuilding the -vf chain — either way the
+     * stream restarts, so one restart subsumes every change made in the
+     * same visit (including a subtitle change) rather than restarting
+     * twice. */
+    if (new_audio != g_current_audio_index || new_zoom != g_zoom_mode) {
         double pos = play_position();
         g_current_audio_index = new_audio;
+        g_zoom_mode           = new_zoom;
 
         int new_burn_in = -1;
         if (new_sub >= 0) {
@@ -3389,13 +3747,19 @@ static void submenu_handle_input(FBDev *fb, int inp, int nav_repeat, double loop
     static double last_nav_press = 0.0;
     int n_opts   = submenu_option_count();
     int is_audio = (g_submenu_tab == SUBMENU_TAB_AUDIO);
-    int *sel     = is_audio ? &g_submenu_audio_sel : &g_submenu_sub_sel;
+    int is_subs  = (g_submenu_tab == SUBMENU_TAB_SUBS);
+    int is_pic   = (g_submenu_tab == SUBMENU_TAB_PICTURE);
+    int *sel     = is_audio ? &g_submenu_audio_sel :
+                   is_subs  ? &g_submenu_sub_sel   : &g_submenu_pic_sel;
 
-    /* Shoulder buttons switch tabs, leaving LEFT/RIGHT free for
-     * subtitle sync (which needs to stay a fine repeated nudge, and
-     * has no audio equivalent to share the keys with). */
-    if (inp & INP_L) submenu_switch_tab(SUBMENU_TAB_AUDIO);
-    if (inp & INP_R) submenu_switch_tab(SUBMENU_TAB_SUBS);
+    /* Shoulder buttons walk the tab strip (AUDIO | SUBTITLES | PICTURE —
+     * the last one only for wide files, see submenu_tab_count), leaving
+     * LEFT/RIGHT free for subtitle sync (which needs to stay a fine
+     * repeated nudge) and for the picture tab's card selection. */
+    if (inp & INP_L && g_submenu_tab > 0)
+        submenu_switch_tab(g_submenu_tab - 1);
+    if (inp & INP_R && g_submenu_tab < submenu_tab_count() - 1)
+        submenu_switch_tab(g_submenu_tab + 1);
 
     int menu_inp = inp | nav_repeat;   /* held UP/DOWN walks the list, held LEFT/RIGHT keeps nudging sync */
     if ((menu_inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT)) &&
@@ -3403,15 +3767,19 @@ static void submenu_handle_input(FBDev *fb, int inp, int nav_repeat, double loop
         last_nav_press = loop_now;
         if (menu_inp & INP_UP)    { if (*sel > 0) (*sel)--; }
         if (menu_inp & INP_DOWN)  { if (*sel < n_opts - 1) (*sel)++; }
+        /* The picture tab's cards sit side by side, so LEFT/RIGHT is the
+         * natural selector there (UP/DOWN above still works too). */
+        if (is_pic && (menu_inp & INP_LEFT))  { if (*sel > 0) (*sel)--; }
+        if (is_pic && (menu_inp & INP_RIGHT)) { if (*sel < n_opts - 1) (*sel)++; }
         /* Live-tunable on top of the fixed baseline (AUDIO_DELAY_SEC
          * + SUBTITLE_SYNC_FUDGE_SEC + g_play_offset) — for whatever
          * that fixed default doesn't cover on a specific subtitle
          * file. Applies immediately if a subtitle is already
          * loaded. Subtitle tab only: there's nothing for it to mean
-         * on the audio tab, and silently changing subtitle timing
+         * on the other tabs, and silently changing subtitle timing
          * from a screen not showing it would be a surprise. */
-        if (!is_audio && (menu_inp & INP_LEFT))  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
-        if (!is_audio && (menu_inp & INP_RIGHT)) { g_sub_delay_extra += 0.1; sub_delay_send(); }
+        if (is_subs && (menu_inp & INP_LEFT))  { g_sub_delay_extra -= 0.1; sub_delay_send(); }
+        if (is_subs && (menu_inp & INP_RIGHT)) { g_sub_delay_extra += 0.1; sub_delay_send(); }
     }
     if (inp & INP_A) { submenu_confirm(fb); input_drain(); return; }
     /* SELECT also closes — a SELECT press while already open was a
@@ -3637,6 +4005,18 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_last_progress_report = now_sec();
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
 
+    /* Picture zoom survives restarts of the SAME title (that's exactly how
+     * the PICTURE tab applies it — see submenu_confirm) but never carries
+     * over to a different one: whether a crop makes sense is a per-file
+     * property of what's baked into its frames. */
+    {
+        static char zoom_item[JF_ID_LEN] = "";
+        if (strcmp(zoom_item, item_id) != 0) {
+            g_zoom_mode = 0;
+            snprintf(zoom_item, sizeof(zoom_item), "%s", item_id);
+        }
+    }
+
     /* Video, unlike the UI, uses the PHYSICAL framebuffer height: mplayer
      * opens /dev/fb0 itself and sees the real line count, and on an
      * interlaced 576/480-line raster the whole point is that video CAN
@@ -3645,8 +4025,8 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
      * except under line doubling. */
     int vh = fb->phys_height;
 
-    char vf_arg[96];
-    if (vh == 288 &&
+    char vf_arg[128];
+    if (vh == 288 && !g_zoom_mode &&
         g_cfg.profile_width == 480 && g_cfg.profile_height == 270) {
         /* PAL at the ORIGINAL 480x270 transcode dimensions (the default for
          * the platform's entire history until the 640x288 bump — see
@@ -3685,10 +4065,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
          * expand only ever pads, never shrinks. Falls back to raw source
          * width/height, then a plain 16:9 guess, if aspect metadata is
          * missing — better than reverting to the confirmed-broken chain. */
-        double dar = g_info_item.source_aspect;
-        if (dar <= 0.0 && g_info_item.source_width > 0 && g_info_item.source_height > 0)
-            dar = (double)g_info_item.source_width / (double)g_info_item.source_height;
-        if (dar <= 0.0) dar = 16.0 / 9.0;
+        double dar = item_dar();
 
         int target_h = (int)(4.0 * vh / (3.0 * dar) + 0.5);
         target_h &= ~1;                        /* even, required for yuv420p chroma subsampling */
@@ -3707,6 +4084,46 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
          * the visible ~[40,vh) window rather than the full [0,vh) buffer.
          * Only applies to this mode (vh is only ever 576/480 here); NTSC's
          * ordinary 240-line progressive path is unaffected. */
+        if (g_zoom_mode) {
+            /* Picture modes (see g_zoom_mode's comment for what each means
+             * and why there's no auto-detection). Under the interlaced
+             * core's cropped raster only [40, vh) is visible (see the
+             * default branch below) — both modes fill and center within
+             * that window, padding the invisible top rows. The vo always
+             * receives exactly framebuffer-sized frames, so the NTSC comb
+             * failure mode this branch's own comment describes can't
+             * re-enter through here. */
+            int usable_h = fb->line_double ? vh - 40 : vh;
+            char expand_zoom[48];
+            if (fb->line_double)
+                snprintf(expand_zoom, sizeof(expand_zoom), "expand=%d:%d:-1:%d:0",
+                         fb->width, vh, 40);
+            else
+                snprintf(expand_zoom, sizeof(expand_zoom), "expand=%d:%d:-1:-1:1",
+                         fb->width, vh);
+
+            if (g_zoom_mode == 2) {
+                /* Stretch: one swscale pass straight to the full screen —
+                 * vertical geometry distorts, nothing is cropped. */
+                snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,%s,dsize=%d:%d",
+                         fb->width, usable_h & ~1, expand_zoom, fb->width, vh);
+            } else {
+                /* Zoom 4:3: scale the normal aspect-correct fit (640 x
+                 * target_h) UP so the picture fills the full height, then
+                 * center-crop the width back to the screen — crop runs
+                 * after scale in the chain, so its arguments are fixed
+                 * screen dimensions, not source-dependent. For pillarboxed
+                 * 4:3-in-16:9 the crop removes just the baked bars. */
+                double z = (double)usable_h / target_h;
+                int sw = ((int)(fb->width * z + 0.5)) & ~1;
+                int sh = usable_h & ~1;
+                if (sw < fb->width) sw = fb->width;
+                snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,crop=%d:%d,%s,dsize=%d:%d",
+                         sw, sh, fb->width, sh, expand_zoom, fb->width, vh);
+            }
+            goto vf_done;
+        }
+
         char expand_arg[48];
         if (fb->line_double) {
             /* Center within the VISIBLE window [40, vh), not the full
@@ -3748,6 +4165,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
         snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,%s,dsize=%d:%d",
                  fb->width, target_h, expand_arg, fb->width, vh);
     }
+vf_done:;
 
     /* A selected client-rendered (text) subtitle rides the COMMAND LINE
      * (-sub/-subdelay) rather than slave commands sent after the fork:
@@ -4527,8 +4945,9 @@ int main(int argc, char **argv)
                                    argc > 3 && strcmp(argv[3], "list") == 0);
     if (argc > 1 && strcmp(argv[1], "--preview-submenu") == 0)
         return run_preview_submenu(argc > 2 ? argv[2] : "",
-                                    (argc > 3 && strcmp(argv[3], "audio") == 0)
-                                        ? SUBMENU_TAB_AUDIO : SUBMENU_TAB_SUBS);
+                                    (argc > 3 && strcmp(argv[3], "audio") == 0)   ? SUBMENU_TAB_AUDIO :
+                                    (argc > 3 && strcmp(argv[3], "picture") == 0) ? SUBMENU_TAB_PICTURE
+                                                                                    : SUBMENU_TAB_SUBS);
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
     grid_init(&g_cfg);             /* just stores the pointer — config itself loads below */
@@ -4727,6 +5146,8 @@ int main(int argc, char **argv)
     int playing = 0;
     int spinner_frame_ctr = 0;
     int about_visible = 0;
+    int changelog_visible = 0;   /* what's-new sub-screen over About, see draw_changelog */
+    int changelog_scroll = 0;
     double last_about_press = 0.0;
     double screenshot_flash_until = 0.0;
     if (state == STATE_BROWSE) draw_browse(&fb);
@@ -4810,17 +5231,62 @@ int main(int argc, char **argv)
         if (!playing && (inp & INP_START) && (loop_now - last_about_press > 0.3)) {
             last_about_press = loop_now;
             about_visible = !about_visible;
+            changelog_visible = 0;
             if (about_visible) draw_about(&fb);
             else redraw_current_screen(&fb, state);
             input_drain();
             continue;
         }
         if (about_visible) {
+            /* What's-new sub-screen: shown between "install" on About and
+             * the actual install, so the user sees the release notes first.
+             * On-screen labels vs INP_* bits follow the app-wide mapping
+             * (screen "B" = INP_A, screen "A" = INP_B — same as About's own
+             * footer above). */
+            if (changelog_visible) {
+                if (inp & INP_B) {                    /* screen "A: back" */
+                    changelog_visible = 0;
+                    draw_about(&fb);
+                } else if (inp & INP_A) {             /* screen "B: install update" */
+                    update_start_install();
+                    changelog_visible = 0;
+                    draw_about(&fb);
+                } else {
+                    int nav = inp | nav_repeat;
+                    if (nav & INP_UP)   changelog_scroll--;
+                    if (nav & INP_DOWN) changelog_scroll++;
+                    int max_scroll = g_cl_count - changelog_rows(&fb);
+                    if (max_scroll < 0) max_scroll = 0;
+                    if (changelog_scroll < 0) changelog_scroll = 0;
+                    if (changelog_scroll > max_scroll) changelog_scroll = max_scroll;
+                    /* Same screenshot-flash guard as About's redraw below. */
+                    if (loop_now >= screenshot_flash_until)
+                        draw_changelog(&fb, changelog_scroll);
+                }
+                usleep(16000);
+                continue;
+            }
             if (inp & INP_B) {
                 about_visible = 0;
                 redraw_current_screen(&fb, state);
             } else {
-                if (inp & INP_A) update_start_install();
+                if (inp & INP_A) {
+                    UpdateState  us;
+                    InstallState is;
+                    update_get_state(&us, &is, NULL, 0);
+                    /* Only when the footer is actually offering "B: install"
+                     * — mid-download/done/failed the press means nothing,
+                     * same as before. */
+                    if (us == UPD_AVAILABLE && is == INST_IDLE) {
+                        changelog_prepare(&fb);
+                        changelog_scroll = 0;
+                        changelog_visible = 1;
+                        draw_changelog(&fb, 0);
+                        input_drain();
+                        usleep(16000);
+                        continue;
+                    }
+                }
                 /* Redraw every frame to pick up update state — except right
                  * after a screenshot taken while About was already open,
                  * where that same unconditional redraw would otherwise

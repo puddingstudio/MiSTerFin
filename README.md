@@ -31,7 +31,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [Unreleased](#unreleased) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
@@ -63,6 +63,7 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 |:---:|:---:|:---:|
 | <img src="docs/images/screenshots/video-playback.png" width="260"><br>Letterboxed (2.20:1 source) | <img src="docs/images/screenshots/video-playback-4x3.png" width="260"><br>Full 4:3 (no letterboxing) | <img src="docs/images/screenshots/video-seek.png" width="260"><br>Seek overlay |
 | <img src="docs/images/screenshots/pause-menu.png" width="260"><br>Pause menu | <img src="docs/images/screenshots/subtitle-picker.png" width="260"><br>Subtitle picker | <img src="docs/images/screenshots/audio-track-picker.png" width="260"><br>Audio track picker |
+| <img src="docs/images/screenshots/picture-modes.png" width="260"><br>Picture modes (wide titles) | | |
 
 **Music**
 
@@ -73,9 +74,9 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 
 **About**
 
-| |
-|:---:|
-| <img src="docs/images/screenshots/about-screen.png" width="260"><br>About screen |
+| | |
+|:---:|:---:|
+| <img src="docs/images/screenshots/about-screen.png" width="260"><br>About screen | <img src="docs/images/screenshots/whats-new.png" width="260"><br>What's new (before an update installs) |
 
 **Setup and errors**
 
@@ -98,7 +99,7 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 - **Alternate audio tracks** — a second tab in the same SELECT menu lists every audio stream (language, codec, channel count, and whatever else the server puts in its display title, so a commentary track is distinguishable from the main mix). Switching restarts the stream at the current position, since the server transcodes one chosen track into what it sends
 - **Music library**: browse Artists → Albums → Tracks, direct-play audio (no server transcode needed for a plain FLAC/MP3 file), a now-playing screen with a live clock, cover art (falls back to the album's cover for a track with no embedded art of its own), a real audio-reactive VU meter pair (reads mplayer's own live PCM export, not a decorative animation), a SELECT-cycled background effect — starfield, rain, **Nebula** (our own audio-reactive plasma visualizer, inspired by Ryan Geiss's classic feedback visualizer), or a faithful port of [MiSTer-Toasty-Squadron](https://github.com/puddingstudio/MiSTer-Toasty-Squadron)'s own flying-toaster screensaver (same flight paths, sizes, and moon, right down to its biggest sprites flying over the cover art); Nebula and Toasty use an immersive layout — just an enlarged centered cover over the effect — seek within a track, and prev/next-track navigation that auto-advances at the end of each track
 - **Sync**: resume position and watched status are read from and reported back to Jellyfin, so they stay in sync with your other Jellyfin clients
-- **About screen** with a GitHub-releases update check and one-button in-app update (A installs, applied on next launch); the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
+- **About screen** with a GitHub-releases update check and in-app update — pressing update first shows the release's own notes on a scrollable what's-new screen, and the install (applied on next launch) sits behind one more confirm there; the same animated starfield background also shows on the setup screen if `jellyfin.conf` is missing/misconfigured
 
 ## <a id="scope"></a>Scope (v1)
 
@@ -343,7 +344,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ## <a id="changelog"></a>Changelog
 
-### <a id="unreleased"></a>Unreleased
+### <a id="v0-9-9"></a>v0.9.9
 - New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound
 - The setup/Quick Connect error screens are clearer: "Can't connect to server" now shows the configured server URL instead of suggesting you add an API key/username you may not need, and A now reliably exits everywhere it's hinted (a couple of these screens only accepted B before). Where Quick Connect also offers "B: try again", B still retries rather than exiting, same as before
 - `DEBUGLOG` now also captures one-shot startup/playback diagnostics — framebuffer geometry, input devices found, the relevant `MiSTer.ini` display settings, menu core/DDR state, the update check result, and the transcode profile used each time something plays — on top of the per-request log it already had
@@ -351,6 +352,8 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - Square album covers for music — a music library's background grid now uses square cells matching album art; movies/TV keep the portrait poster cells, both now with the exact right shape on PAL and NTSC alike
 - Bigger, clearer covers — 6 per row instead of 8, and the whole mosaic is noticeably less dimmed
 - The whole browse UI now redraws at the display's full refresh rate (~50Hz PAL / ~60Hz NTSC, up from ~17fps) — faster cover drawing, background dimming baked in once at load instead of per frame, a cheaper gradient pass, and removal of a redundant per-frame sleep that was eating exactly the time the optimizations freed up
+- Updating from the About screen now shows the release's changelog first — a scrollable what's-new screen with the actual install behind one more confirm, so an update is never a blind "something will change"
+- New PICTURE tab in the playback SELECT menu (wide titles only) with three modes: **Original** (as encoded), **Zoom 4:3** (crops the center to fill the screen — made for 4:3 content encoded inside a 16:9 file with baked black side bars, where it cuts only the bars), and **Stretch** (fills the screen by stretching a wide picture vertically, nothing cropped). Applied instantly at the current position; resets to Original per title
 - Internal code hygiene — no behavior changes
 
 ### <a id="v0-9-8"></a>v0.9.8

@@ -27,4 +27,10 @@ void update_start_install(void);
 void update_get_state(UpdateState *upd, InstallState *inst,
                       char *latest, int latest_len);
 
+/* Copies the found release's notes (the GitHub release body, markdown as
+ * the author wrote it) into out — shown as a what's-new screen before the
+ * user confirms the install. Empty string when there's nothing to show
+ * (no release found yet, or a release with no body). */
+void update_get_changelog(char *out, int outlen);
+
 #endif

@@ -43,6 +43,7 @@ jobs:
           cp -r assets/font2x release/misterfin/font2x
           cp -r assets/subfont2x release/misterfin/subfont2x
           cp -r assets/toasty release/misterfin/toasty
+          cp -r assets/sfx release/misterfin/sfx
           cp assets/about.png release/misterfin/
           chmod +x release/misterfin/misterfin-arm
           chmod +x release/misterfin/mplayer-arm

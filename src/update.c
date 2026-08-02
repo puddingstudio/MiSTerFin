@@ -21,6 +21,9 @@
 
 static UpdateState     g_upd_state = UPD_CHECKING;
 static char            g_upd_latest[32] = {0};
+/* The release body (markdown release notes) from the same /releases/latest
+ * response the tag comes from — release bodies here run ~2-3KB. */
+static char            g_upd_body[8192] = {0};
 static pthread_mutex_t g_upd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Checks github.com/puddingstudio/MiSTerFin's latest release tag against
@@ -127,7 +130,12 @@ static void *update_check_thread(void *arg)
     argv[n++] = (char *)"https://api.github.com/repos/puddingstudio/MiSTerFin/releases/latest";
     argv[n] = NULL;
 
-    char buf[8192];
+    /* Sized well past today's responses: the whole reply must fit or
+     * json_parse rightly rejects it, and the release body ("body", the
+     * markdown notes shown on the what's-new screen) sits at the END of
+     * GitHub's JSON — a longer-than-expected body would otherwise not just
+     * lose the notes but break the entire update check. */
+    static char buf[65536];
     if (!run_no_shell(argv, buf, sizeof(buf))) goto fail;
 
     /* Parsed properly rather than scanned for — the same reason every other
@@ -135,13 +143,16 @@ static void *update_check_thread(void *arg)
     JsonDoc doc;
     if (!json_parse(&doc, buf)) goto fail;
     char tag[32] = {0};
+    char body[sizeof(g_upd_body)] = {0};
     json_copy_str(&doc, NULL, "tag_name", tag, sizeof(tag));
+    json_copy_str(&doc, NULL, "body", body, sizeof(body));
     json_free(&doc);
 
     if (!update_tag_is_sane(tag)) goto fail;
 
     pthread_mutex_lock(&g_upd_mutex);
     strncpy(g_upd_latest, tag, sizeof(g_upd_latest) - 1);
+    memcpy(g_upd_body, body, sizeof(g_upd_body));
     g_upd_state = (strcmp(tag, APP_VERSION) == 0) ? UPD_OK : UPD_AVAILABLE;
     pthread_mutex_unlock(&g_upd_mutex);
     jf_log_line("update check: running=%s latest=%s -> %s", APP_VERSION, tag,
@@ -218,10 +229,20 @@ static void *install_thread(void *arg)
         if (!run_no_shell(argv, NULL, 0)) { set_inst(INST_FAILED); return NULL; }
     }
 
+    /* The directory-valued entries copy the DIRECTORY itself into the
+     * destination (no trailing "/.") so a folder the running install
+     * doesn't have yet is created rather than failing — sfx/ didn't exist
+     * before v0.9.9, and an in-app update has to be able to introduce it.
+     * font2x/subfont2x were previously missing here entirely: an in-app
+     * updater that skips them would strand users on stale 2x fonts
+     * forever while the zip-installed ones moved on. */
     static const char *const asset_copies[][3] = {
-        { "-r", "/tmp/misterfin-update/misterfin/font/.",    "/media/fat/misterfin/font/"    },
-        { "-r", "/tmp/misterfin-update/misterfin/subfont/.", "/media/fat/misterfin/subfont/" },
-        { "-r", "/tmp/misterfin-update/misterfin/toasty/.",  "/media/fat/misterfin/toasty/"  },
+        { "-r", "/tmp/misterfin-update/misterfin/font",      "/media/fat/misterfin/" },
+        { "-r", "/tmp/misterfin-update/misterfin/subfont",   "/media/fat/misterfin/" },
+        { "-r", "/tmp/misterfin-update/misterfin/font2x",    "/media/fat/misterfin/" },
+        { "-r", "/tmp/misterfin-update/misterfin/subfont2x", "/media/fat/misterfin/" },
+        { "-r", "/tmp/misterfin-update/misterfin/toasty",    "/media/fat/misterfin/" },
+        { "-r", "/tmp/misterfin-update/misterfin/sfx",       "/media/fat/misterfin/" },
         { NULL, "/tmp/misterfin-update/misterfin/about.png", "/media/fat/misterfin/about.png" },
     };
     for (size_t i = 0; i < sizeof(asset_copies) / sizeof(asset_copies[0]); i++) {
@@ -286,4 +307,13 @@ void update_get_state(UpdateState *upd, InstallState *inst,
     pthread_mutex_lock(&g_inst_mutex);
     if (inst) *inst = g_inst_state;
     pthread_mutex_unlock(&g_inst_mutex);
+}
+
+void update_get_changelog(char *out, int outlen)
+{
+    if (!out || outlen <= 0) return;
+    pthread_mutex_lock(&g_upd_mutex);
+    strncpy(out, g_upd_body, (size_t)outlen - 1);
+    out[outlen - 1] = '\0';
+    pthread_mutex_unlock(&g_upd_mutex);
 }
