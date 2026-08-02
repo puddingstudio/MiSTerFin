@@ -73,7 +73,9 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 
 **About**
 
-<p align="center"><img src="docs/images/screenshots/about-screen.png" width="260"></p>
+| |
+|:---:|
+| <img src="docs/images/screenshots/about-screen.png" width="260"><br>About screen |
 
 **Setup and errors**
 
