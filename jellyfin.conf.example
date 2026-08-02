@@ -45,16 +45,23 @@ PAL
 # ── Troubleshooting: request log ────────────────────────────────────────────
 # Add a line containing just DEBUGLOG (case-insensitive, works anywhere in
 # this file, same as PAL/NTSC above) and MiSTerFin writes
-# /media/fat/misterfin/debug.log — one line per server request: method,
-# endpoint, ok/FAIL, how long it took, how many bytes came back. Off by
-# default; the file is overwritten fresh on every launch, so it only ever
-# holds one session's worth.
+# /media/fat/misterfin/debug.log. Off by default; the file is overwritten
+# fresh on every launch, so it only ever holds one session's worth.
+#
+# One line per server request (method, endpoint, ok/FAIL, how long it took,
+# how many bytes came back), plus a handful of one-shot lines at startup and
+# during playback: framebuffer geometry, which input devices were found,
+# the relevant MiSTer.ini display settings (ypbpr/scandoubler/video_mode/...
+# — see docs/DISPLAY_COMPATIBILITY.md), which menu core/DDR path is active,
+# the GitHub update check result, and the transcode profile/resolution each
+# time something plays.
 #
 # It does NOT log your server URL, API key, access token, Quick Connect
-# secret, or anything from a request's query string (that's cut off
-# entirely) — safe to attach debug.log to a GitHub issue as-is. It's meant
-# for exactly that: turn it on, reproduce whatever went wrong, and attach
-# the file to the report instead of walking through an SSH session together.
+# secret, anything from a request's query string, or what's actually in your
+# library (no titles/ids) — safe to attach debug.log to a GitHub issue as-is.
+# It's meant for exactly that: turn it on, reproduce whatever went wrong, and
+# attach the file to the report instead of walking through an SSH session
+# together.
 #
 # DEBUGLOG
 

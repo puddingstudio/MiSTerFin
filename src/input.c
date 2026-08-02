@@ -34,6 +34,7 @@ static int  input_fds[MAX_INPUT_FDS];
 static int  input_swap_ab[MAX_INPUT_FDS];
 static int  input_is_virtual[MAX_INPUT_FDS];
 static char input_names[MAX_INPUT_FDS][32];   /* e.g. "event0" — see input_open() */
+static char input_display_names[MAX_INPUT_FDS][128]; /* EVIOCGNAME, e.g. "Microsoft X-Box 360 pad" */
 static int  input_count = 0;
 /* MISTERFIN_INPUT_DEBUG=1 — prints every incoming event with its device, raw
  * code, and what it mapped to (or why it was dropped). MiSTer's input routing
@@ -137,6 +138,7 @@ void input_open(void)
         input_swap_ab[input_count]    = device_needs_ab_swap(name);
         input_is_virtual[input_count] = device_is_mister_virtual(name);
         strncpy(input_names[input_count], e->d_name, sizeof(input_names[0]) - 1);
+        strncpy(input_display_names[input_count], name, sizeof(input_display_names[0]) - 1);
         input_fds[input_count++] = fd;
         if (input_debug)
             fprintf(stderr, "[input] opened %s \"%s\"%s (%d tracked)\n",
@@ -167,6 +169,7 @@ static void input_drop_slot(int i)
         input_swap_ab[j]    = input_swap_ab[j + 1];
         input_is_virtual[j] = input_is_virtual[j + 1];
         memcpy(input_names[j], input_names[j + 1], sizeof(input_names[0]));
+        memcpy(input_display_names[j], input_display_names[j + 1], sizeof(input_display_names[0]));
     }
     input_count--;
 }
@@ -186,6 +189,14 @@ void input_close(void)
     input_count = 0;
     stdin_input_restore();
 }
+
+/* For a one-time startup log line (see jf_log_line callers in main.c) —
+ * a static summary of what got opened, not a live per-event trace like
+ * MISTERFIN_INPUT_DEBUG already provides. */
+int input_device_count(void) { return input_count; }
+const char *input_device_node(int i) { return input_names[i]; }
+const char *input_device_name(int i) { return input_display_names[i]; }
+int input_device_is_virtual(int i) { return input_is_virtual[i]; }
 
 /* ── desktop keyboard backend (stdin, raw mode) ──────────────────────────
  * Off-hardware there are no /dev/input/eventN gamepads to read, so the same

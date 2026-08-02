@@ -47,6 +47,16 @@ int  draw_wrapped(FBDev *fb, int x, int y, const char *text,
  * look right (5/3 at PAL's 288 active lines). */
 double par_correction(FBDev *fb);
 
+/* Corner loading indicator. SPINNER_SIZE/SPINNER_MARGIN are public because
+ * the top bar's clock positions itself clear of the spinner's square. */
+#define SPINNER_SIZE   14
+#define SPINNER_MARGIN 10
+
+/* Simple blinking square in the top-right corner — a GIF mascot animation
+ * was tried first but wasn't worth the decode/ghosting complexity for what
+ * is just a "something's loading" cue. */
+void draw_spinner_frame(FBDev *fb, int frame_idx);
+
 /* Aspect-preserving blit of src into a max_w x max_h box centered on
  * (cx, cy), applying par_correction. */
 void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,

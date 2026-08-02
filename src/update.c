@@ -13,6 +13,7 @@
 
 #include "update.h"
 #include "json.h"
+#include "jellyfin.h"   /* jf_log_line only — see its own comment */
 
 #ifndef APP_VERSION
 #define APP_VERSION "dev"
@@ -143,12 +144,15 @@ static void *update_check_thread(void *arg)
     strncpy(g_upd_latest, tag, sizeof(g_upd_latest) - 1);
     g_upd_state = (strcmp(tag, APP_VERSION) == 0) ? UPD_OK : UPD_AVAILABLE;
     pthread_mutex_unlock(&g_upd_mutex);
+    jf_log_line("update check: running=%s latest=%s -> %s", APP_VERSION, tag,
+                g_upd_state == UPD_OK ? "up to date" : "update available");
     return NULL;
 
 fail:
     pthread_mutex_lock(&g_upd_mutex);
     g_upd_state = UPD_FAILED;
     pthread_mutex_unlock(&g_upd_mutex);
+    jf_log_line("update check: running=%s -> failed (network or GitHub unreachable)", APP_VERSION);
     return NULL;
 }
 

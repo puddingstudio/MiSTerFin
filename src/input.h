@@ -55,4 +55,12 @@ int input_select_start_held(void);
 
 void input_close(void);
 
+/* One-time device-list query, for a startup diagnostics log line — see the
+ * callers in main.c. Not the same thing as MISTERFIN_INPUT_DEBUG, which
+ * traces every event live instead of summarizing what's open. */
+int input_device_count(void);
+const char *input_device_node(int i);   /* e.g. "event0" */
+const char *input_device_name(int i);   /* e.g. "Microsoft X-Box 360 pad" */
+int input_device_is_virtual(int i);
+
 #endif

@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdarg.h>
 
 #ifndef APP_VERSION
 #define APP_VERSION "dev"
@@ -587,6 +588,23 @@ void jf_log_init(const JfConfig *cfg)
 void jf_log_close(void)
 {
     if (g_jf_log) { fclose(g_jf_log); g_jf_log = NULL; }
+}
+
+/* Freeform line for the non-request diagnostics (fb geometry, input devices,
+ * menu core, player lifecycle, ...) — everything that isn't a server round
+ * trip and so doesn't fit jf_log_request's fixed columns. Same no-op-unless-
+ * enabled and immediate-fflush behavior; callers are responsible for the
+ * same privacy rule (no server URL, credentials, or anything a user didn't
+ * put in jellyfin.conf/MiSTer.ini themselves). */
+void jf_log_line(const char *fmt, ...)
+{
+    if (!g_jf_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_jf_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_jf_log);
+    fflush(g_jf_log);
 }
 
 /* method/path_and_query only — deliberately no cfg, no url, no auth header
@@ -1639,4 +1657,16 @@ void jf_report_stopped(const JfConfig *cfg, const char *item_id,
      * straight to the last few seconds — and kept it sitting in the Continue
      * Watching row instead of moving the series on to Next Up. */
     report_user_data(cfg, item_id, played ? 0 : position_ticks, played);
+}
+
+int view_is_resume(const JfItem *v)    { return v->synthetic == JF_SYNTH_RESUME; }
+int view_is_nextup(const JfItem *v)    { return v->synthetic == JF_SYNTH_NEXTUP; }
+int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
+
+const char *collection_item_type(const char *collection_type)
+{
+    if (!strcmp(collection_type, "movies"))  return "Movie";
+    if (!strcmp(collection_type, "tvshows")) return "Series";
+    if (!strcmp(collection_type, "music"))   return "MusicAlbum";
+    return NULL;
 }

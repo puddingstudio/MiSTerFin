@@ -39,16 +39,13 @@
 #include "draw.h"
 #include "screenshot.h"
 #include "util.h"
+#include "grid.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
+/* Main-thread download scratch file. grid.c names the same path (its
+ * GRID_POSTER_TMP) for its own main-thread downloads — same thread, so
+ * sharing is deliberate and safe; keep the two in sync. */
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
-/* Separate download scratch path for the background grid-cache prefetch
- * thread (see grid_prefetch_thread()) — it must never share POSTER_TMP with
- * the main thread's own in-flight download (info screen backdrop/logo,
- * browse cover panel, etc.), which would silently clobber whichever one
- * finishes last. */
-#define POSTER_TMP_BG "/tmp/misterfin_poster_bg.img"
-#define GRID_CACHE_DIR "/media/fat/misterfin/gridcache"
 /* Per-item browse-list cover art, cached to the SD card (same idea as the
  * home-screen grid cache above) so scrolling a list reads covers from the
  * card instead of re-downloading each one — no network round-trip on the
@@ -458,8 +455,6 @@ static double g_np_title_shown_until = 0.0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
 
-static void draw_spinner_frame(FBDev *fb, int frame_idx);   /* forward decl — defined below, used by info_assets_load */
-
 /* ── info-screen hero assets (backdrop, logo, cast photos) ───────────────── */
 
 #define CAST_DISPLAY_MAX 5
@@ -471,22 +466,6 @@ static int      g_logo_w = 0, g_logo_h = 0;
 static uint8_t *g_cast_px[CAST_DISPLAY_MAX];
 static int      g_cast_px_w[CAST_DISPLAY_MAX], g_cast_px_h[CAST_DISPLAY_MAX];
 
-static uint8_t *load_image_tmp(const char *tmp_path, int *w, int *h)
-{
-    int channels = 0;
-    uint8_t *px = stbi_load(tmp_path, w, h, &channels, 4);
-    unlink(tmp_path);
-    return px;
-}
-
-/* Like load_image_tmp but KEEPS the file — for reading a persistent cache
- * file off the SD card (the cover cache), where deleting it would defeat the
- * whole point. */
-static uint8_t *load_image_keep(const char *path, int *w, int *h)
-{
-    int channels = 0;
-    return stbi_load(path, w, h, &channels, 4);
-}
 
 static void info_assets_free(void)
 {
@@ -540,21 +519,7 @@ static void info_assets_load(FBDev *fb, const JfItem *list_item, int *spinner_fr
  * means stop+restart with a new startTimeTicks, which has a few seconds of
  * reconnect latency worth covering with feedback) ───────────────────────── */
 
-#define SPINNER_SIZE   14
-#define SPINNER_MARGIN 10
 #define SPINNER_BLINK_MS 350
-
-/* Simple blinking square in the top-right corner — a GIF mascot animation
- * was tried first but wasn't worth the decode/ghosting complexity for what
- * is just a "something's loading" cue. */
-static void draw_spinner_frame(FBDev *fb, int frame_idx)
-{
-    int dx = fb->width - SPINNER_SIZE - SPINNER_MARGIN;
-    int dy = SPINNER_MARGIN;
-    fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0, 0, 0, 255);
-    if (frame_idx % 2 == 0)
-        fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0x40, 0xE0, 0x40, 255);
-}
 
 typedef struct { int x, y; } SpinnerSamplePt;
 
@@ -620,29 +585,6 @@ static void spinner_show(FBDev *fb, double seconds)
 }
 
 /* ── browse frames ────────────────────────────────────────────────────────── */
-
-/* The BaseItemKind that actually represents "one unit" of a library, keyed
- * off CollectionType — used both for the carousel's "N movies/series/
- * albums" count (jf_count_items) and its background cover grid
- * (jf_list_items_recursive): a plain direct-children listing of a by-artist
- * music library only finds MusicArtist folders, which often have no cover
- * art of their own, so both need to look past the top level at the real
- * leaf type. NULL (unrecognized collection type) means "don't filter". */
-static const char *collection_item_type(const char *collection_type)
-{
-    if (!strcmp(collection_type, "movies"))  return "Movie";
-    if (!strcmp(collection_type, "tvshows")) return "Series";
-    if (!strcmp(collection_type, "music"))   return "MusicAlbum";
-    return NULL;
-}
-
-/* The two home rows are presented as extra cards on the library carousel, but
- * they aren't libraries — no ParentId to list, no collection type, and their
- * contents change every time something is watched. Everything that would
- * normally reach for the server via a view id has to route around them. */
-static int view_is_resume(const JfItem *v) { return v->synthetic == JF_SYNTH_RESUME; }
-static int view_is_nextup(const JfItem *v) { return v->synthetic == JF_SYNTH_NEXTUP; }
-static int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
 
 /* Episodes in these rows arrive out of context — the row mixes shows, so a
  * name like "Episode 03" identifies nothing. Fold the series name and season/
@@ -2243,331 +2185,6 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
     }
 }
 
-/* Dimmed cover-art grid behind the carousel, tiling whatever the active
- * library actually contains — one library's worth of covers cached at a
- * time — but keeps EVERY library's grid it has ever loaded cached in its
- * own slot for the rest of the app session (not just the current one):
- * flipping back to a previously-visited library was re-downloading and
- * re-decoding its covers from scratch every single time otherwise (visible
- * as a lag spike per switch), confirmed as the cause by the user. Bounded
- * to GRID_LIB_CACHE_MAX slots — comfortably above any realistic number of
- * Jellyfin libraries, and each slot is only a handful of small (100px-wide)
- * decoded images, so the memory cost of never evicting is trivial on this
- * platform's RAM. Uses its own JfItem buffer (grid_items in
- * grid_covers_sync), NOT g_items — that array is the carousel's own
- * selection list and must not be clobbered by this side listing. */
-#define GRID_FETCH_MAX 12
-#define GRID_COLS 8
-#define GRID_ROWS 4
-#define GRID_ALPHA 65   /* out of 255 — dimmed but covers should read clearly, per user feedback that 40 was too faint */
-#define GRID_LIB_CACHE_MAX 16
-
-typedef struct {
-    char     view_id[JF_ID_LEN];
-    uint8_t *px[GRID_FETCH_MAX];
-    int      w[GRID_FETCH_MAX], h[GRID_FETCH_MAX];
-    int      count;
-    /* Which cover (index into px[]) each grid cell shows — shuffled once
-     * when this slot is first filled, NOT per draw: draw_browse_carousel
-     * redraws every ~100ms just for the clock/marquee tick even with no
-     * navigation, so reshuffling per-draw would make the background
-     * visibly jitter. */
-    int      cell_order[GRID_COLS * GRID_ROWS];
-    /* Set only once grid_cache_populate() fully finishes — a slot's
-     * view_id becomes visible to other threads' scans (under g_grid_mutex)
-     * as soon as it's reserved, before population (which can take a while
-     * and deliberately runs without the lock held) completes. Checked by
-     * draw_grid_background so it never renders a slot mid-fill. */
-    int      ready;
-} GridLibCache;
-
-static GridLibCache g_grid_cache[GRID_LIB_CACHE_MAX];
-static int           g_grid_cache_n  = 0;    /* slots filled so far */
-static int           g_grid_active   = -1;   /* index of the currently-shown library's slot, -1 = none */
-/* Protects g_grid_cache/g_grid_cache_n/g_grid_active — grid_covers_sync()
- * (main thread, interactive) and grid_prefetch_thread() (background,
- * launched once from the home screen) both touch these. */
-static pthread_mutex_t g_grid_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* A plain Fisher-Yates shuffle of the (count-cycled) index list still reads
- * as "repeating" with few unique covers spread over many cells (e.g. 4
- * covers over this grid's 32 cells is 8 copies of each) — nothing stops the
- * same cover landing in two vertically- or horizontally-adjacent cells,
- * which is exactly the visible pattern a uniform shuffle doesn't avoid.
- * Build the order cell-by-cell instead, rejecting a pick that matches the
- * cell directly above or to the left (a few retries, not exhaustive) —
- * cheap and enough to kill the obvious adjacent-repeat look; only gives up
- * (accepting a repeat) when there aren't enough distinct covers to satisfy
- * both neighbors at once. */
-static void grid_cell_order_shuffle(GridLibCache *gc)
-{
-    if (gc->count <= 0) {
-        for (int i = 0; i < GRID_COLS * GRID_ROWS; i++) gc->cell_order[i] = 0;
-        return;
-    }
-    for (int row = 0; row < GRID_ROWS; row++) {
-        for (int col = 0; col < GRID_COLS; col++) {
-            int left  = col > 0 ? gc->cell_order[row * GRID_COLS + col - 1] : -1;
-            int above = row > 0 ? gc->cell_order[(row - 1) * GRID_COLS + col] : -1;
-            int pick, tries = 0;
-            do {
-                pick = rand() % gc->count;
-            } while (gc->count > 2 && (pick == left || pick == above) && ++tries < 8);
-            gc->cell_order[row * GRID_COLS + col] = pick;
-        }
-    }
-}
-
-/* Turns a Jellyfin GUID view_id into a safe filename — GUIDs are already
- * hex+dashes so this is just a defensive fallback, not real sanitizing. */
-static void grid_cache_disk_path(const char *view_id, char *out, size_t outsz)
-{
-    char safe[JF_ID_LEN];
-    size_t j = 0;
-    for (size_t i = 0; view_id[i] && j < sizeof(safe) - 1; i++) {
-        char c = view_id[i];
-        safe[j++] = (isalnum((unsigned char)c) || c == '-') ? c : '_';
-    }
-    safe[j] = '\0';
-    snprintf(out, outsz, GRID_CACHE_DIR "/%s.dat", safe);
-}
-
-/* Persisted grid cache survives an app restart — without it, every
- * library's mosaic had to be re-downloaded/re-decoded from scratch on
- * every single launch even though nothing in the library had changed,
- * confirmed as a real lag spike by the user. Freshness check is a single
- * cheap jf_count_items() (Limit=0) call: if the library's total item count
- * still matches what it was when this was written, trust the cache as-is.
- * Doesn't catch a same-count swap (one item replaced by another), but
- * that's a rare edge case for what's purely decorative background art.
- * Pixels are stored raw/uncompressed rather than re-encoded to JPEG (this
- * build's stb_image.h is decode-only, no encoder) — at most ~480KB per
- * library (12 covers * ~100x100x4 bytes), trivial for an SD card. */
-static int grid_cache_load_from_disk(GridLibCache *gc, const JfItem *view, const char *item_type)
-{
-    int64_t current_count = jf_count_items(&g_cfg, view->id, item_type);
-    if (current_count < 0) return 0;
-
-    char path[300];
-    grid_cache_disk_path(view->id, path, sizeof(path));
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-
-    int64_t cached_count = -1;
-    int32_t n_covers = 0;
-    if (fread(&cached_count, sizeof(cached_count), 1, f) != 1 ||
-        fread(&n_covers, sizeof(n_covers), 1, f) != 1 ||
-        cached_count != current_count || n_covers <= 0 || n_covers > GRID_FETCH_MAX) {
-        fclose(f);
-        return 0;
-    }
-
-    for (int i = 0; i < n_covers; i++) {
-        int32_t w = 0, h = 0;
-        size_t need;
-        if (fread(&w, sizeof(w), 1, f) != 1 || fread(&h, sizeof(h), 1, f) != 1 ||
-            /* Bounded individually before multiplying: size_t is 32-bit on
-             * the ARM target, so w*h*4 can wrap and slip under the 4MB guard
-             * on a corrupted cache file. */
-            w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
-            (need = (size_t)w * (size_t)h * 4) > 4 * 1024 * 1024) {
-            fclose(f);
-            for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
-            gc->count = 0;
-            return 0;
-        }
-        uint8_t *px = malloc(need);
-        if (!px || fread(px, 1, need, f) != need) {
-            free(px);
-            fclose(f);
-            for (int k = 0; k < gc->count; k++) { free(gc->px[k]); gc->px[k] = NULL; }
-            gc->count = 0;
-            return 0;
-        }
-        gc->px[gc->count] = px;
-        gc->w[gc->count] = w;
-        gc->h[gc->count] = h;
-        gc->count++;
-    }
-    fclose(f);
-    return gc->count > 0;
-}
-
-static void grid_cache_save_to_disk(const GridLibCache *gc, const char *view_id, int64_t count)
-{
-    if (gc->count <= 0) return;
-    mkdir(GRID_CACHE_DIR, 0755);   /* ignore EEXIST/already-there */
-    char path[300];
-    grid_cache_disk_path(view_id, path, sizeof(path));
-    FILE *f = fopen(path, "wb");
-    if (!f) return;
-
-    int32_t n_covers = gc->count;
-    fwrite(&count, sizeof(count), 1, f);
-    fwrite(&n_covers, sizeof(n_covers), 1, f);
-    for (int i = 0; i < gc->count; i++) {
-        int32_t w = gc->w[i], h = gc->h[i];
-        fwrite(&w, sizeof(w), 1, f);
-        fwrite(&h, sizeof(h), 1, f);
-        fwrite(gc->px[i], 1, (size_t)w * (size_t)h * 4, f);
-    }
-    fclose(f);
-}
-
-/* Fills a freshly-reserved (memset to 0, view_id already set) cache slot —
- * disk cache first (grid_cache_load_from_disk), falling back to sequential
- * downloads+decodes (up to GRID_FETCH_MAX) otherwise. Shared by the
- * interactive path (grid_covers_sync, called from the main thread when the
- * user navigates to a library) and grid_prefetch_thread (background,
- * silent). dest_path is caller-owned scratch space (POSTER_TMP for the
- * main thread, POSTER_TMP_BG for the background thread) so the two never
- * clobber each other's in-flight download; fb_show_ui is NULL for the
- * silent background path (no spinner/fb_flip — those must stay main-
- * thread-only, same reasoning as every other "don't touch the framebuffer
- * off-thread" rule already in this codebase). Deliberately NOT called
- * under g_grid_mutex — this does slow network I/O, and the slot it's
- * writing into isn't visible to any reader until the caller marks it
- * active/counted, so nothing needs the lock held here. */
-static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
-                                 const char *dest_path, FBDev *fb_show_ui)
-{
-    const char *item_type = collection_item_type(view->collection_type);
-    JfItem grid_items[GRID_FETCH_MAX];
-    int n;
-
-    if (view_is_synthetic(view)) {
-        /* No ParentId to list under — the covers are just the row's own
-         * items. Deliberately not disk-cached either: the whole point of
-         * these rows is that they change as things get watched, so a cache
-         * keyed on a total that barely moves would show stale art for ages
-         * (see grid_cache_load_from_disk's own staleness check). They're only
-         * ever a couple of items, so re-fetching is cheap. */
-        n = view_is_resume(view)
-              ? jf_list_resume(&g_cfg, grid_items, GRID_FETCH_MAX, NULL)
-              : jf_list_nextup(&g_cfg, grid_items, GRID_FETCH_MAX, NULL);
-    } else {
-        if (grid_cache_load_from_disk(gc, view, item_type)) {
-            grid_cell_order_shuffle(gc);
-            /* Release: everything written above must be visible to any
-             * thread that observes ready == 1. See the acquire in
-             * draw_grid_background. */
-            __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
-            return;
-        }
-        n = jf_list_items_recursive(&g_cfg, view->id, item_type, grid_items, GRID_FETCH_MAX);
-    }
-
-    int spinner_frame = 0;
-    for (int i = 0; i < n && gc->count < GRID_FETCH_MAX; i++) {
-        if (!grid_items[i].image_tag[0]) continue;
-        if (fb_show_ui) { draw_spinner_frame(fb_show_ui, spinner_frame++); fb_flip(fb_show_ui); }
-        if (jf_download_item_image(&g_cfg, grid_items[i].image_item_id, "Primary",
-                                    grid_items[i].image_tag, 100, dest_path)) {
-            uint8_t *px = load_image_tmp(dest_path, &gc->w[gc->count], &gc->h[gc->count]);
-            if (px) gc->px[gc->count++] = px;
-        }
-    }
-    grid_cell_order_shuffle(gc);
-    if (!view_is_synthetic(view)) {
-        int64_t count = jf_count_items(&g_cfg, view->id, item_type);
-        if (count >= 0) grid_cache_save_to_disk(gc, view->id, count);
-    }
-    __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
-}
-
-/* Already-cached libraries (checked here under g_grid_mutex) return
- * immediately — just a linear scan over however many are cached, at most
- * GRID_LIB_CACHE_MAX. A never-seen library reserves its slot under the
- * lock (cheap) then populates it lock-free (grid_cache_populate does the
- * slow network I/O) before marking it active. */
-static void grid_covers_sync(FBDev *fb, const JfItem *view)
-{
-    pthread_mutex_lock(&g_grid_mutex);
-    for (int i = 0; i < g_grid_cache_n; i++) {
-        if (!strcmp(g_grid_cache[i].view_id, view->id)) {
-            g_grid_active = i;
-            pthread_mutex_unlock(&g_grid_mutex);
-            return;
-        }
-    }
-    if (g_grid_cache_n >= GRID_LIB_CACHE_MAX) {
-        g_grid_active = -1;
-        pthread_mutex_unlock(&g_grid_mutex);
-        return;
-    }
-    int slot = g_grid_cache_n++;
-    GridLibCache *gc = &g_grid_cache[slot];
-    memset(gc, 0, sizeof(*gc));
-    strncpy(gc->view_id, view->id, sizeof(gc->view_id) - 1);
-    pthread_mutex_unlock(&g_grid_mutex);
-
-    grid_cache_populate(gc, view, POSTER_TMP, fb);
-
-    pthread_mutex_lock(&g_grid_mutex);
-    g_grid_active = slot;
-    pthread_mutex_unlock(&g_grid_mutex);
-}
-
-/* Runs once, kicked off (detached) right after the home screen first
- * loads. Silently walks every library the user has and pre-populates any
- * that the interactive path hasn't already claimed, so switching to a
- * library the user hasn't visited yet in this session still shows its
- * mosaic immediately instead of a blank/dim background while it fetches.
- * Uses its own download scratch path and never touches fb — see
- * grid_cache_populate's own comment for why. */
-static void *grid_prefetch_thread(void *arg)
-{
-    (void)arg;
-    JfItem views[GRID_LIB_CACHE_MAX];
-    int n = jf_list_views(&g_cfg, views, GRID_LIB_CACHE_MAX);
-
-    for (int i = 0; i < n; i++) {
-        pthread_mutex_lock(&g_grid_mutex);
-        int already = 0;
-        for (int j = 0; j < g_grid_cache_n; j++)
-            if (!strcmp(g_grid_cache[j].view_id, views[i].id)) { already = 1; break; }
-        int slot = -1;
-        if (!already && g_grid_cache_n < GRID_LIB_CACHE_MAX) {
-            slot = g_grid_cache_n++;
-            GridLibCache *gc = &g_grid_cache[slot];
-            memset(gc, 0, sizeof(*gc));
-            strncpy(gc->view_id, views[i].id, sizeof(gc->view_id) - 1);
-        }
-        pthread_mutex_unlock(&g_grid_mutex);
-        if (slot < 0) continue;
-
-        grid_cache_populate(&g_grid_cache[slot], &views[i], POSTER_TMP_BG, NULL);
-    }
-    return NULL;
-}
-
-static void draw_grid_background(FBDev *fb)
-{
-    if (g_grid_active < 0) return;
-    GridLibCache *gc = &g_grid_cache[g_grid_active];
-    if (!__atomic_load_n(&gc->ready, __ATOMIC_ACQUIRE) || gc->count == 0) return;
-    int cell_w = fb->width / GRID_COLS, cell_h = fb->height / GRID_ROWS;
-    for (int row = 0; row < GRID_ROWS; row++) {
-        for (int col = 0; col < GRID_COLS; col++) {
-            int idx = gc->cell_order[row * GRID_COLS + col];
-            fb_blit(fb, gc->px[idx], gc->w[idx], gc->h[idx],
-                    col * cell_w, row * cell_h, cell_w, cell_h, GRID_ALPHA);
-        }
-    }
-}
-
-/* Vertical black gradient over the cover grid, under everything else (top
- * bar, cards, hint) — transparent at the top, solid at the bottom, per
- * user request, so the grid stays visible near the top but doesn't fight
- * with the hint text/cards lower down. */
-static void draw_grid_gradient(FBDev *fb)
-{
-    for (int y = 0; y < fb->height; y++) {
-        uint8_t a = (uint8_t)(255 * y / (fb->height - 1));
-        fb_fill_rect_alpha(fb, 0, y, fb->width, 1, 0, 0, 0, a);
-    }
-}
-
 /* Root screen (g_stack_depth == 1, FRAME_VIEWS) — a horizontal carousel of
  * library cards instead of the regular list, since a handful of libraries
  * (movies/TV/music, ...) reads better as a few big blocks than as rows.
@@ -3917,6 +3534,7 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
                            (int64_t)(pos * 10000000.0), watched);
         g_info_item.played = watched;
         g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        jf_log_line("play: ended on its own at %.0fs, watched=%d", pos, watched);
         return PLAYER_FRAME_ENDED;
     } else if (inp & INP_B) {
         double pos = play_position();
@@ -3926,6 +3544,7 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
         g_info_item.played = watched;
         g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
         player_stop();
+        jf_log_line("play: stopped by user at %.0fs, watched=%d", pos, watched);
         return PLAYER_FRAME_ENDED;
     } else if (g_paused) {
         if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
@@ -4003,6 +3622,11 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     const JfStreamProfile profile = stream_profile();
     jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
                   g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
+    /* Deliberately no item_id/title/url here — those identify what's in
+     * someone's library, not how MiSTerFin behaved. */
+    jf_log_line("play: profile=%dx%d@%d fb_phys_h=%d line_double=%d resume=%.0fs",
+                profile.max_width, profile.max_height, profile.video_bitrate,
+                fb->phys_height, fb->line_double, offset_secs);
 
     char delay_arg[16];
     snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
@@ -4686,6 +4310,7 @@ static int run_preview_browse(int sel, int list_mode)
 
     if (!jf_config_load(&g_cfg)) { fprintf(stderr, "jellyfin.conf not found\n"); return 1; }
     if (jf_resolve_user_id(&g_cfg) != 1) { fprintf(stderr, "user resolve failed\n"); return 1; }
+    grid_init(&g_cfg);
 
     g_root_list_mode = list_mode;
     push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
@@ -4788,23 +4413,6 @@ static void startup_enter_browse(void)
     push_frame(FRAME_VIEWS, "MiSTerFin", NULL, NULL, NULL);
 }
 
-/* Kicks off the background cover-grid prefetch. Deliberately not started
- * unconditionally at launch: it needs a resolved user and a working
- * credential, and starting it from the setup or Quick Connect screens meant
- * firing a /UserViews with an empty userId and no token — harmless against a
- * permissive server, a guaranteed 401 against a real one, and a confusing
- * entry in the log for anyone debugging why their client won't connect.
- * Called from both paths that reach a signed-in library. */
-static void start_grid_prefetch(void)
-{
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, grid_prefetch_thread, NULL);
-    pthread_attr_destroy(&attr);
-}
-
 static void *startup_resolve_thread(void *arg)
 {
     (void)arg;
@@ -4853,6 +4461,63 @@ static void *startup_resolve_thread(void *arg)
     return NULL;
 }
 
+/* A handful of MiSTer.ini keys that determine what MiSTerFin's framebuffer
+ * output actually looks like on the far end of the cable (see
+ * docs/DISPLAY_COMPATIBILITY.md) — logging these turns "picture is wrong on
+ * my setup" into something diagnosable from the log alone, rather than
+ * needing someone to SSH in and ask for MiSTer.ini by hand. A value inside
+ * [Menu] is what actually governs a Script's own framebuffer geometry
+ * (confirmed on hardware — see that doc's video_mode section), so the
+ * section a match was found under is reported alongside it rather than
+ * just assuming top-level. Whitelisted by key name, not a full-file dump —
+ * same "narrow by construction" rule as the request log's query-string cut. */
+static void log_display_settings(void)
+{
+    static const char *const keys[] = {
+        "ypbpr", "composite_sync", "forced_scandoubler", "vga_scaler",
+        "direct_video", "vsync_adjust", "video_mode", "video_mode_ntsc",
+        "video_mode_pal", NULL
+    };
+    FILE *f = fopen("/media/fat/MiSTer.ini", "r");
+    if (!f) { jf_log_line("MiSTer.ini: not found"); return; }
+
+    char section[32] = "";
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '[') {
+            char *end = strchr(p, ']');
+            if (end) {
+                size_t n = (size_t)(end - p - 1);
+                if (n >= sizeof(section)) n = sizeof(section) - 1;
+                memcpy(section, p + 1, n);
+                section[n] = '\0';
+            }
+            continue;
+        }
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        size_t klen = (size_t)(eq - p);
+        while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t')) klen--;
+        for (int i = 0; keys[i]; i++) {
+            if (strlen(keys[i]) != klen || strncasecmp(p, keys[i], klen)) continue;
+            char *val = eq + 1;
+            while (*val == ' ' || *val == '\t') val++;
+            char *semi = strchr(val, ';');   /* inline comment */
+            if (semi) *semi = '\0';
+            size_t vlen = strlen(val);
+            while (vlen > 0 && (val[vlen - 1] == '\r' || val[vlen - 1] == '\n' ||
+                                 val[vlen - 1] == ' '  || val[vlen - 1] == '\t'))
+                val[--vlen] = '\0';
+            jf_log_line("MiSTer.ini [%s] %.*s=%s", section[0] ? section : "top",
+                        (int)klen, p, val);
+            break;
+        }
+    }
+    fclose(f);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--capture-about") == 0)
@@ -4866,6 +4531,7 @@ int main(int argc, char **argv)
                                         ? SUBMENU_TAB_AUDIO : SUBMENU_TAB_SUBS);
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
+    grid_init(&g_cfg);             /* just stores the pointer — config itself loads below */
 
     signal(SIGTERM,  on_signal);
     signal(SIGINT,   on_signal);
@@ -4983,6 +4649,22 @@ int main(int argc, char **argv)
         draw_setup_screen(&fb, g_setup_reason, g_setup_help);
     }
 
+    /* One-shot startup diagnostics — see jf_log_line's own comment. Placed
+     * here rather than earlier because it wants the just-computed startup
+     * outcome (which credential path worked, or exactly why none did), not
+     * just the inputs to it. A no-op unless DEBUGLOG is set. */
+    jf_log_line("fb: %dx%d line_double=%d headless=%d",
+                fb.width, fb.height, fb.line_double, fb.headless);
+    for (int i = 0; i < input_device_count(); i++)
+        jf_log_line("input: %s \"%s\"%s", input_device_node(i), input_device_name(i),
+                    input_device_is_virtual(i) ? " [MiSTer virtual]" : "");
+    log_display_settings();
+    jf_log_line("startup: %s",
+                resolved == 1 ? "signed in (saved token or API key)" :
+                resolved == STARTUP_NEED_QUICK_CONNECT ? "Quick Connect required" :
+                resolved == STARTUP_CONFIG_MISSING ? "jellyfin.conf not found or incomplete" :
+                g_setup_reason);
+
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu
      * core (same idea as MiSTerDVD's guard — running the DDR copy loop
      * against a core that never reads it adds bus contention without
@@ -5018,8 +4700,11 @@ int main(int argc, char **argv)
             if (!zaparoo_active && mst.st_size == 2513448)
                 zaparoo_active = 1;   /* legacy build, zaparoo/ folder gone */
         }
-        if (zaparoo_active && !fb.line_double && ddr_init() == 0)
+        int ddr_engaged = zaparoo_active && !fb.line_double && ddr_init() == 0;
+        if (ddr_engaged)
             ddr_set_mode(strcasecmp(g_cfg.tv_mode, "NTSC") == 0 ? 0 : 2);
+        jf_log_line("menu core: zaparoo_menu_rbf=%d interlaced_core=%d ddr_engaged=%d",
+                    zaparoo_active, fb.line_double, ddr_engaged);
     }
 
     /* Start GitHub release check in background — result appears on the
@@ -5037,7 +4722,7 @@ int main(int argc, char **argv)
      * against a permissive server, but a guaranteed 401 against a real one,
      * and a confusing entry in the server log for anyone debugging why their
      * client won't connect. */
-    if (state == STATE_BROWSE) start_grid_prefetch();
+    if (state == STATE_BROWSE) start_grid_prefetch(&fb);
 
     int playing = 0;
     int spinner_frame_ctr = 0;
@@ -5048,6 +4733,16 @@ int main(int argc, char **argv)
 
     double last_input_rescan = 0.0;
     while (g_running) {
+        /* Set by STATE_BROWSE when it calls draw_browse() this iteration —
+         * that already blocked on fb_flip()'s FBIO_WAITFORVSYNC, so the
+         * unconditional usleep(16000) at the bottom of this loop would just
+         * be added dead time on top of an already-paced frame. Confirmed on
+         * hardware (DEBUGLOG's "carousel steps"/"fb_flip timing" lines): cutting
+         * the home carousel's per-frame CPU cost nearly in half left the
+         * achieved redraw rate completely unchanged, because this trailing
+         * sleep was absorbing 100% of the savings. Scoped to STATE_BROWSE
+         * only — every other state keeps its existing pacing untouched. */
+        int did_vsync_draw = 0;
         int inp = input_poll();
         /* Must be called every tick (it drives the repeat timers), but only
          * OR'd in by the screens that want held-to-scroll — see
@@ -5160,7 +4855,7 @@ int main(int argc, char **argv)
                 qc_running = 0;
                 startup_enter_browse();
                 state = STATE_BROWSE;
-                start_grid_prefetch();   /* skipped at launch — see its comment */
+                start_grid_prefetch(&fb);   /* skipped at launch — see its comment */
                 draw_browse(&fb);
                 input_drain();
                 break;
@@ -5319,17 +5014,30 @@ int main(int argc, char **argv)
                     break;
                 }
             }
-            if (nav && state == STATE_BROWSE) draw_browse(&fb);
+            if (nav && state == STATE_BROWSE) { draw_browse(&fb); did_vsync_draw = 1; }
 
-            /* Keeps the top-bar clock live and the over-long-title marquee
-             * (see draw_browse) crawling even with no input at all. Cheap
-             * enough at this rate — other screens already redraw fully
-             * every ~16ms with no issue, this is a tenth of that. */
+            /* Keeps the top-bar clock live, the over-long-title marquee (see
+             * draw_browse) crawling, and the home carousel's grid background
+             * (draw_grid_background) scrolling, even with no input at all.
+             * The real pacing here is fb_flip()'s own FBIO_WAITFORVSYNC —
+             * that's what actually rate-limits this to the display's true
+             * refresh (50Hz PAL / 60Hz NTSC) with no tearing, same as every
+             * other screen's fb_flip(). The 0.01s check below is just a
+             * floor so headless/desktop runs (fb_flip has nothing to wait
+             * on there) can't spin this unbounded — safely above any real
+             * display's refresh period, so on actual hardware fb_flip's own
+             * vsync wait is always what's really pacing it. Was a flat 0.1s
+             * (10fps) — fine for the marquee alone, but visibly "janky" for
+             * the grid's continuous crawl. g_marquee_px advances by real
+             * elapsed time rather than a flat amount per tick, so its speed
+             * on screen doesn't change with how often this actually fires. */
             static double last_browse_tick = 0.0;
-            if (state == STATE_BROWSE && loop_now - last_browse_tick > 0.1) {
+            if (state == STATE_BROWSE && loop_now - last_browse_tick > 0.01) {
+                double dt = last_browse_tick > 0.0 ? loop_now - last_browse_tick : 0.01;
                 last_browse_tick = loop_now;
-                g_marquee_px += 1.5;
+                g_marquee_px += 15.0 * dt;   /* was a flat +1.5 per (assumed 100ms) tick == 15px/sec */
                 draw_browse(&fb);
+                did_vsync_draw = 1;
             }
             break;
         }
@@ -5504,7 +5212,7 @@ int main(int argc, char **argv)
             ddr_flip(0, 0);
         } else {
             if (!playing && ddr_ready()) ddr_stop();
-            usleep(16000);
+            if (!did_vsync_draw) usleep(16000);
         }
     }
 

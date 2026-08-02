@@ -74,6 +74,20 @@ void fb_blit(FBDev *fb,
              int dx, int dy, int dw, int dh,
              uint8_t layer_alpha);
 
+/* Same nearest-neighbor scaling as fb_blit, but no alpha blend at all —
+ * every destination pixel is simply overwritten with the sampled source
+ * RGB. Only correct where the source is known fully opaque AND any desired
+ * dimming was already baked into its pixels ahead of time (see the grid
+ * mosaic background, which pre-scales covers by GRID_ALPHA once at load
+ * instead of blending against the always-black cleared backdrop on every
+ * single redraw — confirmed via DEBUGLOG timing as this app's biggest
+ * single CPU cost). Do not use this on anything that still needs real
+ * per-pixel alpha or a variable layer_alpha. */
+void fb_blit_opaque(FBDev *fb,
+                     const uint8_t *pixels, int sw, int sh,
+                     int dx, int dy, int dw, int dh);
+
+
 /* Fill a rectangle in the back-buffer with a solid color + alpha blend. */
 void fb_fill_rect_alpha(FBDev *fb,
                         int x, int y, int w, int h,

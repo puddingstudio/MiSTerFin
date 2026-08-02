@@ -213,7 +213,7 @@ If you do want to change it, it's recognised wherever it appears in the file —
 
 The main reason to set it is a constrained network: the default asks the server for about 12 Mbps (~1.5 MB/s — trivial over the wired connection MiSTers normally use, but potentially too much for a weak WiFi bridge). If playback stutters or audio drifts out of sync, set `480x270@8000000` — the original default from earlier releases, which also selects the exact scaling path those releases used.
 
-**Troubleshooting a bug?** Add a line containing just `DEBUGLOG` (also recognised wherever it appears) and MiSTerFin writes `/media/fat/misterfin/debug.log` — one line per server request (method, endpoint, ok/fail, timing), truncated fresh on every launch. Off by default, and never includes your server URL, credentials, or anything from a request's query string, so it's safe to attach to a bug report as-is. See `jellyfin.conf.example` for the full details.
+**Troubleshooting a bug?** Add a line containing just `DEBUGLOG` (also recognised wherever it appears) and MiSTerFin writes `/media/fat/misterfin/debug.log` — one line per server request (method, endpoint, ok/fail, timing), plus one-shot startup/playback diagnostics (framebuffer geometry, input devices found, the relevant `MiSTer.ini` display settings, which menu core/DDR path is active, the update check result, and the transcode profile used each time something plays), truncated fresh on every launch. Off by default, and never includes your server URL, credentials, anything from a request's query string, or what's in your library (no titles/ids), so it's safe to attach to a bug report as-is. See `jellyfin.conf.example` for the full details.
 
 **HTTPS with a self-signed certificate?** MiSTerFin verifies your server's TLS certificate by default. If your server is `https://` with a self-signed cert, add a line containing just `INSECURE_TLS` to skip verification. A plain `http://` server (the usual setup) doesn't use TLS and ignores this.
 
@@ -347,6 +347,12 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 - New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound
 - The setup/Quick Connect error screens are clearer: "Can't connect to server" now shows the configured server URL instead of suggesting you add an API key/username you may not need, and A now reliably exits everywhere it's hinted (a couple of these screens only accepted B before). Where Quick Connect also offers "B: try again", B still retries rather than exiting, same as before
 - Documented all third-party code and components (`docs/THIRD_PARTY.md`)
+- `DEBUGLOG` now also captures one-shot startup/playback diagnostics — framebuffer geometry, input devices found, the relevant `MiSTer.ini` display settings, menu core/DDR state, the update check result, and the transcode profile used each time something plays — on top of the per-request log it already had
+- Animated home-screen background — the cover mosaic behind the library carousel now slowly crawls sideways, each row in the opposite direction, perfectly smooth (subpixel-stepped and paced to the display's real refresh)
+- Square album covers for music — a music library's background grid now uses square cells matching album art; movies/TV keep the portrait poster cells, both now with the exact right shape on PAL and NTSC alike
+- Bigger, clearer covers — 6 per row instead of 8, and the whole mosaic is noticeably less dimmed
+- The whole browse UI now redraws at the display's full refresh rate (~50Hz PAL / ~60Hz NTSC, up from ~17fps) — faster cover drawing, background dimming baked in once at load instead of per frame, a cheaper gradient pass, and removal of a redundant per-frame sleep that was eating exactly the time the optimizations freed up
+- Internal code hygiene — no behavior changes
 
 ### <a id="v0-9-8"></a>v0.9.8
 - Updates are now visible from the home screen — a quiet "START:update available" line appears under the title whenever a newer release exists (home carousel only; disappears once you're up to date)

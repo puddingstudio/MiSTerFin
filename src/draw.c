@@ -201,3 +201,12 @@ void blit_fit_centered(FBDev *fb, const uint8_t *src, int sw, int sh,
     if (dw > max_w) { dh = dh * max_w / dw; dw = max_w; }
     fb_blit(fb, src, sw, sh, cx - dw / 2, cy - dh / 2, dw, dh, alpha);
 }
+
+void draw_spinner_frame(FBDev *fb, int frame_idx)
+{
+    int dx = fb->width - SPINNER_SIZE - SPINNER_MARGIN;
+    int dy = SPINNER_MARGIN;
+    fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0, 0, 0, 255);
+    if (frame_idx % 2 == 0)
+        fb_fill_rect_alpha(fb, dx, dy, SPINNER_SIZE, SPINNER_SIZE, 0x40, 0xE0, 0x40, 255);
+}

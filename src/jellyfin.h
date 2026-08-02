@@ -265,6 +265,14 @@ int jf_has_credential(const JfConfig *cfg);
 void jf_log_init(const JfConfig *cfg);
 void jf_log_close(void);
 
+/* Freeform companion to the request log above — same file, same privacy
+ * rule (nothing a user didn't already put in jellyfin.conf/MiSTer.ini
+ * themselves), same no-op when DEBUGLOG is off. For startup diagnostics
+ * (framebuffer geometry, input devices, menu core/DDR state, player
+ * lifecycle, ...) that aren't a server request and so don't fit
+ * jf_log_request's columns. */
+void jf_log_line(const char *fmt, ...);
+
 /* Fills in cfg->device_id, generating and persisting a fresh random GUID the
  * first time. Call once after jf_config_load, before any request — the id
  * goes in the Authorization header of every one of them, and must not change
@@ -386,6 +394,23 @@ int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *ou
  * are what the code actually branches on. */
 #define JF_SYNTH_RESUME 1
 #define JF_SYNTH_NEXTUP 2
+
+/* The two home rows are presented as extra cards on the library carousel, but
+ * they aren't libraries — no ParentId to list, no collection type, and their
+ * contents change every time something is watched. Everything that would
+ * normally reach for the server via a view id has to route around them. */
+int view_is_resume(const JfItem *v);
+int view_is_nextup(const JfItem *v);
+int view_is_synthetic(const JfItem *v);
+
+/* The BaseItemKind that actually represents "one unit" of a library, keyed
+ * off CollectionType — used both for the carousel's "N movies/series/
+ * albums" count (jf_count_items) and its background cover grid
+ * (jf_list_items_recursive): a plain direct-children listing of a by-artist
+ * music library only finds MusicArtist folders, which often have no cover
+ * art of their own, so both need to look past the top level at the real
+ * leaf type. NULL (unrecognized collection type) means "don't filter". */
+const char *collection_item_type(const char *collection_type);
 
 /* Partly-watched items across the whole library, most recently played first
  * (Jellyfin's "Continue Watching"). Returns movies and episodes together.
