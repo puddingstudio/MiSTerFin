@@ -12,6 +12,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Scope (v1)](#scope)
 - [Requirements](#requirements)
@@ -30,12 +31,56 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [Unreleased](#unreleased) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
 
 ---
+
+## <a id="screenshots"></a>Screenshots
+
+All captured in-app via the [SELECT+START screenshot combo](#controls), straight off a real MiSTer's framebuffer — no emulator, no upscaling.
+
+**Browser**
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/images/screenshots/home-carousel.png" width="260"><br>Home carousel | <img src="docs/images/screenshots/update-available-hint.png" width="260"><br>Update-available hint | <img src="docs/images/screenshots/continue-watching.png" width="260"><br>Continue Watching |
+| <img src="docs/images/screenshots/movies-list.png" width="260"><br>Movies (list view) | <img src="docs/images/screenshots/tv-shows-list.png" width="260"><br>TV shows (root) | <img src="docs/images/screenshots/tv-season-list.png" width="260"><br>Seasons (scrolling title) |
+| <img src="docs/images/screenshots/tv-episode-list.png" width="260"><br>Episode list | <img src="docs/images/screenshots/music-artists.png" width="260"><br>Music: artists (root) | <img src="docs/images/screenshots/music-albums.png" width="260"><br>Music: albums |
+| <img src="docs/images/screenshots/music-tracks.png" width="260"><br>Music: tracks | | |
+
+**Info screen**
+
+| | |
+|:---:|:---:|
+| <img src="docs/images/screenshots/movie-info.png" width="260"><br>Movie info | <img src="docs/images/screenshots/tv-episode-info.png" width="260"><br>Episode info |
+
+**Video playback**
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/images/screenshots/video-playback.png" width="260"><br>Letterboxed (2.20:1 source) | <img src="docs/images/screenshots/video-playback-4x3.png" width="260"><br>Full 4:3 (no letterboxing) | <img src="docs/images/screenshots/video-seek.png" width="260"><br>Seek overlay |
+| <img src="docs/images/screenshots/pause-menu.png" width="260"><br>Pause menu | <img src="docs/images/screenshots/subtitle-picker.png" width="260"><br>Subtitle picker | <img src="docs/images/screenshots/audio-track-picker.png" width="260"><br>Audio track picker |
+
+**Music**
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/images/screenshots/now-playing.png" width="260"><br>Now playing (VU meters) | <img src="docs/images/screenshots/now-playing-rain.png" width="260"><br>Rain | <img src="docs/images/screenshots/now-playing-nebula.png" width="260"><br>Nebula visualizer |
+| <img src="docs/images/screenshots/now-playing-toasty.png" width="260"><br>Toasty screensaver | | |
+
+**About**
+
+<p align="center"><img src="docs/images/screenshots/about-screen.png" width="260"></p>
+
+**Setup and errors**
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/images/screenshots/quick-connect-code.png" width="260"><br>Quick Connect code | <img src="docs/images/screenshots/connection-error.png" width="260"><br>Can't connect to server | <img src="docs/images/screenshots/quick-connect-failed.png" width="260"><br>Quick Connect failed |
+| <img src="docs/images/screenshots/username-not-found.png" width="260"><br>Username not found | <img src="docs/images/screenshots/config-missing.png" width="260"><br>jellyfin.conf missing | <img src="docs/images/screenshots/https-selfsigned-hint.png" width="260"><br>HTTPS self-signed hint |
 
 ## <a id="features"></a>Features
 
@@ -209,6 +254,8 @@ There is no on-screen keyboard for the server URL — edit the file over SSH (us
 
 Button labels below follow Xbox-style naming (bottom face button = A, right face button = B) — this matches most controllers, including generic/8BitDo pads in Xbox mode. Nintendo/SNES-style controllers are the notable exception: their A/B (and X/Y) positions are swapped relative to Xbox, so on those pads the button positions are reversed from the labels here.
 
+**SELECT+START** (held together, from any screen — browser, About, video, or music): captures a screenshot to `/media/fat/screenshots/MiSTerFin/` as a BMP at the real on-screen aspect ratio, with a brief "Screenshot saved" confirmation. Since MiSTer's own screenshot hotkey doesn't reach Script apps, this is MiSTerFin's own — see the [Screenshots](#screenshots) section above for examples.
+
 ### <a id="browser"></a>Browser
 | Button | Keyboard | Action |
 |--------|----------|--------|
@@ -293,6 +340,11 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## <a id="changelog"></a>Changelog
+
+### <a id="unreleased"></a>Unreleased
+- New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound
+- The setup/Quick Connect error screens are clearer: "Can't connect to server" now shows the configured server URL instead of suggesting you add an API key/username you may not need, and A now reliably exits everywhere it's hinted (a couple of these screens only accepted B before). Where Quick Connect also offers "B: try again", B still retries rather than exiting, same as before
+- Documented all third-party code and components (`docs/THIRD_PARTY.md`)
 
 ### <a id="v0-9-8"></a>v0.9.8
 - Updates are now visible from the home screen — a quiet "START:update available" line appears under the title whenever a newer release exists (home carousel only; disappears once you're up to date)
