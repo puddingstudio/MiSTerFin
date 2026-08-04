@@ -1235,6 +1235,183 @@ static void draw_alpha(int x0, int y0, int w, int h, unsigned char *src,
     }
 }
 
+/* ── MiSTerFin session-message banner ─────────────────────────────────────
+ * The app shows admin messages (Jellyfin dashboard -> send message) as a
+ * blue banner rising from the bottom with the text scrolling right-to-left.
+ * On its own screens the app draws that itself, but during video playback
+ * THIS driver owns the framebuffer and repaints every pixel each frame —
+ * anything the app drew would flicker at the video rate. So the banner is
+ * drawn here instead, over each finished frame: the app hands the message
+ * over through /tmp/misterfin_banner (same cross-binary flag-file pattern
+ * as /tmp/misterdvd_vsync above), this code takes ownership of the file
+ * (reads + unlinks) and runs the whole rise/scroll/fall animation itself.
+ * If no frame ever consumes the file (message landed as playback ended),
+ * the app finds the leftover and replays it with its own banner.
+ *
+ * Geometry matches the app's banner: 24 logical rows tall, resting above a
+ * 14-logical-row bottom margin, scale-2 glyphs, 110 px/s scroll, 0.3s
+ * rise/fall. "Logical" because the interlaced full-frame modes have double
+ * the rows for the same physical screen — vscale doubles every vertical
+ * quantity there, exactly like the app's own line doubling. 32bpp only
+ * (the only format this platform uses). */
+#include <time.h>
+#include <sys/stat.h>
+#include "font8x8.h"
+
+#define BANNER_FILE      "/tmp/misterfin_banner"
+#define BANNER_TEXT_MAX  320
+#define BANNER_LH        24      /* container height, logical rows */
+#define BANNER_MARGIN    14      /* bottom overscan margin, logical rows */
+#define BANNER_RISE_SECS 0.30
+#define BANNER_SPEED     110.0   /* scroll px/s */
+
+enum { BAN_IDLE, BAN_RISE, BAN_SCROLL, BAN_FALL };
+static int    ban_phase = BAN_IDLE;
+static double ban_t0;
+static char   ban_text[BANNER_TEXT_MAX];
+
+static double ban_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* One glyph row lookup with the same minimal UTF-8 handling as the app's
+ * font: ASCII from font8x8_basic, U+00A0-U+00FF (2-byte C2/C3 sequences)
+ * from font8x8_ext_latin, anything else '?'. Advances *s. */
+static const uint8_t *ban_next_glyph(const char **s)
+{
+    unsigned char c = (unsigned char)**s;
+    if (!c) return NULL;
+    (*s)++;
+    if (c < 0x80) return font8x8_basic[c];
+    if ((c == 0xC2 || c == 0xC3) && **s) {
+        unsigned cp = ((c & 0x1F) << 6) | ((unsigned char)**s & 0x3F);
+        (*s)++;
+        if (cp >= 0xA0) return font8x8_ext_latin[cp - 0xA0];
+        return font8x8_basic['?'];
+    }
+    while ((**s & 0xC0) == 0x80) (*s)++;   /* skip the rest of the sequence */
+    return font8x8_basic['?'];
+}
+
+static int ban_text_width(const char *s)   /* physical px at scale-2 glyphs */
+{
+    int n = 0;
+    while (ban_next_glyph(&s)) n++;
+    return n * 16;
+}
+
+/* Current banner top edge for THIS moment, without advancing the phase
+ * machine (that's ban_frame's job, once per frame at flip time) — used by
+ * draw_slice to clip video writes out of the banner region. Writing the
+ * video there and only then painting the banner over it (the first version
+ * of this) left a couple-ms window each frame where the scanout could
+ * catch raw video in the banner rows — visible on hardware as intermittent
+ * blinking/tearing on the strip while the film above it stayed perfectly
+ * stable. The rows the clip skips are exactly the rows ban_frame paints
+ * this same frame, so nothing is ever left unpainted; the sub-millisecond
+ * drift between this call and flip_page's own top can only make the clip
+ * sit a row or two on the safe (banner) side of the final edge. */
+static int ban_clip_top(void)
+{
+    if (fb_pixel_size != 4 || ban_phase == BAN_IDLE) return in_height;
+    int vscale   = (in_height > 400) ? 2 : 1;
+    int bh       = BANNER_LH * vscale;
+    int rest_top = in_height - BANNER_MARGIN * vscale - bh;
+    if (ban_phase == BAN_SCROLL) return rest_top;
+    double t = (ban_now() - ban_t0) / BANNER_RISE_SECS;
+    if (t > 1.0) t = 1.0;
+    if (ban_phase == BAN_RISE) {
+        double e = 1.0 - (1.0 - t) * (1.0 - t);
+        return in_height - (int)((in_height - rest_top) * e);
+    }
+    return rest_top + (int)((in_height - rest_top) * t * t);   /* BAN_FALL */
+}
+
+/* Draws the banner over the frame `center` currently points at — called
+ * from flip_page() right before that frame is shown, so it lands after the
+ * video rows and never flickers. */
+static void ban_frame(void)
+{
+    if (fb_pixel_size != 4) return;
+
+    /* New message? The stat is one cheap syscall per frame, the same cost
+     * class as draw_slice's per-frame access() on the vsync flag. */
+    if (ban_phase == BAN_IDLE) {
+        struct stat st;
+        if (stat(BANNER_FILE, &st) != 0) return;
+        FILE *f = fopen(BANNER_FILE, "r");
+        if (!f) return;
+        size_t n = fread(ban_text, 1, sizeof(ban_text) - 1, f);
+        fclose(f);
+        unlink(BANNER_FILE);   /* ours now — see the header comment */
+        while (n > 0 && (ban_text[n-1] == '\n' || ban_text[n-1] == '\r')) n--;
+        ban_text[n] = '\0';
+        if (!ban_text[0]) return;
+        ban_phase = BAN_RISE;
+        ban_t0 = ban_now();
+    }
+
+    double now    = ban_now();
+    int    vscale = (in_height > 400) ? 2 : 1;
+    int    bh     = BANNER_LH * vscale;
+    int    rest_top = in_height - BANNER_MARGIN * vscale - bh;
+    int    top;
+
+    if (ban_phase == BAN_RISE) {
+        double t = (now - ban_t0) / BANNER_RISE_SECS;
+        if (t >= 1.0) { ban_phase = BAN_SCROLL; ban_t0 = now; t = 1.0; }
+        double e = 1.0 - (1.0 - t) * (1.0 - t);
+        top = in_height - (int)((in_height - rest_top) * e);
+    } else if (ban_phase == BAN_SCROLL) {
+        top = rest_top;
+    } else {
+        double t = (now - ban_t0) / BANNER_RISE_SECS;
+        if (t >= 1.0) { ban_phase = BAN_IDLE; return; }
+        top = rest_top + (int)((in_height - rest_top) * t * t);
+    }
+
+    /* Container: solid Jellyfin blue, filled to the bottom edge. */
+    for (int y = top; y < in_height; y++) {
+        uint32_t *row = (uint32_t *)(center + (size_t)fb_line_len * y);
+        for (int x = 0; x < in_width; x++) row[x] = 0x0000A4DCu;
+    }
+
+    if (ban_phase != BAN_SCROLL) return;
+
+    int tw = ban_text_width(ban_text);
+    int x  = in_width - (int)((now - ban_t0) * BANNER_SPEED);
+    if (x + tw < 0) { ban_phase = BAN_FALL; ban_t0 = now; return; }
+
+    int ty = top + (bh - 16 * vscale) / 2;
+    const char *s = ban_text;
+    const uint8_t *glyph;
+    while ((glyph = ban_next_glyph(&s)) != NULL) {
+        if (x >= in_width) break;
+        if (x + 16 > 0) {
+            for (int gy = 0; gy < 8; gy++) {
+                uint8_t bits = glyph[gy];
+                if (!bits) continue;
+                for (int gx = 0; gx < 8; gx++) {
+                    if (!((bits >> gx) & 1)) continue;
+                    for (int dy = 0; dy < 2 * vscale; dy++) {
+                        int py = ty + gy * 2 * vscale + dy;
+                        if (py < 0 || py >= in_height) continue;
+                        uint32_t *row = (uint32_t *)(center + (size_t)fb_line_len * py);
+                        for (int dx = 0; dx < 2; dx++) {
+                            int px = x + gx * 2 + dx;
+                            if (px >= 0 && px < in_width) row[px] = 0x00FFFFFFu;
+                        }
+                    }
+                }
+            }
+        }
+        x += 16;
+    }
+}
+
 static int draw_slice(uint8_t *src[], int stride[], int w, int h, int x, int y)
 {
     uint8_t *d;
@@ -1261,6 +1438,13 @@ static int draw_slice(uint8_t *src[], int stride[], int w, int h, int x, int y)
         ioctl(fb_dev_fd, FBIO_WAITFORVSYNC, &dummy);
     }
 
+    /* Keep video writes out of the active banner's rows — see ban_clip_top. */
+    {
+        int clip = ban_clip_top();
+        if (y >= clip) return 0;
+        if (y + h > clip) h = clip - y;
+    }
+
     d = center + fb_line_len * y + fb_pixel_size * x;
 
     memcpy_pic2(d, src[0], w * fb_pixel_size, h, fb_line_len, stride[0], 1);
@@ -1280,6 +1464,10 @@ static void flip_page(void)
     if (vidix_name)
         return;
 #endif
+    /* Session-message banner over the finished frame — `center` points at
+     * the frame this call is about to show in every mode (pf_back page
+     * under page flipping, the live/back buffer otherwise). */
+    ban_frame();
     /* MiSTer page flipping: the frame just rendered lives in pf_back —
      * repoint the scaler at it (latched in hardware at the next vsync)
      * and retarget rendering at the page that just left the screen. */

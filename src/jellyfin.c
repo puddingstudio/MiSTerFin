@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 #ifndef APP_VERSION
 #define APP_VERSION "dev"
@@ -441,7 +442,7 @@ static int parse_item_list(const JsonDoc *doc, JfItem *out, int max)
  * unauthenticated by definition (it's how you GET a credential), but it does
  * need the Client/Device/DeviceId fields, since those are what the server
  * shows the user when asking them to approve the request. */
-static void jf_auth_header(const JfConfig *cfg, char *out, int outlen)
+void jf_auth_header(const JfConfig *cfg, char *out, int outlen)
 {
     /* Comma-space separated with Token last and omitted when absent — the
      * same shape jellyfin-apiclient-python builds (http.py's
@@ -1493,6 +1494,18 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
      * codec — TS is the container our -demuxer lavf fix is already proven
      * against; an untested mov path isn't worth the risk.
      *
+     * maxFramerate, matched to the TV mode (PAL 25 / NTSC 30): the display
+     * refresh is fixed by the TV mode, so a source on the OTHER standard's
+     * rate (29.97fps NTSC material on a 50Hz PAL output) can never sit on a
+     * clean cadence — frames alternate 1/2 vsyncs and the motion reads as
+     * lagging/stuttering even though nothing is actually behind (confirmed
+     * with a 29.97fps DVD-sourced .mpg on PAL: decode CPU, network, and the
+     * delivered frames all measured healthy, yet playback looked wrong).
+     * The server only acts on the cap when the source EXCEEDS it (verified
+     * live on both cases: 29.97 source gained "fps=25" + "-r 25", a 23.976
+     * source's command was byte-identical with and without the param), so
+     * at-or-below-rate sources — the already-proven paths — are untouched.
+     *
      * burn_in_sub_index — see jf_stream_url's header comment for why this
      * is only ever set for image-based subtitle tracks. */
     char sub_params[64] = "";
@@ -1521,15 +1534,35 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
      * outright; a genuine re-encode of an already-small source is cheap for
      * the server anyway. Audio needs no equivalent: audioCodec=mp3 already
      * forces a real audio transcode, see the comment above. */
+    int fps_cap = (strcasecmp(cfg->tv_mode, "NTSC") == 0) ? 30 : 25;
+
+    /* audioSampleRate=48000: without it the mp3 output keeps the SOURCE's
+     * sample rate (confirmed live: a 22050Hz-AAC movie produced a 22050Hz
+     * mp3 stream), and the MiSTer's ALSA default device force-resamples
+     * everything to 48kHz through ALSA's low-quality linear-interpolation
+     * rate plugin on its way to the FPGA (/etc/asound.conf on the device).
+     * Pinning the stream to 48kHz moves that resample to the server's
+     * proper swresample and turns the device-side one into a no-op.
+     * (Music playback can't get this server-side fix — it streams the
+     * original file untranscoded — so the audio player resamples in
+     * mplayer instead; see play_audio.)
+     *
+     * deviceId: mplayer fetches this URL itself, so unlike every curl
+     * request it can't carry the Authorization header that normally
+     * identifies this install — without the query param the server files
+     * the transcode job under an anonymous device and the dashboard's
+     * session panel can never attach its TranscodingInfo (what's actually
+     * being converted, and to what) to this client's session entry. */
     snprintf(out, outlen,
         "%s/Videos/%s/stream?static=false&videoCodec=mpeg2video&container=ts"
         "&audioCodec=mp3&audioChannels=2&allowVideoStreamCopy=false"
-        "&maxWidth=%d&maxHeight=%d&videoBitRate=%d"
-        "&startTimeTicks=%lld&playSessionId=%s%s%s&ApiKey=%s",
+        "&audioSampleRate=48000"
+        "&maxWidth=%d&maxHeight=%d&videoBitRate=%d&maxFramerate=%d"
+        "&startTimeTicks=%lld&playSessionId=%s&deviceId=%s%s%s&ApiKey=%s",
         cfg->server, safe_id,
-        profile->max_width, profile->max_height, profile->video_bitrate,
+        profile->max_width, profile->max_height, profile->video_bitrate, fps_cap,
         (long long)(start_ticks > 0 ? start_ticks : 0),
-        safe_session, sub_params, audio_params, cfg->token);
+        safe_session, cfg->device_id, sub_params, audio_params, cfg->token);
     return 1;
 }
 
@@ -1595,6 +1628,14 @@ void jf_make_play_session_id(char *out, int outlen)
     snprintf(out, outlen, "misterfin-%d-%ld", (int)getpid(), (long)time(NULL));
 }
 
+/* Video is always a transcode (jf_stream_url forbids stream copy); music
+ * streams the original file untouched (static=true) — the dashboard's
+ * session panel shows whichever one the reports claim, so claiming
+ * "Transcode" for everything (as this used to) told admins their music was
+ * being converted when it wasn't. Set by jf_report_start, reused by the
+ * progress/stopped bodies for the rest of that playback. */
+static char g_play_method[16] = "Transcode";
+
 static void build_playstate_json(const char *item_id, const char *play_session_id,
                                   int64_t position_ticks, int is_paused,
                                   char *out, int outlen)
@@ -1604,17 +1645,27 @@ static void build_playstate_json(const char *item_id, const char *play_session_i
     jf_sanitize_id(play_session_id, safe_session, sizeof(safe_session));
     snprintf(out, outlen,
         "{\"ItemId\":\"%s\",\"PlaySessionId\":\"%s\","
-        "\"PositionTicks\":%lld,\"IsPaused\":%s,\"PlayMethod\":\"Transcode\"}",
+        "\"PositionTicks\":%lld,\"IsPaused\":%s,\"PlayMethod\":\"%s\"}",
         safe_id, safe_session, (long long)position_ticks,
-        is_paused ? "true" : "false");
+        is_paused ? "true" : "false", g_play_method);
 }
 
 void jf_report_start(const JfConfig *cfg, const char *item_id,
-                      const char *play_session_id, int64_t position_ticks)
+                      const char *play_session_id, int64_t position_ticks,
+                      const char *play_method)
 {
+    snprintf(g_play_method, sizeof(g_play_method), "%s", play_method);
     char body[512];
     build_playstate_json(item_id, play_session_id, position_ticks, 0, body, sizeof(body));
     jf_post_json(cfg, "/Sessions/Playing", body);
+    /* The server applies PlayMethod from PROGRESS reports only — confirmed
+     * empirically against a real server: a start report claiming Transcode
+     * left the session's PlayState at DirectPlay (so the dashboard's "i"
+     * panel showed "source entirely compatible... without modifications"),
+     * and the very first progress report flipped it to Transcode. One
+     * immediate progress makes the dashboard truthful from the first
+     * second instead of whenever the periodic report happens to fire. */
+    jf_post_json(cfg, "/Sessions/Playing/Progress", body);
 }
 
 /* Sessions/Playing/Progress and /Stopped (used above for jf_report_start)
@@ -1638,18 +1689,85 @@ static void report_user_data(const JfConfig *cfg, const char *item_id,
     jf_post_json(cfg, path, body);
 }
 
+/* Live session-state update for the dashboard only (position, paused flag,
+ * play method) — per the comment above, the /Sessions endpoints don't
+ * persist the resume position, so this never REPLACES report_user_data,
+ * it's the other half: user_data persists, this one keeps the admin
+ * dashboard's Active Sessions card (and its pause/position display)
+ * current. */
+void jf_report_session_progress(const JfConfig *cfg, const char *item_id,
+                                 const char *play_session_id,
+                                 int64_t position_ticks, int paused)
+{
+    char body[512];
+    build_playstate_json(item_id, play_session_id, position_ticks, paused, body, sizeof(body));
+    jf_post_json(cfg, "/Sessions/Playing/Progress", body);
+}
+
 void jf_report_progress(const JfConfig *cfg, const char *item_id,
                          const char *play_session_id, int64_t position_ticks, int paused)
 {
-    (void)play_session_id; (void)paused;
     report_user_data(cfg, item_id, position_ticks, 0);
+    jf_report_session_progress(cfg, item_id, play_session_id, position_ticks, paused);
+}
+
+/* Fire-and-forget POST on its own detached thread. Exists for exactly one
+ * caller so far: the video-stop session report below, where the server
+ * synchronously kills the live ffmpeg transcode before answering —
+ * measured at 2+ seconds against a real server, which on the main thread
+ * was a visible multi-second hang on every exit from playback. */
+typedef struct {
+    const JfConfig *cfg;   /* main's g_cfg — outlives every thread */
+    char  path[64];
+    char *body;
+} JfAsyncPost;
+
+static void *jf_post_json_thread(void *arg)
+{
+    JfAsyncPost *p = arg;
+    jf_post_json(p->cfg, p->path, p->body);
+    free(p->body);
+    free(p);
+    return NULL;
+}
+
+static void jf_post_json_async(const JfConfig *cfg, const char *path, const char *body)
+{
+    JfAsyncPost *p = malloc(sizeof(*p));
+    if (!p) return;
+    p->cfg = cfg;
+    snprintf(p->path, sizeof(p->path), "%s", path);
+    p->body = strdup(body);
+    if (!p->body) { free(p); return; }
+    pthread_t t;
+    if (pthread_create(&t, NULL, jf_post_json_thread, p) == 0)
+        pthread_detach(t);
+    else {
+        free(p->body);
+        free(p);
+    }
 }
 
 void jf_report_stopped(const JfConfig *cfg, const char *item_id,
                         const char *play_session_id, int64_t position_ticks,
                         int played)
 {
-    (void)play_session_id;
+    /* Tell the session tracker playback ended so the dashboard's card
+     * clears right away instead of lingering until the session times out.
+     * Async for video (see jf_post_json_async — the server kills the live
+     * ffmpeg job synchronously and takes seconds to answer); kept inline
+     * for music, where there's no transcode job (the answer is instant)
+     * and a next/previous-track skip posts the next track's start right
+     * behind this, so keeping order costs nothing and avoids the stop
+     * landing after the new start on the server. */
+    {
+        char body[512];
+        build_playstate_json(item_id, play_session_id, position_ticks, 0, body, sizeof(body));
+        if (strcmp(g_play_method, "Transcode") == 0)
+            jf_post_json_async(cfg, "/Sessions/Playing/Stopped", body);
+        else
+            jf_post_json(cfg, "/Sessions/Playing/Stopped", body);
+    }
     /* When the title was watched to the end, Jellyfin's convention is
      * Played=true with the resume position cleared to 0. Reporting the
      * near-end position with Played=false unconditionally (what this used to
@@ -1657,6 +1775,20 @@ void jf_report_stopped(const JfConfig *cfg, const char *item_id,
      * straight to the last few seconds — and kept it sitting in the Continue
      * Watching row instead of moving the series on to Next Up. */
     report_user_data(cfg, item_id, played ? 0 : position_ticks, played);
+}
+
+/* Registers what this client can do with the session the server keeps for
+ * our DeviceId — this is what makes the dashboard's Active Sessions card
+ * grow its message and pause/stop controls. Re-sent by the session module
+ * after every (re)connect of the command socket rather than once at
+ * startup, since the server drops session state when the device goes away. */
+void jf_report_capabilities(const JfConfig *cfg)
+{
+    jf_post_json(cfg, "/Sessions/Capabilities/Full",
+        "{\"PlayableMediaTypes\":[\"Video\",\"Audio\"],"
+        "\"SupportedCommands\":[\"DisplayMessage\"],"
+        "\"SupportsMediaControl\":true,"
+        "\"SupportsPersistentIdentifier\":false}");
 }
 
 int view_is_resume(const JfItem *v)    { return v->synthetic == JF_SYNTH_RESUME; }

@@ -41,6 +41,7 @@
 #include "util.h"
 #include "grid.h"
 #include "visualizers.h"
+#include "session.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
 /* Main-thread download scratch file. grid.c names the same path (its
@@ -450,6 +451,23 @@ static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "No
  * screen permanently — set to now_sec()+1.5 wherever g_now_playing_bg
  * changes (see the STATE_PLAYING_AUDIO SELECT handling), 0 = not shown. */
 static double g_now_playing_bg_shown_until = 0.0;
+
+/* Mode == NOW_PLAYING_BG_COUNT is VizGif, the single user-supplied GIF
+ * background (see gifviz_scan/visualizers.h) — appended after the fixed
+ * modes above, and only part of the SELECT cycle at all when the user's
+ * vizgif.gif actually exists. Both helpers fall back to the fixed list
+ * untouched when it doesn't, so the feature is a no-op until someone
+ * drops the file in. */
+static int now_playing_mode_count(void)
+{
+    return NOW_PLAYING_BG_COUNT + (gifviz_present() ? 1 : 0);
+}
+
+static const char *now_playing_mode_name(int mode)
+{
+    if (mode < NOW_PLAYING_BG_COUNT) return NOW_PLAYING_BG_NAMES[mode];
+    return "VizGif";
+}
 /* In the immersive backgrounds (Nebula/Toasty) the track title is otherwise
  * hidden, so on each track change it's flashed at the top for a few seconds
  * then disappears — set to now_sec()+N wherever a new track starts playing
@@ -1678,7 +1696,35 @@ static void draw_confirm_exit(FBDev *fb)
  * user request (an earlier version had a placeholder icon tile + bordered
  * panel; both are gone now). All three cards (active + its two neighbors)
  * are the same size; only color marks which one is active. */
-#define CAROUSEL_CARD_W 180   /* max text width before truncating */
+/* Max text width before truncating (at scale 2, 8px/char*scale — 160 = 10
+ * characters, so anything longer than 10 chars truncates to 7 + "..."). No
+ * longer a collision concern the way it was with the old fixed
+ * CAROUSEL_SPACING layout (raising this used to shrink the gap between
+ * neighbors, down to zero in the worst case — confirmed on hardware once as
+ * "Continue"/"Documentaries" running into each other with no gap at all):
+ * card spacing is now computed dynamically from each card's actual measured
+ * width (see carousel_card_width/draw_carousel_cards) plus a fixed
+ * CAROUSEL_GAP, so this only controls how long a name can get before it
+ * truncates — not how close cards sit to each other. */
+#define CAROUSEL_CARD_W 160
+
+/* The count line's wording — shared by draw_library_card (drawing it) and
+ * carousel_card_width (measuring it, for spacing) so the two can't drift
+ * apart into mismatched text. */
+static void carousel_format_count(const JfItem *it, int64_t count, char *buf, size_t bufsz)
+{
+    const char *ct = it->collection_type;
+    if (view_is_synthetic(it))
+        snprintf(buf, bufsz, "%lld item%s", (long long)count, count == 1 ? "" : "s");
+    else if (!strcmp(ct, "movies"))
+        snprintf(buf, bufsz, "%lld movie%s", (long long)count, count == 1 ? "" : "s");
+    else if (!strcmp(ct, "tvshows"))
+        snprintf(buf, bufsz, "%lld series", (long long)count);
+    else if (!strcmp(ct, "music"))
+        snprintf(buf, bufsz, "%lld album%s", (long long)count, count == 1 ? "" : "s");
+    else
+        snprintf(buf, bufsz, "%lld item%s", (long long)count, count == 1 ? "" : "s");
+}
 
 static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx, int cy, int active)
 {
@@ -1694,20 +1740,33 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
     else        draw_text(fb, cx - text_width(fb, name, 2) / 2, cy - 10, name, 2, 0xFF, 0xFF, 0xFF);
 
     if (count >= 0) {
-        const char *ct = it->collection_type;
         char cbuf[32];
-        if (view_is_synthetic(it))
-            snprintf(cbuf, sizeof(cbuf), "%lld item%s", (long long)count, count == 1 ? "" : "s");
-        else if (!strcmp(ct, "movies"))
-            snprintf(cbuf, sizeof(cbuf), "%lld movie%s", (long long)count, count == 1 ? "" : "s");
-        else if (!strcmp(ct, "tvshows"))
-            snprintf(cbuf, sizeof(cbuf), "%lld series", (long long)count);
-        else if (!strcmp(ct, "music"))
-            snprintf(cbuf, sizeof(cbuf), "%lld album%s", (long long)count, count == 1 ? "" : "s");
-        else
-            snprintf(cbuf, sizeof(cbuf), "%lld item%s", (long long)count, count == 1 ? "" : "s");
+        carousel_format_count(it, count, cbuf, sizeof(cbuf));
         draw_text(fb, cx - text_width(fb, cbuf, 1) / 2, cy + 12, cbuf, 1, COL_HINT);
     }
+}
+
+/* This card's on-screen footprint (the wider of its two centered lines,
+ * name at scale 2 and the count at scale 1) — used to space cards so the
+ * GAP between any two neighbors' text is always the same regardless of how
+ * long either name is, instead of the old fixed CAROUSEL_SPACING per card
+ * (which left short names like "Movies"/"Music" with a visibly wider gap
+ * than a long name truncated all the way to CAROUSEL_CARD_W). */
+static double carousel_card_width(FBDev *fb, int i)
+{
+    char name[64];
+    strncpy(name, g_items[i].name, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    truncate_to_width(fb, name, 2, CAROUSEL_CARD_W);
+    double w = text_width(fb, name, 2);
+
+    if (g_view_counts[i] >= 0) {
+        char cbuf[32];
+        carousel_format_count(&g_items[i], g_view_counts[i], cbuf, sizeof(cbuf));
+        double cw = text_width(fb, cbuf, 1);
+        if (cw > w) w = cw;
+    }
+    return w;
 }
 
 /* Root screen (g_stack_depth == 1, FRAME_VIEWS) — a horizontal carousel of
@@ -1716,8 +1775,10 @@ static void draw_library_card(FBDev *fb, const JfItem *it, int64_t count, int cx
  * Every library gets a slot along the strip (see draw_carousel_cards);
  * ones that don't fit on screen simply run off the edge and get clipped. */
 
-/* Spacing between card centers along the strip. */
-#define CAROUSEL_SPACING 150
+/* Fixed edge-to-edge gap between adjacent cards' text (see
+ * carousel_card_width) — the value that stays constant regardless of name
+ * length, replacing the old fixed CAROUSEL_SPACING-per-card approach. */
+#define CAROUSEL_GAP 74
 #define CAROUSEL_SLIDE_STEPS 6     /* LEFT/RIGHT slide — see carousel_slide_animate() */
 
 static int carousel_cy(FBDev *fb)
@@ -1730,20 +1791,49 @@ static int carousel_cy(FBDev *fb)
  * "visual selection" — an integer visual_sel is the normal at-rest layout;
  * a fractional one (from carousel_slide_animate) slides the whole strip
  * smoothly between two integer selections. The card nearest visual_sel
- * gets the active (yellow) treatment. */
+ * gets the active (yellow) treatment.
+ *
+ * Card centers are laid out cumulatively from each card's own measured
+ * width (abscenter[]) rather than at fixed multiples of a spacing constant,
+ * so center[i+1] - center[i] = w[i]/2 + CAROUSEL_GAP + w[i+1]/2 always —
+ * the visible gap is the same CAROUSEL_GAP no matter how long either
+ * neighbor's name is. visual_sel (possibly fractional, mid-slide) maps to
+ * a reference point interpolated the same way between the two abscenter[]
+ * entries it sits between, so the screen-centered card is always exactly
+ * the one at visual_sel. */
 static void draw_carousel_cards(FBDev *fb, double visual_sel, int cy)
 {
     int center_cx = fb->width / 2;
+    int n = g_item_count;
+    if (n <= 0) return;
+
+    double half_w[JF_MAX_ITEMS];
+    double abscenter[JF_MAX_ITEMS];
+    for (int i = 0; i < n; i++) half_w[i] = carousel_card_width(fb, i) / 2.0;
+    abscenter[0] = 0.0;
+    for (int i = 1; i < n; i++)
+        abscenter[i] = abscenter[i - 1] + half_w[i - 1] + CAROUSEL_GAP + half_w[i];
+
+    int old_i = (int)floor(visual_sel);
+    if (old_i < 0) old_i = 0;
+    if (old_i > n - 1) old_i = n - 1;
+    double ref;
+    if (old_i + 1 < n) {
+        double frac = visual_sel - old_i;
+        ref = abscenter[old_i] + (abscenter[old_i + 1] - abscenter[old_i]) * frac;
+    } else {
+        ref = abscenter[old_i];
+    }
+
     int active_i = (int)(visual_sel + (visual_sel >= 0 ? 0.5 : -0.5));
-    for (int i = 0; i < g_item_count; i++) {
-        double rel = i - visual_sel;
-        int cx = center_cx + (int)(rel * CAROUSEL_SPACING);
+    for (int i = 0; i < n; i++) {
+        int cx = center_cx + (int)lround(abscenter[i] - ref);
         if (cx < -CAROUSEL_CARD_W || cx > fb->width + CAROUSEL_CARD_W) continue;
         if (i == active_i) continue;   /* drawn last, on top, in case of any overlap at tight spacing */
         draw_library_card(fb, &g_items[i], g_view_counts[i], cx, cy, 0);
     }
-    if (active_i >= 0 && active_i < g_item_count) {
-        int cx = center_cx + (int)((active_i - visual_sel) * CAROUSEL_SPACING);
+    if (active_i >= 0 && active_i < n) {
+        int cx = center_cx + (int)lround(abscenter[active_i] - ref);
         draw_library_card(fb, &g_items[active_i], g_view_counts[active_i], cx, cy, 1);
     }
 }
@@ -3230,6 +3320,108 @@ static void osd_flash(const char *text, int paused)
     mp_cmd(cmd);
 }
 
+/* ── session message banner ───────────────────────────────────────────────
+ * An admin message from the Jellyfin dashboard (SESSION_EV_MESSAGE): a blue
+ * container rises from the bottom edge, the message scrolls across it right
+ * to left, and once the whole text has left the screen the container sinks
+ * back down and disappears. Registered as the fb_flip overlay (see
+ * fb_set_overlay) so it plays over every app-drawn screen without each
+ * screen's composer knowing about it; every screen redraws at full refresh
+ * rate, so the overlay animates smoothly wherever it fires. During VIDEO
+ * playback mplayer owns the framebuffer and would repaint over it, so
+ * messages arriving then go through mplayer's own OSD instead (osd_flash) —
+ * see the session-event handling in the main loop. Main-thread only (the
+ * loop enqueues, fb_flip draws), so no locking. */
+#define BANNER_QUEUE_MAX 4
+#define BANNER_TEXT_MAX  320
+#define BANNER_H         24                /* container height: scale-2 text + padding */
+#define BANNER_RISE_SECS 0.30
+#define BANNER_SPEED     110.0             /* scroll, px/sec */
+#define BANNER_BLUE      0x00, 0xA4, 0xDC  /* Jellyfin's own theme blue */
+
+enum { BANNER_IDLE, BANNER_RISE, BANNER_SCROLL, BANNER_FALL };
+static char   g_banner_queue[BANNER_QUEUE_MAX][BANNER_TEXT_MAX];
+static int    g_banner_qcount;
+static char   g_banner_text[BANNER_TEXT_MAX];
+static int    g_banner_phase = BANNER_IDLE;
+static double g_banner_t0;
+
+static void banner_enqueue(const char *text)
+{
+    if (g_banner_qcount >= BANNER_QUEUE_MAX) return;   /* someone's spamming — drop */
+    snprintf(g_banner_queue[g_banner_qcount++], BANNER_TEXT_MAX, "%s", text);
+}
+
+/* During VIDEO playback mplayer owns the framebuffer, so the banner is
+ * drawn by our patched vo_fbdev instead (docker/vo_fbdev.c, ban_frame) —
+ * same animation, same look. The handoff is this flag file (the
+ * /tmp/misterdvd_vsync pattern): written atomically (tmp + rename) so a
+ * frame's read can't catch a half-written message; mplayer takes ownership
+ * (reads + unlinks) on the next frame. If playback ends before any frame
+ * consumes it, the main loop finds the leftover and replays it through the
+ * app's own banner (see the pickup next to the session-event handling). */
+#define BANNER_FILE "/tmp/misterfin_banner"
+
+static void banner_file_write(const char *text)
+{
+    char tmp[] = "/tmp/misterfin_banner_XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return; }
+    int ok = (fputs(text, f) >= 0);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, BANNER_FILE) != 0) unlink(tmp);
+}
+
+static void banner_overlay(FBDev *fb)
+{
+    double now = now_sec();
+
+    if (g_banner_phase == BANNER_IDLE) {
+        if (g_banner_qcount == 0) return;
+        snprintf(g_banner_text, sizeof(g_banner_text), "%s", g_banner_queue[0]);
+        memmove(g_banner_queue[0], g_banner_queue[1],
+                sizeof(g_banner_queue[0]) * (BANNER_QUEUE_MAX - 1));
+        g_banner_qcount--;
+        g_banner_phase = BANNER_RISE;
+        g_banner_t0 = now;
+    }
+
+    /* The container's resting top edge — its fill always extends to the
+     * physical bottom so there's no floating gap, but the text row sits
+     * above the overscan margin where a CRT is sure to show it. */
+    int rest_top = fb->height - SAFE_Y_BOT - BANNER_H;
+    int top;
+
+    if (g_banner_phase == BANNER_RISE) {
+        double t = (now - g_banner_t0) / BANNER_RISE_SECS;
+        if (t >= 1.0) { g_banner_phase = BANNER_SCROLL; g_banner_t0 = now; t = 1.0; }
+        double e = 1.0 - (1.0 - t) * (1.0 - t);   /* ease-out */
+        top = fb->height - (int)((fb->height - rest_top) * e);
+    } else if (g_banner_phase == BANNER_SCROLL) {
+        top = rest_top;
+    } else {
+        double t = (now - g_banner_t0) / BANNER_RISE_SECS;
+        if (t >= 1.0) { g_banner_phase = BANNER_IDLE; return; }
+        top = rest_top + (int)((fb->height - rest_top) * t * t);   /* ease-in */
+    }
+
+    fb_fill_rect_alpha(fb, 0, top, fb->width, fb->height - top, BANNER_BLUE, 235);
+
+    if (g_banner_phase == BANNER_SCROLL) {
+        int tw = text_width(fb, g_banner_text, 2);
+        int x  = fb->width - (int)((now - g_banner_t0) * BANNER_SPEED);
+        if (x + tw < 0) {   /* whole message has left the screen */
+            g_banner_phase = BANNER_FALL;
+            g_banner_t0 = now;
+            return;
+        }
+        draw_text_clipped(fb, x, top + (BANNER_H - 16) / 2, g_banner_text, 2,
+                          0xFF, 0xFF, 0xFF, 0, fb->width);
+    }
+}
+
 /* Accumulates a pending seek and (re)starts the debounce window — the
  * actual restart fires from the main loop once SEEK_DEBOUNCE elapses with
  * no further presses. */
@@ -3373,7 +3565,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_play_start_wall = now_sec();
     g_paused          = 0;
     g_last_progress_report = now_sec();
-    jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks);
+    jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks, "Transcode");
 
     /* Picture zoom survives restarts of the SAME title (that's exactly how
      * the PICTURE tab applies it — see submenu_confirm) but never carries
@@ -3660,7 +3852,19 @@ vf_done:;
                 * framebuffer. */
         args[an++] = "-vf";       args[an++] = vf_arg;
         args[an++] = "-lavdopts"; args[an++] = "threads=2:fast";
-        args[an++] = "-af";       args[an++] = "format=s16le";
+               /* volume=-3: a few dB of headroom before the s16 conversion.
+                * Loudness-war-era masters sit at 0dBFS and lossy decode
+                * (the stream's audio is always mp3, see jf_stream_url)
+                * overshoots full scale on exactly that material, so with no
+                * headroom the peaks hard-clip somewhere between the s16
+                * conversion here and the FPGA audio path — audible as
+                * "breaking up" on loud passages on the MiSTer while the
+                * same file sounds fine on a desktop (float pipelines with
+                * the mixer below max never hit the ceiling). -3dB is barely
+                * a level change but absorbs typical lossy overshoot.
+                * jf_stream_url pins the stream's audio to 48kHz to match
+                * the ALSA sink — see the comment there. */
+        args[an++] = "-af";       args[an++] = "volume=-3,format=s16le";
                /* This build has no FreeType/fontconfig (confirmed on
                 * hardware: -subfont-osd-scale/-subfont-text-scale are both
                 * "Unknown option"), so without -subfont, subtitles would
@@ -3762,7 +3966,7 @@ static void play_audio(FBDev *fb, int queue_pos)
     g_play_start_wall = now_sec();
     g_paused          = 0;
     g_last_progress_report = now_sec();
-    jf_report_start(&g_cfg, it->id, g_play_session_id, 0);
+    jf_report_start(&g_cfg, it->id, g_play_session_id, 0, "DirectStream");
 
     int pfd[2];
     pipe(pfd);
@@ -3789,8 +3993,27 @@ static void play_audio(FBDev *fb, int queue_pos)
                /* export=...:512 gives the now-playing visualizer 512 s16le
                 * samples per channel to read from a live-updated mmap'd
                 * file — confirmed supported on this mplayer build (tested
-                * directly with a real FLAC track on hardware). */
-               "-af", "export=" AF_EXPORT_PATH ":512,format=s16le",
+                * directly with a real FLAC track on hardware). Kept FIRST
+                * in the chain so the visualizer sees the same signal it
+                * always has, unaffected by the two filters after it.
+                *
+                * volume=-3: same headroom as the video player — see
+                * play()'s comment.
+                *
+                * lavcresample=48000: music plays the ORIGINAL file
+                * (static=true, no transcode), which is usually 44.1kHz CD
+                * material — but the MiSTer's ALSA default device force-
+                * resamples everything to 48kHz through ALSA's plain linear-
+                * interpolation rate plugin (no quality converter installed;
+                * see /etc/asound.conf's rate->file->/dev/MrAudio chain on
+                * the device). Linear resampling adds aliasing distortion
+                * that scales with signal level — audible as loud music
+                * slowly starting to crackle. Resampling here instead, with
+                * mplayer's much better polyphase resampler, hands ALSA a
+                * 48kHz stream so its own resampler drops out of the path.
+                * Placed after volume so the resampler gets the same
+                * headroom. */
+               "-af", "export=" AF_EXPORT_PATH ":512,volume=-3,lavcresample=48000,format=s16le",
                url,
                (char *)NULL);
         _exit(1);
@@ -3824,27 +4047,32 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 
     int nebula = (g_now_playing_bg == NOW_PLAYING_BG_NEBULA);
     int spin_mode = (g_now_playing_bg == NOW_PLAYING_BG_SPIN);
-    /* Nebula, Toasty Squadron, and Now Spinning all use the immersive layout — just
-     * the enlarged centered cover over the effect plus the bottom hint bar
-     * (Toasty's sprites still fly over the top, see draw_toasty_fg below). */
-    int immersive = nebula || spin_mode || (g_now_playing_bg == NOW_PLAYING_BG_TOASTY);
+    int gif_mode = (g_now_playing_bg >= NOW_PLAYING_BG_COUNT);
+    /* Nebula, Toasty Squadron, Now Spinning, and the GIF modes all use the
+     * immersive layout — just an overlay (cover + text) over the effect
+     * plus the bottom hint bar (Toasty's sprites still fly over the top,
+     * see draw_toasty_fg below). */
+    int immersive = nebula || spin_mode || gif_mode || (g_now_playing_bg == NOW_PLAYING_BG_TOASTY);
 
     if      (g_now_playing_bg == 1) draw_rain(fb);
     else if (nebula)                 draw_nebula(fb, af_buf, af_n);
     else if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
     else if (spin_mode)             {}   /* its own background (the EQ bar) is drawn below, alongside the disc — needs the layout math there */
+    else if (gif_mode)               draw_gif_bg(fb);
     else                            draw_starfield(fb);
 
     /* The brief "which background" label on SELECT is shown in every mode
      * (that's how the cycle stays legible); the clock and PAUSED marker are
      * hidden in the immersive modes, which keep only the cover + hints. */
     if (now_sec() < g_now_playing_bg_shown_until)
-        draw_text(fb, SAFE_X, SAFE_Y, NOW_PLAYING_BG_NAMES[g_now_playing_bg], 1, COL_HINT);
+        draw_text(fb, SAFE_X, SAFE_Y, now_playing_mode_name(g_now_playing_bg), 1, COL_HINT);
     /* In the immersive modes the title is otherwise hidden, so flash it at the
      * top for a few seconds on each track change (see g_np_title_shown_until,
      * set in play_audio). Nudged down a line if the bg-name label happens to
-     * be up at the same moment so the two don't overlap. */
-    if (immersive && now_sec() < g_np_title_shown_until) {
+     * be up at the same moment so the two don't overlap. GIF mode excluded:
+     * it shows the title permanently in its own corner overlay below, so
+     * this transient flash would just be redundant clutter there. */
+    if (immersive && !gif_mode && now_sec() < g_np_title_shown_until) {
         int ty0 = (now_sec() < g_now_playing_bg_shown_until) ? SAFE_Y + 12 : SAFE_Y;
         char tflash[300];
         snprintf(tflash, sizeof(tflash), "%s", it->name);
@@ -3855,6 +4083,52 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
         draw_clock(fb);
         if (g_paused)
             draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
+    }
+
+    if (gif_mode) {
+        /* VizGif's own overlay, per user spec: the (small) cover CENTERED
+         * over the GIF, title/artist small in the top-left, and the clock
+         * big (scale 2 — twice the usual header clock) in the top-right.
+         * Deliberately NOT the other immersive modes' big centered cover:
+         * the GIF stays the star, the cover is a compact centerpiece. */
+        if (g_nowplaying_cover_px) {
+            int cover_h = (fb->height == 288) ? 100 : 84;
+            int cover_w = (int)(cover_h * par_correction(fb) + 0.5);
+            int top    = SAFE_Y;
+            int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
+            blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
+                               fb->width / 2, (top + bottom) / 2, cover_w, cover_h, 255);
+        }
+
+        /* Same top edge as the clock on the opposite corner, per user
+         * request. Briefly shares this row with the "which background"
+         * mode-name label right after switching modes (see above) — visible
+         * as an overlap for that label's ~1.5s window, accepted for the
+         * cleaner aligned look the rest of the time. */
+        int ty0 = SAFE_Y;
+        char tflash[300];
+        snprintf(tflash, sizeof(tflash), "%s", it->name);
+        truncate_to_width(fb, tflash, 1, fb->width - 2 * SAFE_X);
+        draw_text(fb, SAFE_X, ty0, tflash, 1, COL_TITLE);
+        if (it->artist[0]) {
+            char abuf[300];
+            snprintf(abuf, sizeof(abuf), "%s", it->artist);
+            truncate_to_width(fb, abuf, 1, fb->width - 2 * SAFE_X);
+            draw_text(fb, SAFE_X, ty0 + 10, abuf, 1, COL_ITEM);
+        }
+
+        /* draw_clock() is the shared scale-1 header clock — this mode
+         * wants it double-size per user request, so it draws its own. */
+        {
+            time_t now_t = time(NULL);
+            struct tm now_tm;
+            localtime_r(&now_t, &now_tm);
+            char clock_buf[8];
+            snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
+            draw_text(fb, fb->width - SAFE_X - text_width(fb, clock_buf, 2), SAFE_Y,
+                      clock_buf, 2, COL_HINT);
+        }
+        goto np_hint;
     }
 
     if (immersive) {
@@ -4160,6 +4434,48 @@ static int run_preview_now_spinning(double t_offset)
     return 0;
 }
 
+/* Hidden dev tool for the VizGif now-playing mode — exercises the real
+ * draw_now_playing() (not a hand-rolled layout copy), so this checks the
+ * actual centered-cover/title/clock overlay against whatever vizgif.gif
+ * is in place. */
+static int run_preview_gifviz(void)
+{
+    FBDev fb;
+    if (fb_open(&fb, "/dev/fb0") < 0) { fprintf(stderr, "no framebuffer\n"); return 1; }
+    SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
+
+    gifviz_scan();
+    if (!gifviz_present()) { fprintf(stderr, "no vizgif.gif found\n"); return 1; }
+    gifviz_load(&fb);
+
+    int cw = 120, ch = 120;
+    uint8_t *cover = malloc((size_t)cw * ch * 4);
+    for (int y = 0; y < ch; y++) {
+        for (int x = 0; x < cw; x++) {
+            uint8_t *p = cover + ((size_t)y * cw + x) * 4;
+            int qx = x < cw / 2, qy = y < ch / 2;
+            p[0] = qx && qy ? 220 : (qx && !qy ? 40  : (!qx && qy ? 40  : 220));
+            p[1] = qx && qy ? 40  : (qx && !qy ? 220 : (!qx && qy ? 40  : 220));
+            p[2] = qx && qy ? 40  : (qx && !qy ? 40  : (!qx && qy ? 220 : 40));
+            p[3] = 255;
+        }
+    }
+    g_nowplaying_cover_px = cover;
+    g_nowplaying_cover_w = cw;
+    g_nowplaying_cover_h = ch;
+
+    g_now_playing_bg = NOW_PLAYING_BG_COUNT;   /* the VizGif mode */
+
+    JfItem it;
+    memset(&it, 0, sizeof(it));
+    snprintf(it.name, sizeof(it.name), "Preview Track Title");
+    snprintf(it.artist, sizeof(it.artist), "Preview Artist Name");
+
+    draw_now_playing(&fb, &it, 0.0);
+    free(cover);
+    return 0;
+}
+
 static int run_preview_submenu(const char *item_id, int tab)
 {
     FBDev fb;
@@ -4358,9 +4674,12 @@ int main(int argc, char **argv)
                                                                                     : SUBMENU_TAB_SUBS);
     if (argc > 1 && strcmp(argv[1], "--preview-now-spinning") == 0)
         return run_preview_now_spinning(argc > 2 ? atof(argv[2]) : 0.0);
+    if (argc > 1 && strcmp(argv[1], "--preview-gifviz") == 0)
+        return run_preview_gifviz();
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
     grid_init(&g_cfg);             /* just stores the pointer — config itself loads below */
+    gifviz_scan();                 /* just a presence check — the GIF decodes lazily on first select */
 
     signal(SIGTERM,  on_signal);
     signal(SIGINT,   on_signal);
@@ -4404,6 +4723,9 @@ int main(int argc, char **argv)
     cursor_hide();
     input_open();
     input_drain();
+
+    fb_set_overlay(banner_overlay);   /* session messages — see banner_overlay */
+    unlink(BANNER_FILE);              /* stale handoff from a crashed previous run */
 
     /* Enable vsync by default — mplayer's patched vo_fbdev checks this file
      * each frame (see VSYNC_FLAG comment above).
@@ -4493,6 +4815,12 @@ int main(int argc, char **argv)
                 resolved == STARTUP_NEED_QUICK_CONNECT ? "Quick Connect required" :
                 resolved == STARTUP_CONFIG_MISSING ? "jellyfin.conf not found or incomplete" :
                 g_setup_reason);
+
+    /* Open the server's command socket (admin messages, dashboard remote
+     * control — see session.h). Started for the Quick Connect path too:
+     * the thread itself waits for the token to appear. */
+    if (resolved == 1 || resolved == STARTUP_NEED_QUICK_CONNECT)
+        session_start(&g_cfg);
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu
      * core — running the DDR copy loop against a core that never reads it
@@ -4635,6 +4963,69 @@ int main(int argc, char **argv)
         if (loop_now - last_input_rescan > 3.0) {
             last_input_rescan = loop_now;
             input_open();
+        }
+
+        /* Server-pushed session events (see session.h). Messages: banner
+         * on app-drawn screens, mplayer's own OSD during video (mplayer
+         * owns the framebuffer there and would repaint over the banner —
+         * the same reasoning as the osdlevel-0 comment in play()).
+         * Playstate commands become SYNTHETIC INPUT BITS rather than
+         * direct calls — the existing input handlers already own every
+         * report/stop/state-transition detail (dashboard Stop runs the
+         * exact same path as the user's own stop button), so mapping to
+         * them can't drift out of sync with real button behavior. Only
+         * injected in the two playing states with no overlay up: anywhere
+         * else INP_A/INP_B mean navigation, not transport control. */
+        {
+            SessionEvent sev;
+            while (session_poll(&sev)) {
+                if (sev.kind == SESSION_EV_MESSAGE) {
+                    char full[BANNER_TEXT_MAX];
+                    if (sev.header[0] && sev.text[0])
+                        snprintf(full, sizeof(full), "%s: %s", sev.header, sev.text);
+                    else
+                        snprintf(full, sizeof(full), "%s", sev.text[0] ? sev.text : sev.header);
+                    /* Live video: mplayer draws the banner (see BANNER_FILE).
+                     * Paused video: mplayer isn't producing frames (the
+                     * file would sit unread until resume) but the pause
+                     * screen redraws every tick, so the app's own banner
+                     * works there — route by pause state. */
+                    if (state == STATE_PLAYING && !g_paused)
+                        banner_file_write(full);
+                    else
+                        banner_enqueue(full);
+                } else if ((state == STATE_PLAYING || state == STATE_PLAYING_AUDIO) &&
+                           !about_visible && !g_submenu_visible) {
+                    switch (sev.kind) {
+                    case SESSION_EV_PLAY_PAUSE: inp |= INP_A; break;
+                    case SESSION_EV_PAUSE:      if (!g_paused) inp |= INP_A; break;
+                    case SESSION_EV_UNPAUSE:    if (g_paused)  inp |= INP_A; break;
+                    case SESSION_EV_STOP:       inp |= INP_B; break;
+                    case SESSION_EV_NEXT:
+                        if (state == STATE_PLAYING_AUDIO) inp |= INP_DOWN;
+                        break;
+                    case SESSION_EV_PREV:
+                        if (state == STATE_PLAYING_AUDIO) inp |= INP_UP;
+                        break;
+                    default: break;
+                    }
+                }
+            }
+
+            /* A message handed to mplayer right as playback ended never got
+             * drawn — replay the leftover through the app's own banner. */
+            if (state != STATE_PLAYING && access(BANNER_FILE, F_OK) == 0) {
+                FILE *bf = fopen(BANNER_FILE, "r");
+                if (bf) {
+                    char leftover[BANNER_TEXT_MAX];
+                    size_t n = fread(leftover, 1, sizeof(leftover) - 1, bf);
+                    fclose(bf);
+                    while (n > 0 && (leftover[n-1] == '\n' || leftover[n-1] == '\r')) n--;
+                    leftover[n] = '\0';
+                    if (leftover[0]) banner_enqueue(leftover);
+                }
+                unlink(BANNER_FILE);
+            }
         }
 
         /* START toggles the About screen — only from the browser, not
@@ -5046,7 +5437,7 @@ int main(int argc, char **argv)
                 g_play_offset = target;
                 g_play_start_wall = now_sec();
             } else if (inp & INP_SELECT) {
-                g_now_playing_bg = (g_now_playing_bg + 1) % NOW_PLAYING_BG_COUNT;
+                g_now_playing_bg = (g_now_playing_bg + 1) % now_playing_mode_count();
                 g_now_playing_bg_shown_until = now_sec() + 1.5;
                 if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY && !toasty_is_loaded()) {
                     /* Draw one full frame first — cover/title/timeline/VU/
@@ -5057,6 +5448,11 @@ int main(int argc, char **argv)
                      * of the load being the first thing drawn this tick. */
                     draw_now_playing(&fb, cur, play_position());
                     toasty_load(&fb);
+                } else if (g_now_playing_bg >= NOW_PLAYING_BG_COUNT && !gifviz_is_loaded()) {
+                    /* Same one-frame-first pattern as Toasty above — the
+                     * screen's own UI stays visible while the GIF decodes. */
+                    draw_now_playing(&fb, cur, play_position());
+                    gifviz_load(&fb);
                 }
             } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
                 g_last_progress_report = loop_now;

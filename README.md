@@ -347,6 +347,12 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ### <a id="unreleased"></a>Unreleased
 - New "Now Spinning" music visualizer — album art as a spinning CD with a reactive graphic-EQ bar underneath
 - Smoother animations throughout — every screen now redraws at full refresh rate (the same fix the home screen got in v0.9.9), plus motion blur on the starfield background for less choppy motion
+- VizGif — a single user-supplied animated GIF background for the music player (drop the file in, that's it)
+- Home carousel: consistent spacing between library cards regardless of name length
+- Fixed choppy video playback when a title's frame rate doesn't match the display's (e.g. NTSC-rate content on a PAL setup)
+- Fixed audio distortion on loud material, and fixed a resampling quality issue that showed up on music
+- Jellyfin dashboard: accurate transcoding info, remote pause/play/stop, and admin messages now show as an on-screen banner
+- Fixed a multi-second delay when exiting video playback
 - Internal code hygiene
 
 ### <a id="v0-9-9"></a>v0.9.9

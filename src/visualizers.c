@@ -8,6 +8,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <math.h>
 #include "visualizers.h"
 #include "draw.h"
@@ -1152,4 +1154,118 @@ double now_spinning_disc_angle(int paused, double *out_blur_span)
     return a;
     #undef DISC_SPEED
     #undef DISC_SPINDOWN_TAU
+}
+
+/* The VizGif background — ONE user-supplied animated GIF at a fixed path,
+ * appended as a single extra now-playing mode after the fixed ones
+ * (Starfield/Rain/Nebula/Now Spinning/Toasty). Deliberately exactly one
+ * (an earlier version scanned a folder and made a mode per file — per user
+ * request that's gone): drop a vizgif.gif in place and the mode exists,
+ * remove it and the mode disappears from the SELECT cycle entirely.
+ * Presence is checked once at startup (gifviz_scan, cheap — no decode);
+ * the GIF is only actually decoded the first time the mode is selected
+ * (gifviz_load), spinner-covered same as toasty_load, and then kept in
+ * memory for the rest of the session — never freed, same permanence
+ * policy as Toasty's sprites.
+ *
+ * stb_image's own multi-frame GIF loader (stbi_load_gif_from_memory)
+ * returns every frame as one contiguous w*h*4 * frame_count buffer plus a
+ * per-frame delay array already in milliseconds — no extra frame-
+ * management code needed here beyond picking which frame is "now". */
+#define GIFVIZ_PATH            "/media/fat/misterfin/vizgif.gif"
+#define GIFVIZ_MAX_FRAMES       300   /* loops a truncated animation rather than refusing outright */
+#define GIFVIZ_MAX_FILE_BYTES  (16 * 1024 * 1024)
+#define GIFVIZ_MIN_DELAY_MS      20   /* some GIFs encode a 0ms delay for sub-frame tricks */
+
+typedef struct {
+    uint8_t *px;          /* frame_count * w * h * 4 RGBA, or NULL until loaded (or on failure) */
+    int     *delays;      /* frame_count entries, ms */
+    int      w, h, frame_count;
+    int      load_tried;  /* set on the first load attempt, success or failure, so it's not retried every select */
+} GifViz;
+
+static GifViz g_gifviz;
+static int    g_gifviz_present = 0;
+
+void gifviz_scan(void)
+{
+    g_gifviz_present = (access(GIFVIZ_PATH, R_OK) == 0);
+}
+
+int gifviz_present(void) { return g_gifviz_present; }
+
+int gifviz_is_loaded(void)
+{
+    return g_gifviz_present && g_gifviz.load_tried;
+}
+
+void gifviz_load(FBDev *fb)
+{
+    GifViz *g = &g_gifviz;
+    if (!g_gifviz_present || g->load_tried) return;
+    g->load_tried = 1;
+
+    FILE *f = fopen(GIFVIZ_PATH, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > GIFVIZ_MAX_FILE_BYTES) { fclose(f); return; }
+
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { free(buf); return; }
+
+    /* One flip so a slow decode still shows feedback — this is a single
+     * library call, not a loop we can report incremental progress from,
+     * so (unlike toasty_load) it's just an "about to be busy" flip. */
+    draw_spinner_frame(fb, 0);
+    fb_flip(fb);
+
+    int *delays = NULL;
+    int w = 0, h = 0, frames = 0, comp = 0;
+    uint8_t *px = stbi_load_gif_from_memory(buf, (int)sz, &delays, &w, &h, &frames, &comp, 4);
+    free(buf);
+    if (!px || w <= 0 || h <= 0 || frames <= 0) {
+        if (px) stbi_image_free(px);
+        free(delays);
+        return;
+    }
+    if (frames > GIFVIZ_MAX_FRAMES) frames = GIFVIZ_MAX_FRAMES;
+    for (int k = 0; k < frames; k++)
+        if (delays[k] < GIFVIZ_MIN_DELAY_MS) delays[k] = GIFVIZ_MIN_DELAY_MS;
+
+    g->px = px;
+    g->delays = delays;
+    g->w = w; g->h = h; g->frame_count = frames;
+}
+
+static int gifviz_frame_at(const GifViz *g, double now)
+{
+    long total_ms = 0;
+    for (int i = 0; i < g->frame_count; i++) total_ms += g->delays[i];
+    if (total_ms <= 0) return 0;
+
+    long t = (long)fmod(now * 1000.0, (double)total_ms);
+    long acc = 0;
+    for (int i = 0; i < g->frame_count; i++) {
+        acc += g->delays[i];
+        if (t < acc) return i;
+    }
+    return g->frame_count - 1;
+}
+
+void draw_gif_bg(FBDev *fb)
+{
+    GifViz *g = &g_gifviz;
+    if (!g->px || g->frame_count <= 0) return;   /* still loading (or failed to decode) */
+
+    int idx = gifviz_frame_at(g, now_sec());
+    const uint8_t *frame = g->px + (size_t)idx * g->w * g->h * 4;
+    /* Always stretched to fill the whole screen — a user-supplied GIF has
+     * no guaranteed aspect ratio, and cropping it to preserve one is out
+     * of scope (per user request: just fill the screen, always). */
+    fb_blit(fb, frame, g->w, g->h, 0, 0, fb->width, fb->height, 255);
 }

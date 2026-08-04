@@ -238,9 +238,28 @@ void fb_clear(FBDev *fb)
 
 unsigned long g_fb_flip_count = 0;
 
+static FbOverlayFn s_overlay;
+
+void fb_set_overlay(FbOverlayFn fn)
+{
+    s_overlay = fn;
+}
+
 void fb_flip(FBDev *fb)
 {
     g_fb_flip_count++;
+
+    /* See fb_set_overlay in fb.h. Runs before the copy so it lands in this
+     * same frame; the guard makes a misbehaving overlay's nested fb_flip a
+     * no-op instead of infinite recursion. */
+    if (s_overlay) {
+        static int in_overlay;
+        if (!in_overlay) {
+            in_overlay = 1;
+            s_overlay(fb);
+            in_overlay = 0;
+        }
+    }
 
     /* Wait for vsync BEFORE the copy so the write lands in the blanking
      * interval instead of racing the scan position — same fix already

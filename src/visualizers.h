@@ -67,4 +67,16 @@ void draw_now_playing_eq(FBDev *fb, const int16_t *samples, int n,
                          int x0, int y0, int w, int h);
 double now_spinning_disc_angle(int paused, double *out_blur_span);
 
+/* VizGif — ONE user-supplied animated GIF (/media/fat/misterfin/vizgif.gif)
+ * as a single extra now-playing mode, appended after the fixed modes; the
+ * mode only exists when the file does. Call gifviz_scan() once at startup
+ * (cheap — just a presence check); the GIF is decoded lazily on first
+ * selection (gifviz_load, spinner shown on fb) and kept in memory for the
+ * rest of the session. */
+void gifviz_scan(void);
+int  gifviz_present(void);
+int  gifviz_is_loaded(void);
+void gifviz_load(FBDev *fb);
+void draw_gif_bg(FBDev *fb);
+
 #endif

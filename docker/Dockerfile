@@ -27,6 +27,7 @@ WORKDIR /build
 
 COPY build-mplayer.sh /build/build-mplayer.sh
 COPY vo_fbdev.c /build/vo_fbdev.c
+COPY font8x8.h /build/font8x8.h
 RUN chmod +x /build/build-mplayer.sh
 
 CMD ["/build/build-mplayer.sh"]

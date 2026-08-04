@@ -553,14 +553,36 @@ int jf_subtitle_is_text(const char *codec);
 
 /* Playback progress reporting (Sessions/Playing family). play_session_id is
  * a client-generated opaque string reused across start/progress/stopped for
- * a single playback so the server can correlate/cancel the transcode job. */
+ * a single playback so the server can correlate/cancel the transcode job.
+ * play_method is what the dashboard's session card displays: "Transcode"
+ * for video (always a real transcode here), "DirectStream" for music
+ * (original file, untouched) — remembered for the rest of that playback's
+ * progress/stopped reports. */
 void jf_report_start   (const JfConfig *cfg, const char *item_id,
-                         const char *play_session_id, int64_t position_ticks);
+                         const char *play_session_id, int64_t position_ticks,
+                         const char *play_method);
 void jf_report_progress(const JfConfig *cfg, const char *item_id,
                          const char *play_session_id, int64_t position_ticks, int paused);
+/* Dashboard-only live position/pause update (no resume persistence) — for
+ * the music player, whose resume position shouldn't be saved per track. */
+void jf_report_session_progress(const JfConfig *cfg, const char *item_id,
+                                 const char *play_session_id,
+                                 int64_t position_ticks, int paused);
 void jf_report_stopped (const JfConfig *cfg, const char *item_id,
                          const char *play_session_id, int64_t position_ticks,
                          int played);
+
+/* Registers session capabilities (message display, remote media control)
+ * for this DeviceId — see the implementation's comment for when. */
+void jf_report_capabilities(const JfConfig *cfg);
+
+/* The full "Authorization: MediaBrowser Client=..., DeviceId=..., Token=..."
+ * header line every request carries. Public for session.c's WebSocket
+ * handshake — the server resolves which session a socket belongs to from
+ * exactly this header (confirmed live: with only api_key/deviceId in the
+ * query string the socket got filed under the bare API key's identity, a
+ * different session than the one the curl requests build up). */
+void jf_auth_header(const JfConfig *cfg, char *out, int outlen);
 
 /* Generates a client-side play session id, e.g. "misterfin-<pid>-<time>". */
 void jf_make_play_session_id(char *out, int outlen);

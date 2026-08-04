@@ -25,6 +25,10 @@ tar xf MPlayer-$MPLAYER_VER.tar.xz
 # intentionally left as-is (not ours to rename — src/main.c's own VSYNC_FLAG
 # writes/checks that exact path, and this binary is what watches for it).
 cp /build/vo_fbdev.c MPlayer-$MPLAYER_VER/libvo/vo_fbdev.c
+# The session-message banner in vo_fbdev.c renders text with the app's own
+# 8x8 font — docker/font8x8.h is a copy of src/font8x8.h (public domain;
+# kept in docker/ because this directory is the whole build context).
+cp /build/font8x8.h MPlayer-$MPLAYER_VER/libvo/font8x8.h
 cd MPlayer-$MPLAYER_VER
 
 ./configure \

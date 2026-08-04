@@ -47,6 +47,16 @@ void fb_flip(FBDev *fb);    /* memcpy back->framebuffer (doubling lines if line_
  * instead of needing their own hand-threaded flag). */
 extern unsigned long g_fb_flip_count;
 
+/* Optional overlay callback, drawn into the back buffer at the top of every
+ * fb_flip() — the mirror image of g_fb_flip_count's reasoning: something
+ * that must appear on EVERY screen (the session message banner) gets one
+ * registration here instead of a draw call hand-added to each screen's own
+ * composer (and silently missing from the next one). The callback draws
+ * with the ordinary primitives but must never call fb_flip itself
+ * (recursion is guarded, the nested call is simply skipped). */
+typedef void (*FbOverlayFn)(FBDev *fb);
+void fb_set_overlay(FbOverlayFn fn);
+
 /* The mem->back direction of fb_flip: copies what is actually on screen
  * into the logical back buffer (downsampling every other line when
  * line_double). mplayer writes video frames straight to fb->mem, so
