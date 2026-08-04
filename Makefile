@@ -10,7 +10,12 @@ TARGET_ARM = misterfin-arm
 # check (main.c) compares against the latest GitHub release tag byte-for-
 # byte — so a dev build correctly shows up as "different from the latest
 # release" and offers to install it, rather than silently claiming to BE it.
-VERSION ?= $(shell git describe --tags 2>/dev/null || echo "dev")
+# --dirty closes the remaining hole: UNCOMMITTED work on top of a tagged
+# commit still described as exactly the tag (commit distance counts commits,
+# not working-tree changes), so such a build claimed to BE the release and
+# the About screen wrongly reported it up to date — confirmed in practice
+# the day after v0.9.9 shipped.
+VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo "dev")
 
 CC     = gcc
 CFLAGS = -O2 -Wall -Wextra -Isrc -DAPP_VERSION=\"$(VERSION)\"
