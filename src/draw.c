@@ -172,7 +172,7 @@ int draw_wrapped(FBDev *fb, int x, int y, const char *text,
  * framebuffer size rather than hardcoded, so it's automatically correct at
  * any active-line count (PAL 288, NTSC 240, ...) instead of only the one
  * resolution it happened to be tuned against. At fb->height=288 this comes
- * out to exactly 5/3 — MiSTerDVD's original proven PAL correction factor
+ * out to exactly 5/3 — this platform's proven PAL correction factor
  * (confirmed unchanged: was hardcoded 5.0/3.0 before this generalization). */
 double par_correction(FBDev *fb)
 {
@@ -185,7 +185,7 @@ double par_correction(FBDev *fb)
  * one). Used for the logo and any poster/cover, which — unlike the
  * full-bleed backdrop crop-fill — must never look distorted.
  *
- * par_correction() is MiSTerDVD's proven correction for this platform's
+ * par_correction() is this platform's proven correction for its own
  * non-square pixels, generalized to the live framebuffer size: our buffer
  * is 640 wide feeding a 4:3 CRT through a narrower final PAL/NTSC DDR
  * resolution, so plain w/h aspect math alone renders posters visibly too

@@ -1486,8 +1486,8 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
      * videoCodec=mpeg2video (not h264): confirmed Jellyfin supports it as a
      * transcode target. MPEG-2 decode is meaningfully lighter than H.264 on
      * this weak Cortex-A9 (no CABAC/CAVLC entropy overhead, no deblocking
-     * filter, simpler motion compensation) — MiSTerDVD already proves this
-     * exact chip decodes real MPEG-2 DVD content smoothly, which H.264 at a
+     * filter, simpler motion compensation) — this exact chip is already
+     * proven to decode real MPEG-2 DVD content smoothly, which H.264 at a
      * comparable resolution did not manage without desync. container=ts
      * forces MPEG-TS muxing instead of Jellyfin's default .mov for this
      * codec — TS is the container our -demuxer lavf fix is already proven

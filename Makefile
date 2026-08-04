@@ -55,8 +55,9 @@ arm: $(SRCS)
 clean:
 	rm -f $(TARGET) $(TARGET_ARM)
 
-# Requires mplayer-arm (the fbdev-patched build from MiSTerDVD's docker/ toolchain)
-# to already exist in this directory — see README "Building from Source".
+# Requires mplayer-arm (the fbdev-patched build from this project's docker/
+# toolchain) to already exist in this directory — see README "Building from
+# Source".
 deploy: arm
 	sshpass -p "1" ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no root@$(MISTER_HOST) \
 		"mkdir -p /media/fat/misterfin"
@@ -118,7 +119,7 @@ deploy: arm
 			mplayer-arm root@$(MISTER_HOST):/media/fat/misterfin/mplayer-arm; \
 		echo "mplayer-arm deployed"; \
 	else \
-		echo "WARNING: mplayer-arm not found in project root — copy it from a MiSTerDVD build before deploying"; \
+		echo "WARNING: mplayer-arm not found in project root — build it from docker/ first (see README)"; \
 	fi
 	sshpass -p "1" scp -o StrictHostKeyChecking=no -o PubkeyAuthentication=no \
 		tools/MiSTerFin.sh root@$(MISTER_HOST):/media/fat/Scripts/MiSTerFin.sh

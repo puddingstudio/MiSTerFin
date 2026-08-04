@@ -120,7 +120,7 @@ def render(font):
 def make_desc():
     lines = [
         "[info]",
-        "name MiSTerDVD",
+        "name MiSTerFin",
         f"spacewidth {CHAR_W}",
         "charspace 1",
         f"height {CHAR_H}",

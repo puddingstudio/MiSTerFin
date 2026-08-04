@@ -15,7 +15,7 @@
 #include "input.h"
 #include "util.h"
 
-/* ── input (evdev gamepad, same model as MiSTerDVD) ─────────────────────── */
+/* ── input (evdev gamepad) ────────────────────────────────────────────────── */
 
 /* Bit-array helpers for the evdev state ioctls below (linux/input.h returns
  * these as an array of unsigned long). */

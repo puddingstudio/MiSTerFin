@@ -15,16 +15,15 @@ CFLAGS_ARM="-march=armv7-a -mfpu=neon -mfloat-abi=hard -O2"
 
 # ── MPlayer ──────────────────────────────────────────────────────────────────
 # MiSTerFin only ever plays a network stream (Jellyfin's HTTP transcode) —
-# no physical disc support needed, so unlike MiSTerDVD's build this skips
-# libdvdcss/libdvdread/libdvdnav entirely (and their autotools build deps).
+# no physical disc support needed, so this build skips libdvdcss/libdvdread/
+# libdvdnav entirely (and their autotools build deps).
 echo "=== Building MPlayer $MPLAYER_VER ==="
 wget -q https://mplayerhq.hu/MPlayer/releases/MPlayer-$MPLAYER_VER.tar.xz
 tar xf MPlayer-$MPLAYER_VER.tar.xz
 # Apply vsync patch: wait for blanking interval before each frame write to
-# eliminate tearing (same patch MiSTerDVD uses — the flag file path it
-# checks, /tmp/misterdvd_vsync, is intentionally left as-is so this exact
-# binary stays interchangeable with MiSTerDVD's; MiSTerFin's own main.c
-# writes/checks that same path, see VSYNC_FLAG in src/main.c).
+# eliminate tearing. The flag file it checks, /tmp/misterdvd_vsync, is
+# intentionally left as-is (not ours to rename — src/main.c's own VSYNC_FLAG
+# writes/checks that exact path, and this binary is what watches for it).
 cp /build/vo_fbdev.c MPlayer-$MPLAYER_VER/libvo/vo_fbdev.c
 cd MPlayer-$MPLAYER_VER
 

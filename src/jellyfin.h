@@ -1,8 +1,8 @@
 #pragma once
 #include <stdint.h>
 
-/* Jellyfin REST client — curl shelled out via popen(), no libcurl dependency
- * (matches MiSTerDVD's approach). All endpoints/params below were verified
+/* Jellyfin REST client — curl shelled out via popen(), no libcurl dependency.
+ * All endpoints/params below were verified
  * against the official Jellyfin OpenAPI spec (see plan doc); a few optional
  * fields (MediaSourceId, PlaybackInfo negotiation) are intentionally omitted
  * rather than guessed — see README "Known limitations". */

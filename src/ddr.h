@@ -7,8 +7,8 @@
  * ordinary framebuffer→scaler path — none of this file is needed for that.
  * But the Zaparoo Project (https://zaparoo.org) maintains a dual-mode fork
  * of the menu core (menu_zaparoo.rbf, feat/dual-mode-native-fb) that can
- * ALSO scan video out natively from DDR, and users who installed it (e.g.
- * via MiSTerDVD's install-menu-rbf.sh) get double-buffered, structurally
+ * ALSO scan video out natively from DDR, and users who installed it get
+ * double-buffered, structurally
  * tear-free playback with broadcast-style native scanout. That is a
  * trade-off rather than an upgrade over the standard path (which is
  * already tear-free in normal use via the mplayer vsync wait): the native

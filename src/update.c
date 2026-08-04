@@ -1,4 +1,4 @@
-/* GitHub release check + in-app update — same pattern as MiSTerDVD.
+/* GitHub release check + in-app update.
  * Extracted verbatim from main.c; see update.h for the interface. */
 
 #include <stdio.h>

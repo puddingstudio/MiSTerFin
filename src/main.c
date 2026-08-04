@@ -62,10 +62,9 @@
  * elsewhere in this file for other examples of that). Unlinked before each
  * track starts so a stale file from a previous track can't be misread as
  * current audio for the first frame or two. */
-/* Hardcoded inside the shared mplayer-arm binary's patched vo_fbdev.c (built
- * for MiSTerDVD, reused here unchanged) — NOT ours to rename. Its presence
- * makes vo_fbdev wait for vblank before each frame, trading a little extra
- * decode latency for tear-free output. */
+/* Hardcoded inside the shared mplayer-arm binary's own patched vo_fbdev.c —
+ * NOT ours to rename. Its presence makes vo_fbdev wait for vblank before
+ * each frame, trading a little extra decode latency for tear-free output. */
 #define VSYNC_FLAG   "/tmp/misterdvd_vsync"
 
 /* VISIBLE row count is now derived from the live framebuffer height —
@@ -958,7 +957,7 @@ static void draw_about_frame(FBDev *fb, int show_footer)
         update_get_state(&us, &is, latest, sizeof(latest));
 
         /* Same bottom margin as everything else now (SAFE_Y_BOT == SAFE_Y) —
-         * not the taller margin MiSTerDVD's own about screen used. */
+         * not the taller margin an earlier version of this screen used. */
         int safe_y = fb->height - 8 - SAFE_Y_BOT;
         char installed[48];
         snprintf(installed, sizeof(installed), "%s installed", APP_VERSION);
@@ -1454,8 +1453,8 @@ static void draw_quick_connect(FBDev *fb)
 /* NOT a literal aspect-ratio box — blit_fit_centered's 5/3 pixel-aspect
  * correction means a typical portrait poster actually wants a box WIDER
  * than naive square-pixel math would suggest to look right on the real
- * screen (mirrors MiSTerDVD's own pdh=160/max_pw=200 proportions, scaled
- * down for this smaller corner panel). */
+ * screen (mirrors a proven pdh=160/max_pw=200 proportion, scaled down for
+ * this smaller corner panel). */
 #define BROWSE_COVER_W 175
 #define BROWSE_COVER_H 140
 
@@ -2256,7 +2255,7 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
     fb_flip(fb);
 }
 
-/* ── playback (mplayer slave-mode, adapted from MiSTerDVD's non-DVD path) ── */
+/* ── playback (mplayer slave-mode) ───────────────────────────────────────── */
 
 static pid_t   g_player_pid      = -1;
 static int     g_cmd_fd          = -1;
@@ -2323,8 +2322,8 @@ static int     g_burned_in_sub_index = -1;
 static int     g_current_audio_index = -1;
 /* Seek is a full stop+restart (network stream isn't byte-range seekable —
  * see player_seek) which takes a couple of seconds; accumulate repeated
- * presses into one seek instead of firing a restart per press, same as
- * MiSTerDVD's local-seek debounce pattern. */
+ * presses into one seek instead of firing a restart per press (a proven
+ * local-seek debounce pattern). */
 static double  g_seek_accum  = 0.0;
 static double  g_seek_fire_at = 0.0;   /* 0 = no pending seek */
 
@@ -4496,13 +4495,12 @@ int main(int argc, char **argv)
                 g_setup_reason);
 
     /* Enable DDR native-video only when menu_zaparoo.rbf is the active menu
-     * core (same idea as MiSTerDVD's guard — running the DDR copy loop
-     * against a core that never reads it adds bus contention without
-     * benefit).
+     * core — running the DDR copy loop against a core that never reads it
+     * adds bus contention without benefit.
      *
      * Detected by comparing menu.rbf's CONTENT against the installed
      * Zaparoo copy (/media/fat/zaparoo/menu_zaparoo.rbf — the exact file
-     * MiSTerDVD's install script copies into place), so detection survives
+     * a Zaparoo install script copies into place), so detection survives
      * Zaparoo releasing a new build. The old exact-size check stays as a
      * fallback for a card where the zaparoo/ folder was deleted after
      * install. Size compare gates the byte compare, so the common
@@ -4640,7 +4638,7 @@ int main(int argc, char **argv)
         }
 
         /* START toggles the About screen — only from the browser, not
-         * mid-playback (same guard MiSTerDVD uses). */
+         * mid-playback. */
         if (!playing && (inp & INP_START) && (loop_now - last_about_press > 0.3)) {
             last_about_press = loop_now;
             about_visible = !about_visible;
