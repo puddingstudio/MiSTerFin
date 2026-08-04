@@ -435,14 +435,18 @@ static int    g_shuffle_mode = 0;
 /* Now-playing background effect, cycled by SELECT (see the
  * STATE_PLAYING_AUDIO input handling) — 0 = starfield, 1 = rain,
  * 2 = Nebula, our audio-reactive plasma visualizer (see draw_nebula), 3 =
- * Toasty Squadron sprites (see draw_toasty). Persists for the whole app
- * session, same as g_root_list_mode. Index 2 (Nebula) is an immersive mode: it hides
- * the clock/title/timeline/VU and just shows an enlarged centered cover over
+ * Now Spinning — the cover rendered as a spinning CD with a graphic-
+ * EQ bar (see draw_now_playing_cd/draw_now_playing_eq), 4 = Toasty Squadron
+ * sprites (see draw_toasty). Persists for the whole app session, same as
+ * g_root_list_mode. Indices 2/3/4 are immersive modes: they hide the
+ * clock/title/timeline/VU and just show an enlarged centered cover over
  * the effect (see draw_now_playing). */
-#define NOW_PLAYING_BG_COUNT 4
-#define NOW_PLAYING_BG_NEBULA  2
+#define NOW_PLAYING_BG_COUNT  5
+#define NOW_PLAYING_BG_NEBULA 2
+#define NOW_PLAYING_BG_SPIN   3
+#define NOW_PLAYING_BG_TOASTY 4
 static int    g_now_playing_bg = 0;
-static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "Toasty Squadron" };
+static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "Now Spinning", "Toasty Squadron" };
 /* Label shows briefly on change then disappears, rather than sitting on
  * screen permanently — set to now_sec()+1.5 wherever g_now_playing_bg
  * changes (see the STATE_PLAYING_AUDIO SELECT handling), 0 = not shown. */
@@ -916,6 +920,12 @@ static void star_respawn(Star *s)
     s->z = 1.0f;
 }
 
+/* Longest trail a star is allowed to draw, in pixel steps — a star that
+ * respawns right in front of the camera can jump several screen-widths in
+ * scale in one frame; without a cap that one frame draws a stray line
+ * clean across the screen instead of a short streak. */
+#define STAR_TRAIL_MAX 14
+
 static void draw_starfield(FBDev *fb)
 {
     if (!g_stars_init) {
@@ -927,8 +937,12 @@ static void draw_starfield(FBDev *fb)
     }
     for (int i = 0; i < STAR_COUNT; i++) {
         Star *s = &g_stars[i];
-        s->z -= 0.012f;
-        if (s->z <= 0.05f) star_respawn(s);
+        float z_prev = s->z;
+        /* Was 0.012f, tuned back when this screen redrew at roughly half
+         * its now-fixed rate (see g_fb_flip_count's comment) — halved to
+         * land back at the approach speed it was tuned at. */
+        s->z -= 0.006f;
+        if (s->z <= 0.05f) { star_respawn(s); continue; }
 
         float scale = 1.0f / s->z;
         int sx = (int)(fb->width  / 2 + s->x * scale * (fb->width  / 4));
@@ -937,7 +951,29 @@ static void draw_starfield(FBDev *fb)
 
         int size = scale > 2.2f ? 2 : 1;   /* stars get a touch bigger as they approach */
         uint8_t bright = scale > 1.4f ? 255 : 150;
-        fb_fill_rect_alpha(fb, sx, sy, size, size, bright, bright, bright, 255);
+
+        /* Motion-blur trail: a short streak from where this star was last
+         * frame to where it is now, fading in toward the head — same
+         * "faster = more blur" self-scaling as the spinning disc's, just as a
+         * fading streak instead of an averaged sample (better suited to a
+         * point this small). Stars near the center barely move frame to
+         * frame (short/no streak); ones rushing past the camera get a
+         * proper hyperspace trail. */
+        float scale_prev = 1.0f / z_prev;
+        int psx = (int)(fb->width  / 2 + s->x * scale_prev * (fb->width  / 4));
+        int psy = (int)(fb->height / 2 + s->y * scale_prev * (fb->height / 4));
+        int dx = sx - psx, dy = sy - psy;
+        int steps = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+        if (steps > STAR_TRAIL_MAX) steps = STAR_TRAIL_MAX;
+        if (steps < 1) steps = 1;
+
+        for (int t = 0; t <= steps; t++) {
+            float frac = (float)t / steps;
+            int px = psx + (int)(dx * frac + 0.5f);
+            int py = psy + (int)(dy * frac + 0.5f);
+            uint8_t alpha = (uint8_t)(60 + frac * frac * 195);   /* dim tail, full-bright head */
+            fb_fill_rect_alpha(fb, px, py, size, size, bright, bright, bright, alpha);
+        }
     }
 }
 
@@ -956,7 +992,10 @@ static void rain_respawn(RainDrop *d, FBDev *fb, int initial)
 {
     d->x     = (float)(rand() % fb->width);
     d->y     = initial ? (float)(rand() % fb->height) : -4.0f;
-    d->speed = 1.5f + ((float)rand() / (float)RAND_MAX) * 2.5f;
+    /* Was 1.5f-4.0f, tuned back when this screen redrew at roughly half its
+     * now-fixed rate (see g_fb_flip_count's comment) — halved to land back
+     * at the fall speed it was tuned at. */
+    d->speed = (1.5f + ((float)rand() / (float)RAND_MAX) * 2.5f) * 0.5f;
     d->bright = (uint8_t)(120 + rand() % 136);
 }
 
@@ -1042,7 +1081,14 @@ static void draw_nebula(FBDev *fb, const int16_t *samples, int n)
      * then decay. */
     /* Global motion: gentle zoom + slow rotation, both breathing with the
      * audio. */
-    nebula_swirl += 0.010 + energy * 0.05;
+    /* These per-call increments were tuned while this screen redrew at
+     * roughly half its now-fixed rate (see g_fb_flip_count's comment —
+     * STATE_PLAYING_AUDIO had the same redundant-usleep bug STATE_BROWSE
+     * did, just not yet found/fixed when Nebula was last tuned), so at the
+     * same increment they now advance about twice as fast in real time.
+     * Halved to land back where it was — decay (the trail length/
+     * persistence, a different knob) is untouched. */
+    nebula_swirl += (0.010 + energy * 0.05) * 0.5;
     double theta = 0.022 * sin(nebula_swirl);
     double zoom  = 1.0 - (0.010 + energy * 0.018);   /* <1 => content flows */
     double ct = cos(theta) / zoom, st = sin(theta) / zoom;
@@ -1054,7 +1100,7 @@ static void draw_nebula(FBDev *fb, const int16_t *samples, int n)
      * where the feedback is sampled — just enough to curl the waveform,
      * deliberately weak so it doesn't suck the whole image into a whirlpool.
      * Louder audio strengthens it a little. */
-    nebula_t += 0.006 + energy * 0.02;
+    nebula_t += (0.006 + energy * 0.02) * 0.5;   /* see the swirl increment's own comment */
     static const double asw[NEBULA_NATTR] = { 0.26 };   /* swirl sign/strength */
     double ax[NEBULA_NATTR], ay[NEBULA_NATTR], asr[NEBULA_NATTR];
     for (int i = 0; i < NEBULA_NATTR; i++) {
@@ -3815,8 +3861,9 @@ static void submenu_handle_input(FBDev *fb, int inp, int nav_repeat, double loop
      * still silently open. Constant redraw keeps the box visibly
      * pinned the whole time it's actually open, so that state is
      * never invisible. */
+    unsigned long flips_before = g_fb_flip_count;
     draw_submenu(fb);
-    usleep(16000);
+    if (g_fb_flip_count == flips_before) usleep(16000);
     return;
 }
 
@@ -4509,6 +4556,227 @@ static void draw_vu_horizontal(FBDev *fb, const int16_t *samples, int count,
     }
 }
 
+/* Now Spinning's cover art: the immersive cover rendered as a spinning CD
+ * (circular, with a hole punched in the center) instead of a plain
+ * rectangle. max_h is the same "physical box height" the other immersive
+ * modes pass to blit_fit_centered — the disc's on-screen diameter matches
+ * their cover size exactly.
+ *
+ * Nearest-neighbor per destination pixel, same technique as fb_blit: for
+ * each screen pixel inside the disc, rotate its position back by -angle
+ * and sample the cover at that point, so the RESULT spins while the
+ * sampling math itself stays a simple lookup (no separate rotate-then-
+ * blit pass, no intermediate buffer). Source is treated as its own
+ * center-cropped square (album art is square in practice; a non-square
+ * source just loses its longer edge rather than distorting).
+ *
+ * blur_span is how far (radians) the disc turned since the last redraw —
+ * at DISC_SPEED's higher settings that's tens of degrees per frame, which
+ * without any blur reads as strobing rather than spinning (no motion blur
+ * to fake what a real fast-spinning disc's own persistence of vision
+ * would show). Instead of one sample per pixel, CD_BLUR_TAPS samples are
+ * taken across the swept arc and averaged — a cheap "shutter" rather than
+ * a persistent accumulation buffer, so it costs nothing extra when the
+ * disc is slow or paused (span near 0 collapses back to one sample) and
+ * scales itself to however fast the disc is actually turning. */
+#define CD_HOLE_FRAC 0.16   /* hole radius, as a fraction of the disc radius */
+#define CD_BLUR_TAPS 5
+
+static void draw_now_playing_cd(FBDev *fb, const uint8_t *px, int sw, int sh,
+                                 int cx, int cy, int max_h, double angle, double blur_span)
+{
+    if (!px || sw <= 0 || sh <= 0 || max_h <= 0) return;
+
+    double par = par_correction(fb);
+    int ry = max_h / 2;
+    /* rx = ry*par is what makes the disc a true circle ON SCREEN rather
+     * than an oval — same physical-square relationship blit_fit_centered's
+     * own dw/dh math relies on (see its comment). */
+    int rx = (int)(ry * par + 0.5);
+    if (rx < 1 || ry < 1) return;
+
+    int x0 = cx - rx, x1 = cx + rx, y0 = cy - ry, y1 = cy + ry;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > fb->width)  x1 = fb->width;
+    if (y1 > fb->height) y1 = fb->height;
+
+    int side = sw < sh ? sw : sh;   /* centered square crop of the source */
+    int off_x = (sw - side) / 2, off_y = (sh - side) / 2;
+    double hole2 = CD_HOLE_FRAC * CD_HOLE_FRAC;
+
+    /* Taps span [angle - blur_span, angle] — the disc's own trailing arc,
+     * same direction a real motion blur streaks in. */
+    double cs[CD_BLUR_TAPS], sn[CD_BLUR_TAPS];
+    for (int k = 0; k < CD_BLUR_TAPS; k++) {
+        double a = angle - blur_span * ((double)k / (CD_BLUR_TAPS - 1));
+        cs[k] = cos(a); sn[k] = sin(a);
+    }
+
+    for (int fy = y0; fy < y1; fy++) {
+        double v = (double)(fy - cy) / ry;
+        uint32_t *dst_row = (uint32_t *)(fb->back + (size_t)fy * fb->stride);
+        for (int fx = x0; fx < x1; fx++) {
+            double u = (double)(fx - cx) / rx;
+            double r2 = u * u + v * v;
+            if (r2 > 1.0 || r2 < hole2) continue;   /* outside the disc, or in the hole */
+
+            uint32_t acc_r = 0, acc_g = 0, acc_b = 0;
+            for (int k = 0; k < CD_BLUR_TAPS; k++) {
+                /* Rotate the sample point by -angle so the IMAGE appears to
+                 * spin by +angle. */
+                double ru = u * cs[k] + v * sn[k];
+                double rv = -u * sn[k] + v * cs[k];
+
+                int sx = (int)((ru * 0.5 + 0.5) * side);
+                int sy = (int)((rv * 0.5 + 0.5) * side);
+                if (sx < 0) sx = 0; else if (sx >= side) sx = side - 1;
+                if (sy < 0) sy = 0; else if (sy >= side) sy = side - 1;
+
+                const uint8_t *src = px + (size_t)(sy + off_y) * sw * 4 + (size_t)(sx + off_x) * 4;
+                acc_r += src[0]; acc_g += src[1]; acc_b += src[2];
+            }
+            dst_row[fx] = ((acc_r / CD_BLUR_TAPS) << 16) | ((acc_g / CD_BLUR_TAPS) << 8) | (acc_b / CD_BLUR_TAPS);
+        }
+    }
+}
+
+/* Now Spinning's own background: a classic multi-band graphic-EQ bar, full width,
+ * blocky LED-style segments colored green/yellow/red by height (bottom to
+ * top), per user reference. No real FFT (this codebase has never done one
+ * — Nebula above reads raw PCM the same way): each band is a cheap RBJ
+ * resonant bandpass biquad, log-spaced across a nominal 100Hz-8kHz voice/
+ * music range, run over the same live PCM chunk read_af_samples already
+ * hands the VU meters. A real spectrum would need a known sample rate and
+ * an FFT; this doesn't need to be correct, just visibly frequency-
+ * selective and reactive — the assumed 44.1kHz is close enough for a
+ * decorative visualizer regardless of the stream's actual rate. */
+#define EQ_BANDS   24
+#define EQ_SEGS     8
+#define EQ_GAIN   3.0   /* bandpass output is much quieter than raw amplitude — tune to taste.
+                          * Was 7.0: fine against the isolated test tones this was built with,
+                          * but real music has broadband content in every band at once, so most
+                          * bars sat pinned at the top (stuck on red) instead of visibly moving
+                          * with the track — lowered so typical program material leaves headroom
+                          * for the smoothing below to actually show movement. */
+
+static double eq_b0[EQ_BANDS], eq_b2[EQ_BANDS], eq_a1[EQ_BANDS], eq_a2[EQ_BANDS];
+static double eq_x1[EQ_BANDS], eq_x2[EQ_BANDS], eq_y1[EQ_BANDS], eq_y2[EQ_BANDS];
+static double eq_level[EQ_BANDS];
+static int    eq_coeffs_ready = 0;
+
+static void eq_init_coeffs(void)
+{
+    if (eq_coeffs_ready) return;
+    eq_coeffs_ready = 1;
+    const double fs = 44100.0, f_lo = 100.0, f_hi = 8000.0, q = 2.5;
+    for (int i = 0; i < EQ_BANDS; i++) {
+        double f0 = f_lo * pow(f_hi / f_lo, (double)i / (EQ_BANDS - 1));   /* log-spaced centers */
+        double w0 = 2.0 * M_PI * f0 / fs;
+        double alpha = sin(w0) / (2.0 * q);
+        double a0 = 1.0 + alpha;
+        eq_b0[i] =  alpha / a0;          /* RBJ constant-skirt bandpass, b1 == 0 */
+        eq_b2[i] = -alpha / a0;
+        eq_a1[i] = -2.0 * cos(w0) / a0;
+        eq_a2[i] =  (1.0 - alpha) / a0;
+    }
+}
+
+static void draw_now_playing_eq(FBDev *fb, const int16_t *samples, int n,
+                                 int x0, int y0, int w, int h)
+{
+    eq_init_coeffs();
+    int half = n / 2;   /* left channel only — same convention as draw_nebula/the VU meters */
+
+    int gap = 2;
+    int bar_w = (w - (EQ_BANDS - 1) * gap) / EQ_BANDS;
+    if (bar_w < 1) bar_w = 1;
+    int seg_gap = 1;
+    int seg_h = (h - (EQ_SEGS - 1) * seg_gap) / EQ_SEGS;
+    if (seg_h < 1) seg_h = 1;
+
+    for (int b = 0; b < EQ_BANDS; b++) {
+        double x1 = eq_x1[b], x2 = eq_x2[b], y1 = eq_y1[b], y2 = eq_y2[b];
+        double b0 = eq_b0[b], b2 = eq_b2[b], a1 = eq_a1[b], a2 = eq_a2[b];
+        double peak = 0.0;
+        for (int i = 0; i < half; i++) {
+            double xn = samples[i] / 32768.0;
+            double yn = b0 * xn + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1; x1 = xn; y2 = y1; y1 = yn;
+            double a = yn < 0 ? -yn : yn;
+            if (a > peak) peak = a;
+        }
+        eq_x1[b] = x1; eq_x2[b] = x2; eq_y1[b] = y1; eq_y2[b] = y2;
+
+        /* count==0 (paused) leaves peak at 0, so bars decay to empty via
+         * the smoothing below instead of freezing — same reasoning as
+         * draw_vu_horizontal. */
+        double raw = peak * EQ_GAIN;
+        if (raw > 1.0) raw = 1.0;
+        double lvl = eq_level[b];
+        const double attack = 0.6, decay = 0.16;   /* decay was 0.10 — quicker fall so a bar
+                                                      * that peaked doesn't linger up there
+                                                      * once the music's actual level has
+                                                      * already dropped. */
+        lvl += (raw - lvl) * (raw > lvl ? attack : decay);
+        eq_level[b] = lvl;
+
+        int lit = (int)(lvl * EQ_SEGS + 0.5);
+        int bx = x0 + b * (bar_w + gap);
+        for (int s = 0; s < EQ_SEGS; s++) {
+            uint8_t r, g, bl;
+            if (s < EQ_SEGS * 6 / 10)       { r = 0x30; g = 0xE0; bl = 0x30; }
+            else if (s < EQ_SEGS * 85 / 100) { r = 0xE0; g = 0xC0; bl = 0x20; }
+            else                              { r = 0xE0; g = 0x30; bl = 0x30; }
+            /* Dim, not invisible, when unlit — reads as an LED strip with
+             * its off segments still faintly visible, like the reference. */
+            uint8_t alpha = (s < lit) ? 255 : 50;
+            int sy = y0 + h - (s + 1) * (seg_h + seg_gap);
+            fb_fill_rect_alpha(fb, bx, sy, bar_w, seg_h, r, g, bl, alpha);
+        }
+    }
+}
+
+/* Now Spinning disc rotation angle, eased toward 0 speed when paused and back up to
+ * full speed on resume — a hard stop/start read as a glitch (the disc is
+ * meant to look like a physical thing spinning under a laser, not a sprite
+ * turning on a fixed clock). State persists across calls: disc_speed is the
+ * disc's current angular velocity, eased toward whichever target (0 when
+ * paused, DISC_SPEED otherwise) with a time-constant so it's frame-rate
+ * independent — same reasoning as draw_vu_horizontal's own smoothing, just
+ * exponential instead of a fixed per-tick step. */
+static double now_spinning_disc_angle(int paused, double *out_blur_span)
+{
+    #define DISC_SPEED 11.25    /* rad/sec — a real CD spins at ~21-52 rad/s (200-500 RPM),
+                                  * which would just be a blur at this resolution/frame rate.
+                                  * Halved from 22.5 per user feedback (motion blur scales with
+                                  * speed, so this also halves the blur strength). */
+    #define DISC_SPINDOWN_TAU 0.7 /* seconds to mostly settle into the new speed */
+    static double angle = 0.0, speed = 0.0, last_t = -1.0;
+
+    double t = now_sec();
+    double dt = (last_t < 0.0) ? 0.0 : t - last_t;
+    if (dt > 0.5) dt = 0.5;   /* guard a long gap (screen not visited in a while) from one huge jump */
+    last_t = t;
+
+    double target = paused ? 0.0 : DISC_SPEED;
+    double ease = 1.0 - exp(-dt / DISC_SPINDOWN_TAU);
+    speed += (target - speed) * ease;
+    angle += speed * dt;
+
+    /* How far the disc swept THIS frame — draw_now_playing_cd's motion-
+     * blur tap span (see its own comment). Naturally 0 when paused/just
+     * resumed (speed near 0) and grows with DISC_SPEED, no separate
+     * tuning knob needed. */
+    *out_blur_span = speed * dt;
+
+    double a = fmod(angle, 2.0 * M_PI);
+    if (a < 0.0) a += 2.0 * M_PI;
+    return a;
+    #undef DISC_SPEED
+    #undef DISC_SPINDOWN_TAU
+}
+
 static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 {
     fb_clear(fb);
@@ -4522,14 +4790,16 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     int af_n = g_paused ? 0 : read_af_samples(af_buf, 4096);
 
     int nebula = (g_now_playing_bg == NOW_PLAYING_BG_NEBULA);
-    /* Both Nebula and Toasty Squadron use the immersive layout — just the
-     * enlarged centered cover over the effect plus the bottom hint bar
+    int spin_mode = (g_now_playing_bg == NOW_PLAYING_BG_SPIN);
+    /* Nebula, Toasty Squadron, and Now Spinning all use the immersive layout — just
+     * the enlarged centered cover over the effect plus the bottom hint bar
      * (Toasty's sprites still fly over the top, see draw_toasty_fg below). */
-    int immersive = nebula || (g_now_playing_bg == 3);
+    int immersive = nebula || spin_mode || (g_now_playing_bg == NOW_PLAYING_BG_TOASTY);
 
     if      (g_now_playing_bg == 1) draw_rain(fb);
     else if (nebula)                 draw_nebula(fb, af_buf, af_n);
-    else if (g_now_playing_bg == 3) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
+    else if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
+    else if (spin_mode)             {}   /* its own background (the EQ bar) is drawn below, alongside the disc — needs the layout math there */
     else                            draw_starfield(fb);
 
     /* The brief "which background" label on SELECT is shown in every mode
@@ -4559,9 +4829,21 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
          * effect, and nothing else but the shared hint bar below. Seeking
          * still works (L/R input untouched) — only its timeline readout is
          * hidden. */
+        int top    = (fb->height == 288) ? SAFE_Y : 2;
+        int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
+
+        if (spin_mode) {
+            /* Now Spinning's own background: a full-width graphic-EQ bar, reserved
+             * as a strip at the bottom of the immersive area (above the
+             * hint line) — the disc above shrinks to make room for it,
+             * same "top..bottom" box the cover math below already uses. */
+            int eq_h = (fb->height == 288) ? 40 : 34;
+            int eq_top = bottom - eq_h;
+            draw_now_playing_eq(fb, af_buf, af_n, SAFE_X, eq_top, fb->width - 2 * SAFE_X, eq_h);
+            bottom = eq_top - 6;
+        }
+
         if (g_nowplaying_cover_px) {
-            int top    = (fb->height == 288) ? SAFE_Y : 2;
-            int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
             int box_h  = bottom - top;
             int box_w  = (fb->height == 288) ? box_h : (int)(box_h * par_correction(fb) + 0.5);
             /* Cap at the square box PAL's own math lands on (246 px at 288
@@ -4573,8 +4855,21 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
              * inside blit_fit_centered brings the height down to match.
              * A no-op at 288 lines (box_w is already exactly 246 there). */
             if (box_w > 246) box_w = 246;
-            blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
-                               fb->width / 2, (top + bottom) / 2, box_w, box_h, 255);
+            if (spin_mode) {
+                /* Gentle spin, eased to a stop while paused and back up to
+                 * speed on resume — see now_spinning_disc_angle(). */
+                double blur_span;
+                double angle = now_spinning_disc_angle(g_paused, &blur_span);
+                blur_span *= 0.7;   /* the physically-exact span read a bit strong — toned down */
+                /* A bit smaller than the other immersive covers' full box,
+                 * per user feedback — still centered in the same area. */
+                int disc_h = (int)(box_h * 0.8 + 0.5);
+                draw_now_playing_cd(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
+                                    fb->width / 2, (top + bottom) / 2, disc_h, angle, blur_span);
+            } else {
+                blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
+                                   fb->width / 2, (top + bottom) / 2, box_w, box_h, 255);
+            }
         }
         goto np_hint;
     }
@@ -4670,7 +4965,7 @@ np_hint:
 
     /* Mega-tier Toasty sprites fly over everything above — see
      * draw_toasty_fg()'s own comment. */
-    if (g_now_playing_bg == 3) draw_toasty_fg(fb);
+    if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY) draw_toasty_fg(fb);
 
     fb_flip(fb);
 }
@@ -4752,6 +5047,86 @@ static int run_preview_browse(int sel, int list_mode)
  * Honours MISTERFIN_FB for geometry (see fb.c), so the same item can be
  * checked at PAL's 288 lines and NTSC's 240 — the box is sized from its
  * content and the shorter frame is where it would overflow first. */
+/* Hidden dev tool for the Now Spinning now-playing screen (spinning-disc cover +
+ * graphic EQ bar) — no server, no mplayer needed: a synthetic four-quadrant
+ * cover (with a white spoke so rotation is unambiguous) stands in for real
+ * art, and a fabricated three-tone PCM buffer (bass/mid/treble sines)
+ * stands in for read_af_samples so the EQ's per-band bandpass filters have
+ * something frequency-varied to visibly react to. t_offset shifts the
+ * disc's rotation angle by that many "seconds" (draw_now_playing_cd is
+ * driven by now_sec(), so this sleeps for real rather than faking a
+ * clock). Dumps via MISTERFIN_FRAME_OUT like every other headless tool. */
+static int run_preview_now_spinning(double t_offset)
+{
+    FBDev fb;
+    if (fb_open(&fb, "/dev/fb0") < 0) { fprintf(stderr, "no framebuffer\n"); return 1; }
+    SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
+
+    int cw = 160, ch = 160;
+    uint8_t *cover = malloc((size_t)cw * ch * 4);
+    for (int y = 0; y < ch; y++) {
+        for (int x = 0; x < cw; x++) {
+            uint8_t *p = cover + ((size_t)y * cw + x) * 4;
+            int qx = x < cw / 2, qy = y < ch / 2;
+            p[0] = qx && qy ? 220 : (qx && !qy ? 40  : (!qx && qy ? 40  : 220));
+            p[1] = qx && qy ? 40  : (qx && !qy ? 220 : (!qx && qy ? 40  : 220));
+            p[2] = qx && qy ? 40  : (qx && !qy ? 40  : (!qx && qy ? 220 : 40));
+            p[3] = 255;
+            double u = (x - cw / 2.0 + 0.5) / (cw / 2.0);
+            double v = (y - ch / 2.0 + 0.5) / (ch / 2.0);
+            if (fabs(u) < 0.05 && v < 0) { p[0] = p[1] = p[2] = 255; }
+        }
+    }
+
+    if (t_offset > 0) usleep((useconds_t)(t_offset * 1e6));
+
+    fb_clear(&fb);
+
+    int top    = (fb.height == 288) ? SAFE_Y : 2;
+    int bottom = fb.height - 8 - SAFE_Y_BOT - 6;
+    int eq_h   = (fb.height == 288) ? 40 : 34;
+    int eq_top = bottom - eq_h;
+
+    int16_t buf[2048];
+    int half = 1024;
+    double f1 = getenv("SPIN_F1") ? atof(getenv("SPIN_F1")) : 150.0;
+    double f2 = getenv("SPIN_F2") ? atof(getenv("SPIN_F2")) : 1000.0;
+    double f3 = getenv("SPIN_F3") ? atof(getenv("SPIN_F3")) : 5000.0;
+    int reps = getenv("SPIN_REPS") ? atoi(getenv("SPIN_REPS")) : 40;
+    double phase = 0.0;
+    for (int r = 0; r < reps; r++) {
+        for (int i = 0; i < half; i++) {
+            double t = phase + i / 44100.0;
+            double s = 0.5  * sin(2.0 * M_PI * f1 * t)
+                     + 0.3  * sin(2.0 * M_PI * f2 * t)
+                     + 0.15 * sin(2.0 * M_PI * f3 * t);
+            int16_t v = (int16_t)(s * 20000.0);
+            buf[i] = v; buf[half + i] = v;
+        }
+        phase += half / 44100.0;
+        /* Clear before each rep, same as a real frame — the filters' state
+         * (eq_x1/x2/y1/y2/eq_level) persists across calls same as always,
+         * but without this the dim "unlit" alpha=50 draws blend against
+         * whatever a NOISY EARLY (pre-settled) rep already painted fully
+         * bright, and same-hue-over-same-hue alpha blending never erases
+         * that — a test-harness-only artifact, since real playback always
+         * clears before every redraw. */
+        fb_clear(&fb);
+        draw_now_playing_eq(&fb, buf, half * 2, SAFE_X, eq_top, fb.width - 2 * SAFE_X, eq_h);
+    }
+
+    int cd_bottom = eq_top - 6;
+    double angle = fmod(now_sec() * 22.5, 2.0 * M_PI);
+    draw_now_playing_cd(&fb, cover, cw, ch, fb.width / 2, (top + cd_bottom) / 2, cd_bottom - top, angle, 0.4);
+
+    const char *hint = "B:pause  L/R:seek  U/D:prev/next  SELECT:bg  A:stop";
+    draw_text(&fb, (fb.width - text_width(&fb, hint, 1)) / 2, fb.height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(&fb);
+    free(cover);
+    return 0;
+}
+
 static int run_preview_submenu(const char *item_id, int tab)
 {
     FBDev fb;
@@ -4948,6 +5323,8 @@ int main(int argc, char **argv)
                                     (argc > 3 && strcmp(argv[3], "audio") == 0)   ? SUBMENU_TAB_AUDIO :
                                     (argc > 3 && strcmp(argv[3], "picture") == 0) ? SUBMENU_TAB_PICTURE
                                                                                     : SUBMENU_TAB_SUBS);
+    if (argc > 1 && strcmp(argv[1], "--preview-now-spinning") == 0)
+        return run_preview_now_spinning(argc > 2 ? atof(argv[2]) : 0.0);
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
     grid_init(&g_cfg);             /* just stores the pointer — config itself loads below */
@@ -5154,16 +5531,18 @@ int main(int argc, char **argv)
 
     double last_input_rescan = 0.0;
     while (g_running) {
-        /* Set by STATE_BROWSE when it calls draw_browse() this iteration —
-         * that already blocked on fb_flip()'s FBIO_WAITFORVSYNC, so the
-         * unconditional usleep(16000) at the bottom of this loop would just
-         * be added dead time on top of an already-paced frame. Confirmed on
-         * hardware (DEBUGLOG's "carousel steps"/"fb_flip timing" lines): cutting
-         * the home carousel's per-frame CPU cost nearly in half left the
-         * achieved redraw rate completely unchanged, because this trailing
-         * sleep was absorbing 100% of the savings. Scoped to STATE_BROWSE
-         * only — every other state keeps its existing pacing untouched. */
-        int did_vsync_draw = 0;
+        /* If anything drawn this iteration already called fb_flip(), that
+         * blocked on FBIO_WAITFORVSYNC — every usleep(16000) below (the
+         * shared tail and the few early-continue screens above it) skips
+         * itself when this changed, instead of adding redundant dead time
+         * on top of an already-paced frame. Confirmed on hardware (first
+         * found on STATE_BROWSE: cutting the home carousel's per-frame CPU
+         * cost nearly in half left the achieved redraw rate completely
+         * unchanged, because this trailing sleep was absorbing 100% of the
+         * savings) then generalized to every screen via g_fb_flip_count
+         * (see its own comment) instead of hand-threading a flag through
+         * each one. */
+        unsigned long flips_before = g_fb_flip_count;
         int inp = input_poll();
         /* Must be called every tick (it drives the repeat timers), but only
          * OR'd in by the screens that want held-to-scroll — see
@@ -5263,7 +5642,7 @@ int main(int argc, char **argv)
                     if (loop_now >= screenshot_flash_until)
                         draw_changelog(&fb, changelog_scroll);
                 }
-                usleep(16000);
+                if (g_fb_flip_count == flips_before) usleep(16000);
                 continue;
             }
             if (inp & INP_B) {
@@ -5283,7 +5662,7 @@ int main(int argc, char **argv)
                         changelog_visible = 1;
                         draw_changelog(&fb, 0);
                         input_drain();
-                        usleep(16000);
+                        if (g_fb_flip_count == flips_before) usleep(16000);
                         continue;
                     }
                 }
@@ -5294,7 +5673,7 @@ int main(int argc, char **argv)
                  * before it was ever visible. */
                 if (loop_now >= screenshot_flash_until) draw_about(&fb);
             }
-            usleep(16000);
+            if (g_fb_flip_count == flips_before) usleep(16000);
             continue;
         }
 
@@ -5480,7 +5859,7 @@ int main(int argc, char **argv)
                     break;
                 }
             }
-            if (nav && state == STATE_BROWSE) { draw_browse(&fb); did_vsync_draw = 1; }
+            if (nav && state == STATE_BROWSE) draw_browse(&fb);
 
             /* Keeps the top-bar clock live, the over-long-title marquee (see
              * draw_browse) crawling, and the home carousel's grid background
@@ -5503,7 +5882,6 @@ int main(int argc, char **argv)
                 last_browse_tick = loop_now;
                 g_marquee_px += 15.0 * dt;   /* was a flat +1.5 per (assumed 100ms) tick == 15px/sec */
                 draw_browse(&fb);
-                did_vsync_draw = 1;
             }
             break;
         }
@@ -5638,7 +6016,7 @@ int main(int argc, char **argv)
             } else if (inp & INP_SELECT) {
                 g_now_playing_bg = (g_now_playing_bg + 1) % NOW_PLAYING_BG_COUNT;
                 g_now_playing_bg_shown_until = now_sec() + 1.5;
-                if (g_now_playing_bg == 3 && !g_toasty_loaded) {
+                if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY && !g_toasty_loaded) {
                     /* Draw one full frame first — cover/title/timeline/VU/
                      * hint all render normally, background stays plain
                      * black since draw_toasty_bg() no-ops until loaded —
@@ -5678,7 +6056,7 @@ int main(int argc, char **argv)
             ddr_flip(0, 0);
         } else {
             if (!playing && ddr_ready()) ddr_stop();
-            if (!did_vsync_draw) usleep(16000);
+            if (g_fb_flip_count == flips_before) usleep(16000);
         }
     }
 

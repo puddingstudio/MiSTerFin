@@ -36,6 +36,17 @@ void fb_close(FBDev *fb);
 void fb_clear(FBDev *fb);   /* clear back-buffer to black */
 void fb_flip(FBDev *fb);    /* memcpy back->framebuffer (doubling lines if line_double) */
 
+/* Incremented by every fb_flip() call, real hardware or headless — lets a
+ * caller detect "did anything actually flip since I last checked" without
+ * every single draw-then-flip call site needing to separately signal that
+ * back up to the main loop (see its own use in main()'s tail: skipping the
+ * idle usleep when this tick's redraw already blocked on fb_flip's own
+ * FBIO_WAITFORVSYNC would otherwise double-pace every screen that redraws
+ * every tick — confirmed on hardware for STATE_BROWSE, generalized here so
+ * newly-added continuously-redrawing screens get the same fix for free
+ * instead of needing their own hand-threaded flag). */
+extern unsigned long g_fb_flip_count;
+
 /* The mem->back direction of fb_flip: copies what is actually on screen
  * into the logical back buffer (downsampling every other line when
  * line_double). mplayer writes video frames straight to fb->mem, so

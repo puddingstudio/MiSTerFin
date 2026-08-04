@@ -236,8 +236,12 @@ void fb_clear(FBDev *fb)
     memset(fb->back, 0, (size_t)fb->stride * fb->height);
 }
 
+unsigned long g_fb_flip_count = 0;
+
 void fb_flip(FBDev *fb)
 {
+    g_fb_flip_count++;
+
     /* Wait for vsync BEFORE the copy so the write lands in the blanking
      * interval instead of racing the scan position — same fix already
      * proven in MiSTer-Toasty-Squadron's fb_flip(). Without this, nothing

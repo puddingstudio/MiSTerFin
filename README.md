@@ -31,7 +31,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [Unreleased](#unreleased) · [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
@@ -343,6 +343,10 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ---
 
 ## <a id="changelog"></a>Changelog
+
+### <a id="unreleased"></a>Unreleased
+- New "Now Spinning" music visualizer — album art as a spinning CD with a reactive graphic-EQ bar underneath
+- Smoother animations throughout — every screen now redraws at full refresh rate (the same fix the home screen got in v0.9.9), plus motion blur on the starfield background for less choppy motion
 
 ### <a id="v0-9-9"></a>v0.9.9
 - New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound
