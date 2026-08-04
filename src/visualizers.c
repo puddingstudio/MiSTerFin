@@ -138,6 +138,161 @@ void draw_rain(FBDev *fb)
     }
 }
 
+/* Fireworks — the what's-new (changelog-before-install) screen's backdrop,
+ * per user request: sporadically a single white pixel launches from the
+ * bottom, climbs, and "pops" at its apex into a burst of colored particles
+ * that scatter under gravity and fade out; a third of the particles carry
+ * a short motion-blur streak (same trailing-arc idea as the starfield's).
+ * Everything advances on real elapsed time (now_sec() deltas, same as
+ * Toasty) so the pacing doesn't change with the redraw rate — the lesson
+ * every per-frame-tuned effect above had to relearn when the redraw rate
+ * doubled. Horizontal velocities are PAR-scaled so a burst reads as a
+ * CIRCLE on the real 4:3 screen instead of a tall ellipse. */
+#define FW_ROCKETS       6
+#define FW_PARTICLES   360
+#define FW_BURST_MIN    60
+#define FW_BURST_VAR    40
+
+typedef struct { float x, y, vx, vy; int alive; } FwRocket;
+typedef struct {
+    float   x, y, vx, vy;
+    float   life, max_life;
+    uint8_t r, g, b;
+    int     blur, alive;
+} FwParticle;
+
+static FwRocket   fw_rockets[FW_ROCKETS];
+static FwParticle fw_parts[FW_PARTICLES];
+static double     fw_last_tick   = 0.0;
+static double     fw_next_launch = 0.0;
+
+/* One color family per burst — picked per rocket, with per-particle
+ * brightness variation applied at spawn. */
+static const uint8_t FW_COLORS[][3] = {
+    { 0xFF, 0x50, 0x40 },   /* red        */
+    { 0xFF, 0xC8, 0x40 },   /* gold       */
+    { 0x50, 0xE0, 0xFF },   /* cyan       */
+    { 0x60, 0xFF, 0x60 },   /* green      */
+    { 0xFF, 0x60, 0xE0 },   /* magenta    */
+    { 0xE8, 0xE8, 0xFF },   /* white-blue */
+};
+#define FW_COLOR_COUNT (int)(sizeof(FW_COLORS) / sizeof(FW_COLORS[0]))
+
+static void fw_burst(FBDev *fb, float x, float y)
+{
+    const uint8_t *col = FW_COLORS[rand() % FW_COLOR_COUNT];
+    int want = FW_BURST_MIN + rand() % FW_BURST_VAR;
+    double par = par_correction(fb);
+    for (int i = 0; i < FW_PARTICLES && want > 0; i++) {
+        FwParticle *p = &fw_parts[i];
+        if (p->alive) continue;
+        want--;
+
+        float ang   = ((float)rand() / (float)RAND_MAX) * 2.0f * (float)M_PI;
+        float speed = fb->height * (0.10f + ((float)rand() / (float)RAND_MAX) * 0.28f);
+        p->x  = x;
+        p->y  = y;
+        p->vx = cosf(ang) * speed * (float)par;
+        p->vy = sinf(ang) * speed;
+        p->max_life = 0.8f + ((float)rand() / (float)RAND_MAX) * 0.9f;
+        p->life     = p->max_life;
+        /* Same family, varied brightness, so the burst shimmers instead of
+         * being one flat color. */
+        float bright = 0.6f + ((float)rand() / (float)RAND_MAX) * 0.4f;
+        p->r = (uint8_t)(col[0] * bright);
+        p->g = (uint8_t)(col[1] * bright);
+        p->b = (uint8_t)(col[2] * bright);
+        p->blur  = (rand() % 3 == 0);
+        p->alive = 1;
+    }
+}
+
+void draw_fireworks(FBDev *fb)
+{
+    double now = now_sec();
+    double dt = (fw_last_tick > 0.0) ? now - fw_last_tick : 0.0;
+    fw_last_tick = now;
+    if (dt < 0.0 || dt > 0.25) dt = 0.0;   /* clamp a long pause/clock jump */
+
+    float grav = fb->height * 0.28f;   /* px/sec^2, gentle — embers drift down, not plummet */
+
+    /* Sporadic launches: whenever the timer lapses AND a rocket slot is
+     * free. The randomized gap is what makes it read as fireworks rather
+     * than a fountain. */
+    if (now >= fw_next_launch) {
+        for (int i = 0; i < FW_ROCKETS; i++) {
+            if (fw_rockets[i].alive) continue;
+            FwRocket *rk = &fw_rockets[i];
+            rk->x  = fb->width * (0.12f + ((float)rand() / (float)RAND_MAX) * 0.76f);
+            rk->y  = (float)fb->height + 2.0f;
+            rk->vx = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f) * fb->width * 0.02f;
+            /* Wide launch-speed spread so apex height (and how long the
+             * climb takes) varies a lot burst to burst — a weak launch
+             * pops low and quick, a strong one climbs slowly and pops
+             * near the top; previously this was too narrow a range and
+             * every rocket ended up popping at the very top. */
+            rk->vy = -fb->height * (0.32f + ((float)rand() / (float)RAND_MAX) * 0.50f);
+            rk->alive = 1;
+            break;
+        }
+        fw_next_launch = now + 0.35 + ((double)rand() / RAND_MAX) * 1.0;
+    }
+
+    for (int i = 0; i < FW_ROCKETS; i++) {
+        FwRocket *rk = &fw_rockets[i];
+        if (!rk->alive) continue;
+        rk->x  += rk->vx * (float)dt;
+        rk->y  += rk->vy * (float)dt;
+        rk->vy += grav * 0.9f * (float)dt;   /* decelerating climb */
+
+        /* Pop at the apex (climb spent), or at a ceiling if it was fast
+         * enough to threaten the very top of the screen. */
+        if (rk->vy > -fb->height * 0.06f || rk->y < fb->height * 0.12f) {
+            rk->alive = 0;
+            fw_burst(fb, rk->x, rk->y);
+            continue;
+        }
+
+        int sx = (int)rk->x, sy = (int)rk->y;
+        /* White head + a faint 2-step tail BELOW it (it's climbing). */
+        fb_fill_rect_alpha(fb, sx, sy,     1, 1, 255, 255, 255, 255);
+        fb_fill_rect_alpha(fb, sx, sy + 2, 1, 1, 255, 255, 255, 120);
+        fb_fill_rect_alpha(fb, sx, sy + 4, 1, 1, 255, 255, 255, 50);
+    }
+
+    for (int i = 0; i < FW_PARTICLES; i++) {
+        FwParticle *p = &fw_parts[i];
+        if (!p->alive) continue;
+
+        float px_prev = p->x, py_prev = p->y;
+        p->x  += p->vx * (float)dt;
+        p->y  += p->vy * (float)dt;
+        p->vy += grav * (float)dt;
+        p->life -= (float)dt;
+        if (p->life <= 0.0f || p->y >= fb->height || p->x < -4.0f || p->x >= fb->width + 4.0f) {
+            p->alive = 0;
+            continue;
+        }
+
+        uint8_t alpha = (uint8_t)(255.0f * (p->life / p->max_life));
+        int sx = (int)p->x, sy = (int)p->y;
+        if ((unsigned)sx < (unsigned)fb->width && (unsigned)sy < (unsigned)fb->height)
+            fb_fill_rect_alpha(fb, sx, sy, 1, 1, p->r, p->g, p->b, alpha);
+
+        if (p->blur) {
+            /* Short streak back toward where it was last frame — dimmer
+             * than the head, same self-scaling-with-speed idea as the
+             * starfield trails. */
+            int bx = (int)((px_prev + p->x) * 0.5f), by = (int)((py_prev + p->y) * 0.5f);
+            int tx = (int)px_prev, ty = (int)py_prev;
+            if ((unsigned)bx < (unsigned)fb->width && (unsigned)by < (unsigned)fb->height)
+                fb_fill_rect_alpha(fb, bx, by, 1, 1, p->r, p->g, p->b, (uint8_t)(alpha / 2));
+            if ((unsigned)tx < (unsigned)fb->width && (unsigned)ty < (unsigned)fb->height)
+                fb_fill_rect_alpha(fb, tx, ty, 1, 1, p->r, p->g, p->b, (uint8_t)(alpha / 4));
+        }
+    }
+}
+
 /* Now-playing background effect #2 (index NOW_PLAYING_BG_NEBULA) — "Nebula",
  * our own audio-reactive plasma visualizer. It's an ORIGINAL effect written
  * from scratch, inspired by Ryan Geiss's classic feedback visualizer but not
@@ -199,19 +354,24 @@ void draw_nebula(FBDev *fb, const int16_t *samples, int n)
      * then decay. */
     /* Global motion: gentle zoom + slow rotation, both breathing with the
      * audio. */
-    /* These per-call increments were tuned while this screen redrew at
+    /* Every per-call increment here was tuned while this screen redrew at
      * roughly half its now-fixed rate (see g_fb_flip_count's comment —
      * STATE_PLAYING_AUDIO had the same redundant-usleep bug STATE_BROWSE
      * did, just not yet found/fixed when Nebula was last tuned), so at the
-     * same increment they now advance about twice as fast in real time.
-     * Halved to land back where it was — decay (the trail length/
-     * persistence, a different knob) is untouched. */
+     * same numbers everything advanced about twice as fast in real time.
+     * ALL of them are compensated to land back at the tuned look: the
+     * swirl/attractor/zoom/palette increments are halved, and decay —
+     * multiplicative per frame, not additive — moves toward 1 so that
+     * applying it twice as often fades a trail at the same per-second
+     * rate as before (0.949^2sec-worth ~= 0.973 per new frame -> ~249/256;
+     * a first pass halved only swirl/attractor and the user immediately
+     * spotted the rest still running fast). */
     nebula_swirl += (0.010 + energy * 0.05) * 0.5;
     double theta = 0.022 * sin(nebula_swirl);
-    double zoom  = 1.0 - (0.010 + energy * 0.018);   /* <1 => content flows */
+    double zoom  = 1.0 - (0.010 + energy * 0.018) * 0.5;   /* <1 => content flows */
     double ct = cos(theta) / zoom, st = sin(theta) / zoom;
     double cx = NEBULA_W / 2.0, cy = NEBULA_H / 2.0;
-    unsigned decay = 243;   /* /256 per frame */
+    unsigned decay = 249;   /* /256 per frame */
 
     /* On top of the global spin, one gentle "circular attractor" drifting
      * behind the cover adds a small bounded radial pull + tangential swirl to
@@ -274,8 +434,8 @@ void draw_nebula(FBDev *fb, const int16_t *samples, int n)
      * rainbow cycle. The golden-angle step keeps consecutive schemes well
      * separated. Intensity 0 stays black. */
     double target_hue = (double)((int)(now_sec() / 15.0)) * 2.39996;
-    nebula_hue += (target_hue - nebula_hue) * 0.05;
-    nebula_pal_phase += 0.0015 + energy * 0.010;   /* only a slow in-scheme drift */
+    nebula_hue += (target_hue - nebula_hue) * 0.025;               /* see the swirl block's rate-compensation comment */
+    nebula_pal_phase += (0.0015 + energy * 0.010) * 0.5;   /* only a slow in-scheme drift */
     uint32_t pal[256];
     for (int i = 0; i < 256; i++) {
         double t = i / 255.0;

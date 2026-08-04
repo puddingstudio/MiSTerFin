@@ -1125,7 +1125,7 @@ static void draw_changelog(FBDev *fb, int scroll)
     update_get_state(NULL, NULL, latest, sizeof(latest));
 
     fb_clear(fb);
-    draw_rain(fb);   /* same falling-rain effect as the music player's background */
+    draw_fireworks(fb);   /* release notes get fireworks — it's a celebration, after all */
     char title[64];
     snprintf(title, sizeof(title), "What's new in %s", latest);
     draw_top_bar(fb, title);

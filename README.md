@@ -347,6 +347,7 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 ### <a id="unreleased"></a>Unreleased
 - New "Now Spinning" music visualizer — album art as a spinning CD with a reactive graphic-EQ bar underneath
 - Smoother animations throughout — every screen now redraws at full refresh rate (the same fix the home screen got in v0.9.9), plus motion blur on the starfield background for less choppy motion
+- Internal code hygiene
 
 ### <a id="v0-9-9"></a>v0.9.9
 - New SELECT+START screenshot combo — captures a BMP at the real on-screen aspect ratio from any screen (browse, About, video, music), with a brief "Screenshot saved" confirmation and a camera shutter sound

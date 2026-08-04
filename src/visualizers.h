@@ -25,9 +25,12 @@ int read_af_samples(int16_t *buf, int max_samples);
  * the setup/Quick Connect error screens, and now-playing mode 0. */
 void draw_starfield(FBDev *fb);
 
-/* Falling blue-white rain streaks — now-playing mode 1 and the what's-new
- * screen's backdrop. */
+/* Falling blue-white rain streaks — now-playing mode 1. */
 void draw_rain(FBDev *fb);
+
+/* Fireworks: sporadic white rockets from the bottom edge popping into
+ * colored, gravity-scattered bursts — the what's-new screen's backdrop. */
+void draw_fireworks(FBDev *fb);
 
 /* Nebula, the audio-reactive plasma (now-playing mode 2). samples/n come
  * from read_af_samples; n == 0 (paused / not exporting yet) is fine. */
