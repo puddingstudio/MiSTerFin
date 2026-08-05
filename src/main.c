@@ -4101,11 +4101,12 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
         }
 
         /* Same top edge as the clock on the opposite corner, per user
-         * request. Briefly shares this row with the "which background"
-         * mode-name label right after switching modes (see above) — visible
-         * as an overlap for that label's ~1.5s window, accepted for the
-         * cleaner aligned look the rest of the time. */
-        int ty0 = SAFE_Y;
+         * request — except for the brief window right after switching
+         * modes, where the "which background" name label (e.g. "VizGif")
+         * occupies this exact row; bumped down out of its way for that
+         * window, same pattern the other immersive modes use just above,
+         * and back up the instant the label clears. */
+        int ty0 = (now_sec() < g_now_playing_bg_shown_until) ? SAFE_Y + 12 : SAFE_Y;
         char tflash[300];
         snprintf(tflash, sizeof(tflash), "%s", it->name);
         truncate_to_width(fb, tflash, 1, fb->width - 2 * SAFE_X);

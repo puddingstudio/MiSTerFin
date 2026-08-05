@@ -1,6 +1,6 @@
 # MiSTerFin
 
-<p align="center"><img src="docs/about.gif" width="100%" alt="MiSTerFin about screen"></p>
+<p align="center"><img src="docs/hero.png" width="100%" alt="MiSTerFin screenshot collage"></p>
 
 A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfpga.org) platform. Browse your Movies/TV/Music library, see cover art and overview, and play back on a CRT — video is server-side transcoded and letterboxed to PAL or NTSC, with client-side subtitles, full pause/seek/resume support, and a proper music player with a now-playing screen. Works with whatever analog output your MiSTer is already set up for (SCART, composite, component, ...) — MiSTerFin just writes to the standard framebuffer, same as any other MiSTer app.
 
@@ -63,14 +63,14 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 |:---:|:---:|:---:|
 | <img src="docs/images/screenshots/video-playback.png" width="260"><br>Letterboxed (2.20:1 source) | <img src="docs/images/screenshots/video-playback-4x3.png" width="260"><br>Full 4:3 (no letterboxing) | <img src="docs/images/screenshots/video-seek.png" width="260"><br>Seek overlay |
 | <img src="docs/images/screenshots/pause-menu.png" width="260"><br>Pause menu | <img src="docs/images/screenshots/subtitle-picker.png" width="260"><br>Subtitle picker | <img src="docs/images/screenshots/audio-track-picker.png" width="260"><br>Audio track picker |
-| <img src="docs/images/screenshots/picture-modes.png" width="260"><br>Picture modes (wide titles) | | |
+| <img src="docs/images/screenshots/picture-modes.png" width="260"><br>Picture modes (wide titles) | <img src="docs/images/screenshots/session-message-banner.png" width="260"><br>Admin message from the Jellyfin dashboard | |
 
 **Music**
 
 | | | |
 |:---:|:---:|:---:|
 | <img src="docs/images/screenshots/now-playing.png" width="260"><br>Now playing (VU meters) | <img src="docs/images/screenshots/now-playing-rain.png" width="260"><br>Rain | <img src="docs/images/screenshots/now-playing-nebula.png" width="260"><br>Nebula visualizer |
-| <img src="docs/images/screenshots/now-playing-toasty.png" width="260"><br>Toasty screensaver | | |
+| <img src="docs/images/screenshots/now-playing-toasty.png" width="260"><br>Toasty screensaver | <img src="docs/images/screenshots/now-playing-spinning.png" width="260"><br>Now Spinning | |
 
 **About**
 
