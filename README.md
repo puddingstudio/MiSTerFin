@@ -107,6 +107,12 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 - Server-side transcode for video (the MiSTer's ARM Cortex-A9 can't decode arbitrary HEVC/4K sources locally) to a CRT-sized stream, then letterboxed/pillarboxed client-side to exactly fill the PAL/NTSC frame
 - Audio plays back directly (`static=true`, no server transcode) — this mplayer build decodes FLAC/MP3 natively, and there's no letterboxing concern for audio the way there is for video
 
+<br>
+
+<p align="center"><img src="docs/misterfin-reddit-crawl.gif" width="100%" alt="MiSTerFin home carousel crawl"></p>
+
+<br>
+
 ---
 
 ## <a id="requirements"></a>Requirements
