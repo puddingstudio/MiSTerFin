@@ -36,6 +36,11 @@ void draw_fireworks(FBDev *fb);
  * from read_af_samples; n == 0 (paused / not exporting yet) is fine. */
 void draw_nebula(FBDev *fb, const int16_t *samples, int n);
 
+/* Tunnel, the low-poly 3D wireframe flythrough (now-playing mode). Same
+ * samples/n contract as draw_nebula — n == 0 is fine, travel speed just
+ * sits at its resting rate. */
+void draw_tunnel(FBDev *fb, const int16_t *samples, int n);
+
 /* Toasty Squadron (now-playing mode 4). The frame decode takes multiple
  * seconds on this hardware, so it's triggered EXPLICITLY (toasty_load,
  * spinner shown on fb) by the SELECT handler that switches to the mode —

@@ -1156,6 +1156,345 @@ double now_spinning_disc_angle(int paused, double *out_blur_span)
     #undef DISC_SPINDOWN_TAU
 }
 
+/* Tunnel (now-playing mode): a low-poly 3D wireframe tunnel flythrough,
+ * Star Fox/DOS-demo style — a handful of warped N-gon "rings" receding
+ * into the screen, flown through forever by wrapping each ring's depth
+ * back to the far end once it passes the camera. Travel speed reacts to
+ * the music's energy (read_af_samples' same mean-abs measure Nebula
+ * uses), the whole tunnel slowly tumbles, and its neon colour steps to a
+ * new hue every so often — same step-then-ease idiom as Nebula's colour
+ * scheme (see draw_nebula's comment), just on its own independent timer.
+ *
+ * Lines are blended ADDITIVELY rather than alpha-composited on purpose:
+ * perspective alone makes the warped grid lines converge densely near the
+ * vanishing point, so brightness naturally builds up right where a real
+ * tunnel's "light at the end" would be — no separate distance-glow code
+ * needed. Genuinely 3D (a real perspective divide per vertex, not a faked
+ * 2D spiral): a Cortex-A9 has no hardware divide, but this is TUNNEL_RINGS
+ * * TUNNEL_SIDES divisions a frame (128) against the tens of thousands
+ * that motivated fb_blit's row-lookup-table fix — a non-issue at this
+ * vertex count. */
+#define TUNNEL_SIDES         12
+#define TUNNEL_RINGS         18
+#define TUNNEL_RING_SPACING 0.9
+#define TUNNEL_NEAR_Z       0.45  /* fixed floor on depth — keeps the nearest ring's scale bounded */
+#define TUNNEL_BASE_R       2.0   /* big relative to focal ON PURPOSE: rings closer than d~1.5 project past every screen edge, which is what actually puts the camera INSIDE the tunnel (at 1.0 the whole thing fit in frame and read as an object floating in space) */
+#define TUNNEL_FOCAL_FRAC   0.45  /* focal length as a fraction of fb->height, so it scales PAL/NTSC alike */
+#define TUNNEL_BASE_SPEED   1.1   /* rings/sec through the tunnel at rest */
+#define TUNNEL_ENERGY_SPEED 3.2   /* extra rings/sec at full audio energy */
+#define TUNNEL_ROT_RATE     0.15  /* rad/sec, slow tumble */
+#define TUNNEL_WOBBLE_AMT   0.16  /* radius perturbation — what makes it warped, not a plain cylinder */
+#define TUNNEL_WOBBLE_FREQ  1.0   /* low relative to TUNNEL_SIDES, or the low vertex count aliases a smooth wave into a spiky star */
+#define TUNNEL_WOBBLE_RATE  0.4
+#define TUNNEL_HUE_HOLD    12.0   /* seconds between colour changes */
+#define TUNNEL_HUE_TAU      1.5   /* seconds to ease into the new one */
+/* The winding centerline — what makes this read as FLYING THROUGH a tunnel
+ * rather than looking at a wireframe object from outside (the first cut
+ * kept every ring concentric on a screen-centered axis, and the user
+ * immediately called it out as "not a tunnel you travel through": with no
+ * curvature there is no parallax, so the eye reads it as a static web).
+ * The tunnel's cross-section centers follow a lissajous path in world
+ * space as a function of ABSOLUTE tunnel position s = scroll + depth, and
+ * the camera rides that same path — so nearby rings stay roughly centered
+ * around the viewer while distant ones swing wide with the curve, walls
+ * sweep across the frame as bends flow past, and the vanishing point
+ * wanders instead of sitting nailed to screen center. Amplitudes are in
+ * radius units and deliberately LARGER than the radius: that's what makes
+ * bends strong enough to see the outer wall of the curve ahead. */
+#define TUNNEL_SWAY_X   2.2
+#define TUNNEL_SWAY_Y   1.6
+#define TUNNEL_FREQ_X   0.22
+#define TUNNEL_FREQ_Y   0.16
+/* Beat response: mean-abs of real music sits around 0.1-0.25 on the raw
+ * 0..1 normalization (the first cut fed that in directly and the speed
+ * change was too small to notice — confirmed by user), so energy is
+ * amplified by TUNNEL_ENERGY_AMP before use, and a simple transient
+ * detector (fast level vs slow-follower level) fires "beats" that light
+ * up random wall panels, which then fade out while traveling toward the
+ * camera with their ring. */
+#define TUNNEL_ENERGY_AMP    3.5
+#define TUNNEL_BEAT_RATIO    1.22  /* instant level must exceed slow EMA by this to count as a hit */
+#define TUNNEL_BEAT_FLOOR    0.04  /* and by an absolute floor, so silence can't "beat" on noise */
+#define TUNNEL_BEAT_HOLD     0.11  /* refractory seconds between hits */
+#define TUNNEL_LIT_TAU       0.85  /* seconds for a lit panel to fade */
+#define TUNNEL_LIT_MIN_D     1.2   /* don't fill panels nearer than this — they project enormous */
+
+static double tunnel_scroll    = 0.0;
+static double tunnel_rot       = 0.0;
+static double tunnel_wobble_ph = 0.0;
+static double tunnel_hue       = 0.0;
+static double tunnel_last_tick = -1.0;
+static double tunnel_env_slow  = 0.0;   /* slow energy follower, the beat reference level */
+static double tunnel_beat_at   = 0.0;   /* last beat time, for the refractory hold */
+static float  tunnel_lit[TUNNEL_RINGS][TUNNEL_SIDES];   /* per-panel glow intensity */
+static double tunnel_prev_depth[TUNNEL_RINGS];
+/* The ride itself follows the music (per user request — energy-scaled
+ * speed alone wasn't dynamic enough): every beat KICKS the forward speed
+ * (which then glides back down — accelerate on the hit, decelerate after),
+ * the cruising speed between kicks tracks the song's TEMPO (EMA of
+ * inter-beat gaps), each beat also punches the camera roll in a random
+ * direction, and how hard the tunnel winds follows a slow energy average
+ * (quiet passage = straighter road, loud = twistier). */
+static double tunnel_boost     = 0.0;   /* per-beat forward kick, decaying */
+static double tunnel_rot_vel   = 0.0;   /* per-beat roll punch, decaying */
+static double tunnel_cruise    = TUNNEL_BASE_SPEED;
+static double tunnel_beat_gap  = 0.5;   /* smoothed seconds/beat — 120bpm prior */
+static double tunnel_amp_env   = 0.0;   /* slow energy average driving sway amplitude */
+
+/* Additive scanline fill of one convex wall panel (the quad between two
+ * depth-adjacent rings sharing a side) — the "lit in rhythm" panels. Same
+ * additive blend as tunnel_line so a panel glows THROUGH the grid rather
+ * than covering it. */
+static void tunnel_fill_quad(FBDev *fb, const double *qx, const double *qy,
+                              int r, int g, int b)
+{
+    double ymin = qy[0], ymax = qy[0];
+    for (int i = 1; i < 4; i++) {
+        if (qy[i] < ymin) ymin = qy[i];
+        if (qy[i] > ymax) ymax = qy[i];
+    }
+    int y0 = (int)ymin; if (y0 < 0) y0 = 0;
+    int y1 = (int)ymax; if (y1 >= fb->height) y1 = fb->height - 1;
+
+    for (int y = y0; y <= y1; y++) {
+        double yc = y + 0.5;
+        double xs[4];
+        int nx = 0;
+        for (int e = 0; e < 4; e++) {
+            int e2 = (e + 1) & 3;
+            double ya = qy[e], yb = qy[e2];
+            if ((ya <= yc) == (yb <= yc)) continue;   /* edge doesn't cross this scanline */
+            xs[nx++] = qx[e] + (qx[e2] - qx[e]) * (yc - ya) / (yb - ya);
+        }
+        /* Convex quad: 2 crossings; a slightly bowtied projection can give
+         * 4 — fill between the outermost pair either way. */
+        if (nx < 2) continue;
+        double xa = xs[0], xb = xs[0];
+        for (int i = 1; i < nx; i++) {
+            if (xs[i] < xa) xa = xs[i];
+            if (xs[i] > xb) xb = xs[i];
+        }
+        int px0 = (int)xa; if (px0 < 0) px0 = 0;
+        int px1 = (int)xb; if (px1 >= fb->width) px1 = fb->width - 1;
+        uint32_t *row = (uint32_t *)(fb->back + (size_t)y * fb->stride);
+        for (int x = px0; x <= px1; x++) {
+            uint32_t v = row[x];
+            int nr = (int)((v >> 16) & 0xFF) + r; if (nr > 255) nr = 255;
+            int ng = (int)((v >>  8) & 0xFF) + g; if (ng > 255) ng = 255;
+            int nb = (int)( v        & 0xFF) + b; if (nb > 255) nb = 255;
+            row[x] = ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+        }
+    }
+}
+
+/* Plain DDA, additive-blended straight into the back buffer (0x00RRGGBB,
+ * same layout fb_fill_rect_alpha packs) — no alpha/coverage math, thin
+ * hard-edged 1px lines are exactly the retro low-poly look this wants. */
+static void tunnel_line(FBDev *fb, double x0, double y0, double x1, double y1,
+                         int r, int g, int b)
+{
+    /* Trivial reject for fully-offscreen lines — with the camera INSIDE
+     * the tunnel, the nearest rings are mostly outside the frame, so a
+     * good share of segments never touch a visible pixel at all. */
+    if ((x0 < 0 && x1 < 0) || (x0 >= fb->width  && x1 >= fb->width))  return;
+    if ((y0 < 0 && y1 < 0) || (y0 >= fb->height && y1 >= fb->height)) return;
+
+    double dx = x1 - x0, dy = y1 - y0;
+    double len = sqrt(dx * dx + dy * dy);
+    int steps = (int)len;
+    if (steps < 1) steps = 1;
+    if (steps > 4096) return;   /* degenerate projection blow-up guard */
+    double sx = dx / steps, sy = dy / steps;
+    double x = x0, y = y0;
+    for (int i = 0; i <= steps; i++) {
+        int px = (int)x, py = (int)y;
+        if ((unsigned)px < (unsigned)fb->width && (unsigned)py < (unsigned)fb->height) {
+            uint32_t *p = (uint32_t *)(fb->back + (size_t)py * fb->stride) + px;
+            uint32_t v = *p;
+            int nr = (int)((v >> 16) & 0xFF) + r; if (nr > 255) nr = 255;
+            int ng = (int)((v >>  8) & 0xFF) + g; if (ng > 255) ng = 255;
+            int nb = (int)( v        & 0xFF) + b; if (nb > 255) nb = 255;
+            *p = ((uint32_t)nr << 16) | ((uint32_t)ng << 8) | (uint32_t)nb;
+        }
+        x += sx; y += sy;
+    }
+}
+
+void draw_tunnel(FBDev *fb, const int16_t *samples, int n)
+{
+    double now = now_sec();
+    double dt = (tunnel_last_tick > 0.0) ? now - tunnel_last_tick : 0.0;
+    if (dt < 0.0 || dt > 0.25) dt = 0.0;   /* clamp a long pause/clock jump, not a real frame gap */
+    tunnel_last_tick = now;
+
+    int half = n / 2;
+    double energy = 0.0;
+    for (int i = 0; i < half; i++) { int s = samples[i]; energy += s < 0 ? -s : s; }
+    if (half > 0) energy /= (double)half * 32768.0;
+    /* Amplified into a usable 0..1 range — see TUNNEL_ENERGY_AMP. */
+    double e = energy * TUNNEL_ENERGY_AMP;
+    if (e > 1.0) e = 1.0;
+
+    /* Beat: the instant level popping out above its own slow follower. */
+    tunnel_env_slow += (energy - tunnel_env_slow) * (1.0 - exp(-dt / 0.6));
+    int beat = (energy > tunnel_env_slow * TUNNEL_BEAT_RATIO &&
+                energy > TUNNEL_BEAT_FLOOR &&
+                now - tunnel_beat_at > TUNNEL_BEAT_HOLD);
+    if (beat) {
+        /* Tempo estimate from the gap to the previous beat — gaps beyond
+         * 2s are section breaks, not tempo, and would drag the average. */
+        double gap = now - tunnel_beat_at;
+        if (gap < 2.0) tunnel_beat_gap += (gap - tunnel_beat_gap) * 0.25;
+        tunnel_beat_at = now;
+        tunnel_boost   += 2.2 * (0.5 + e);                              /* forward kick */
+        tunnel_rot_vel += ((rand() & 1) ? 0.5 : -0.5) * (0.4 + e);      /* roll punch, random direction */
+    }
+    tunnel_boost   *= exp(-dt / 0.45);   /* the glide back down after each kick */
+    tunnel_rot_vel *= exp(-dt / 0.60);
+
+    /* Cruise speed follows the song's tempo (~60bpm -> ~0.9 rings/s,
+     * ~150bpm -> ~2.3), easing over a couple of seconds so a section
+     * change reads as the ride accelerating/braking rather than snapping.
+     * With no beats for a while (pause, ambient outro) it settles back to
+     * the resting rate. */
+    double cruise_target = (now - tunnel_beat_at < 2.5)
+        ? TUNNEL_BASE_SPEED * (0.55 + (60.0 / tunnel_beat_gap) / 110.0)
+        : TUNNEL_BASE_SPEED;
+    tunnel_cruise += (cruise_target - tunnel_cruise) * (1.0 - exp(-dt / 2.0));
+
+    /* Winding strength follows a slow energy average — see the statics'
+     * comment. Applied to the sway amplitudes below (camera and rings from
+     * the same value, so the camera always stays on the centerline). */
+    tunnel_amp_env += (e - tunnel_amp_env) * (1.0 - exp(-dt / 1.2));
+
+    tunnel_scroll    += dt * (tunnel_cruise + e * TUNNEL_ENERGY_SPEED * 0.6 + tunnel_boost);
+    tunnel_rot       += dt * (TUNNEL_ROT_RATE * (1.0 + e * 2.0) + tunnel_rot_vel);
+    tunnel_wobble_ph += dt * TUNNEL_WOBBLE_RATE;
+
+    /* Same "step to a new target every N seconds, ease toward it" shape as
+     * Nebula's colour scheme, but on its own hold/ease timing and via the
+     * frame-rate-independent exponential ease (1-e^-dt/tau) used elsewhere
+     * for the Now Spinning disc's spin-down — Nebula's own additive-per-
+     * call ease predates that and is tuned to a fixed assumed frame rate,
+     * not worth converting here since a fresh effect can just start right. */
+    double target_hue = (double)((int)(now / TUNNEL_HUE_HOLD)) * 2.39996;
+    tunnel_hue += (target_hue - tunnel_hue) * (1.0 - exp(-dt / TUNNEL_HUE_TAU));
+    int cr = (int)((0.5 + 0.5 * sin(tunnel_hue))           * 255.0);
+    int cg = (int)((0.5 + 0.5 * sin(tunnel_hue + 2.09439)) * 255.0);
+    int cb = (int)((0.5 + 0.5 * sin(tunnel_hue + 4.18879)) * 255.0);
+
+    double par = par_correction(fb);
+    double cx = fb->width / 2.0, cy = fb->height / 2.0;
+    double focal = fb->height * TUNNEL_FOCAL_FRAC;
+
+    /* The camera's own spot on the winding centerline — ring offsets are
+     * taken RELATIVE to this (see the TUNNEL_SWAY_* comment), which is
+     * exactly "the camera follows the tunnel's path". */
+    double sway_x = TUNNEL_SWAY_X * (0.45 + 0.90 * tunnel_amp_env);
+    double sway_y = TUNNEL_SWAY_Y * (0.45 + 0.90 * tunnel_amp_env);
+    double cam_x = sway_x * sin(tunnel_scroll * TUNNEL_FREQ_X);
+    double cam_y = sway_y * cos(tunnel_scroll * TUNNEL_FREQ_Y);
+
+    double depth[TUNNEL_RINGS];
+    double vx[TUNNEL_RINGS][TUNNEL_SIDES], vy[TUNNEL_RINGS][TUNNEL_SIDES];
+    int    rr[TUNNEL_RINGS], rg[TUNNEL_RINGS], rb[TUNNEL_RINGS];
+
+    for (int i = 0; i < TUNNEL_RINGS; i++) {
+        double d = (double)i - tunnel_scroll;
+        d -= floor(d / TUNNEL_RINGS) * TUNNEL_RINGS;   /* wrap into [0, RINGS) — the flythrough loop */
+        depth[i] = d;
+        double s = tunnel_scroll + d;   /* absolute position along the tunnel — the coordinate the winding path and warp live in, so both stream past as we travel */
+        double z = TUNNEL_NEAR_Z + d * TUNNEL_RING_SPACING;
+        double scale = focal / z;
+
+        double ring_cx = cx + (sway_x * sin(s * TUNNEL_FREQ_X) - cam_x) * scale * par;
+        double ring_cy = cy + (sway_y * cos(s * TUNNEL_FREQ_Y) - cam_y) * scale;
+
+        for (int j = 0; j < TUNNEL_SIDES; j++) {
+            double theta = j * (2.0 * M_PI / TUNNEL_SIDES) + tunnel_rot;
+            double wob = 1.0 + TUNNEL_WOBBLE_AMT *
+                         sin(theta * TUNNEL_WOBBLE_FREQ + s * 0.8 + tunnel_wobble_ph);
+            double r  = TUNNEL_BASE_R * wob;
+            double ry = r * scale;
+            double rx = ry * par;   /* same rx=ry*par relationship as the Now Spinning disc, for a circular (not oval) cross-section */
+            vx[i][j] = ring_cx + rx * cos(theta);
+            vy[i][j] = ring_cy + ry * sin(theta);
+        }
+
+        /* Depth cueing: near rings at full colour fading toward the far
+         * end — on top of this the additive overdraw where distant lines
+         * converge still builds the bright "light at the end" spot. */
+        double fade = 0.30 + 0.70 * (1.0 - d / (double)TUNNEL_RINGS);
+        rr[i] = (int)(cr * fade);
+        rg[i] = (int)(cg * fade);
+        rb[i] = (int)(cb * fade);
+
+        /* A ring whose depth JUMPED up wrapped back to the far end this
+         * frame — it's a "new" ring now, so any still-fading panel glow
+         * it carried dies with the old one instead of teleporting. */
+        if (d > tunnel_prev_depth[i] + TUNNEL_RINGS * 0.5)
+            for (int j = 0; j < TUNNEL_SIDES; j++) tunnel_lit[i][j] = 0.0f;
+        tunnel_prev_depth[i] = d;
+    }
+
+    /* Panel glow: fade what's lit, and light a few random wall panels on
+     * every beat (a couple more the harder it hits). Panels keep their
+     * (ring, side) slot, so a lit one travels toward the camera with its
+     * ring and fades on the way — that's the "painted in rhythm" pulse. */
+    for (int i = 0; i < TUNNEL_RINGS; i++)
+        for (int j = 0; j < TUNNEL_SIDES; j++)
+            if (tunnel_lit[i][j] > 0.0f) {
+                tunnel_lit[i][j] *= (float)exp(-dt / TUNNEL_LIT_TAU);
+                if (tunnel_lit[i][j] < 0.02f) tunnel_lit[i][j] = 0.0f;
+            }
+    if (beat) {
+        int hits = 3 + (int)(e * 4.0);
+        for (int h = 0; h < hits; h++) {
+            int i = rand() % TUNNEL_RINGS;
+            if (depth[i] < TUNNEL_LIT_MIN_D || depth[i] > TUNNEL_RINGS - 2) continue;
+            tunnel_lit[i][rand() % TUNNEL_SIDES] = 1.0f;
+        }
+    }
+    for (int i = 0; i < TUNNEL_RINGS; i++) {
+        int i2 = (i + 1) % TUNNEL_RINGS;
+        if (depth[i2] < depth[i]) continue;       /* the wrap seam — no panel there, same as no rail */
+        if (depth[i]  < TUNNEL_LIT_MIN_D) continue;   /* nearest panels project enormous — skip, same reason spawning does */
+        for (int j = 0; j < TUNNEL_SIDES; j++) {
+            float lit = tunnel_lit[i][j];
+            if (lit <= 0.0f) continue;
+            int j2 = (j + 1) % TUNNEL_SIDES;
+            double qx[4] = { vx[i][j], vx[i][j2], vx[i2][j2], vx[i2][j] };
+            double qy[4] = { vy[i][j], vy[i][j2], vy[i2][j2], vy[i2][j] };
+            /* Fill at a fraction of the line colour so the grid stays
+             * legible over a lit panel (additive, so overlap just glows). */
+            tunnel_fill_quad(fb, qx, qy,
+                             (int)(cr * 0.75 * lit),
+                             (int)(cg * 0.75 * lit),
+                             (int)(cb * 0.75 * lit));
+        }
+    }
+
+    /* Ring edges (the cross-section polygons). */
+    for (int i = 0; i < TUNNEL_RINGS; i++)
+        for (int j = 0; j < TUNNEL_SIDES; j++) {
+            int j2 = (j + 1) % TUNNEL_SIDES;
+            tunnel_line(fb, vx[i][j], vy[i][j], vx[i][j2], vy[i][j2], rr[i], rg[i], rb[i]);
+        }
+
+    /* Rails connecting depth-adjacent rings — array-adjacent rings ARE
+     * depth-adjacent by construction (each one step further in i is
+     * exactly one step further in wrapped depth), except at the single
+     * seam each frame where depth wraps back to 0; skip that one pair
+     * (depth[i2] < depth[i]) or it'd draw a line spanning the whole
+     * tunnel, camera to horizon. */
+    for (int i = 0; i < TUNNEL_RINGS; i++) {
+        int i2 = (i + 1) % TUNNEL_RINGS;
+        if (depth[i2] < depth[i]) continue;
+        for (int j = 0; j < TUNNEL_SIDES; j++)
+            tunnel_line(fb, vx[i][j], vy[i][j], vx[i2][j], vy[i2][j], rr[i], rg[i], rb[i]);
+    }
+}
+
 /* The VizGif background — ONE user-supplied animated GIF at a fixed path,
  * appended as a single extra now-playing mode after the fixed ones
  * (Starfield/Rain/Nebula/Now Spinning/Toasty). Deliberately exactly one

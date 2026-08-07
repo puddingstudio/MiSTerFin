@@ -31,7 +31,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [Now playing (music)](#now-playing)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
-  - [Unreleased](#unreleased) · [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
+  - [v1.0.0](#v1-0-0) · [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
 - [Credits](#credits)
 - [Thanks](#thanks)
 - [Licence](#licence)
@@ -70,7 +70,7 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 | | | |
 |:---:|:---:|:---:|
 | <img src="docs/images/screenshots/now-playing.png" width="260"><br>Now playing (VU meters) | <img src="docs/images/screenshots/now-playing-rain.png" width="260"><br>Rain | <img src="docs/images/screenshots/now-playing-nebula.png" width="260"><br>Nebula visualizer |
-| <img src="docs/images/screenshots/now-playing-toasty.png" width="260"><br>Toasty screensaver | <img src="docs/images/screenshots/now-playing-spinning.png" width="260"><br>Now Spinning | |
+| <img src="docs/images/screenshots/now-playing-spinning.png" width="260"><br>Now Spinning | <img src="docs/images/screenshots/now-playing-tunnel.png" width="260"><br>Tunnel | <img src="docs/images/screenshots/now-playing-toasty.png" width="260"><br>Toasty Squadron |
 
 **About**
 
@@ -350,15 +350,15 @@ Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, incl
 
 ## <a id="changelog"></a>Changelog
 
-### <a id="unreleased"></a>Unreleased
-- New "Now Spinning" music visualizer — album art as a spinning CD with a reactive graphic-EQ bar underneath
-- Smoother animations throughout — every screen now redraws at full refresh rate (the same fix the home screen got in v0.9.9), plus motion blur on the starfield background for less choppy motion
-- VizGif — a single user-supplied animated GIF background for the music player (drop the file in, that's it)
-- Home carousel: consistent spacing between library cards regardless of name length
+### <a id="v1-0-0"></a>v1.0.0
 - Fixed choppy video playback when a title's frame rate doesn't match the display's (e.g. NTSC-rate content on a PAL setup)
 - Fixed audio distortion on loud material, and fixed a resampling quality issue that showed up on music
-- Jellyfin dashboard: accurate transcoding info, remote pause/play/stop, and admin messages now show as an on-screen banner
 - Fixed a multi-second delay when exiting video playback
+- Home carousel: consistent spacing between library cards regardless of name length
+- New "Now Spinning" music visualizer — album art as a spinning CD with a reactive graphic-EQ bar underneath
+- New "Tunnel" music visualizer — a low-poly 3D wireframe flythrough, warping and accelerating with the music, with wall panels that light up on the beat
+- Smoother animations throughout — every screen now redraws at full refresh rate (the same fix the home screen got in v0.9.9), plus motion blur on the starfield background for less choppy motion
+- Jellyfin dashboard: accurate transcoding info, remote pause/play/stop, and admin messages now show as an on-screen banner
 - Internal code hygiene
 
 ### <a id="v0-9-9"></a>v0.9.9

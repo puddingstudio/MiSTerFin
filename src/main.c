@@ -441,32 +441,30 @@ static int    g_shuffle_mode = 0;
  * g_root_list_mode. Indices 2/3/4 are immersive modes: they hide the
  * clock/title/timeline/VU and just show an enlarged centered cover over
  * the effect (see draw_now_playing). */
-#define NOW_PLAYING_BG_COUNT  5
-#define NOW_PLAYING_BG_NEBULA 2
-#define NOW_PLAYING_BG_SPIN   3
-#define NOW_PLAYING_BG_TOASTY 4
+#define NOW_PLAYING_BG_COUNT   6
+#define NOW_PLAYING_BG_NEBULA  2
+#define NOW_PLAYING_BG_SPIN    3
+#define NOW_PLAYING_BG_TUNNEL  4
+#define NOW_PLAYING_BG_TOASTY  5   /* last in the cycle, per user request */
 static int    g_now_playing_bg = 0;
-static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "Now Spinning", "Toasty Squadron" };
+static const char *NOW_PLAYING_BG_NAMES[] = { "Starfield", "Rain", "Nebula", "Now Spinning", "Tunnel", "Toasty Squadron" };
 /* Label shows briefly on change then disappears, rather than sitting on
  * screen permanently — set to now_sec()+1.5 wherever g_now_playing_bg
  * changes (see the STATE_PLAYING_AUDIO SELECT handling), 0 = not shown. */
 static double g_now_playing_bg_shown_until = 0.0;
 
-/* Mode == NOW_PLAYING_BG_COUNT is VizGif, the single user-supplied GIF
- * background (see gifviz_scan/visualizers.h) — appended after the fixed
- * modes above, and only part of the SELECT cycle at all when the user's
- * vizgif.gif actually exists. Both helpers fall back to the fixed list
- * untouched when it doesn't, so the feature is a no-op until someone
- * drops the file in. */
+/* VizGif (the user-supplied GIF background, still implemented in
+ * visualizers.c) is deliberately NOT in the cycle right now — pulled per
+ * user request pending a better default GIF; these helpers are where it
+ * plugs back in when it returns. */
 static int now_playing_mode_count(void)
 {
-    return NOW_PLAYING_BG_COUNT + (gifviz_present() ? 1 : 0);
+    return NOW_PLAYING_BG_COUNT;
 }
 
 static const char *now_playing_mode_name(int mode)
 {
-    if (mode < NOW_PLAYING_BG_COUNT) return NOW_PLAYING_BG_NAMES[mode];
-    return "VizGif";
+    return NOW_PLAYING_BG_NAMES[mode];
 }
 /* In the immersive backgrounds (Nebula/Toasty) the track title is otherwise
  * hidden, so on each track change it's flashed at the top for a few seconds
@@ -4047,18 +4045,18 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 
     int nebula = (g_now_playing_bg == NOW_PLAYING_BG_NEBULA);
     int spin_mode = (g_now_playing_bg == NOW_PLAYING_BG_SPIN);
-    int gif_mode = (g_now_playing_bg >= NOW_PLAYING_BG_COUNT);
-    /* Nebula, Toasty Squadron, Now Spinning, and the GIF modes all use the
+    int tunnel_mode = (g_now_playing_bg == NOW_PLAYING_BG_TUNNEL);
+    /* Nebula, Toasty Squadron, Now Spinning, and Tunnel all use the
      * immersive layout — just an overlay (cover + text) over the effect
      * plus the bottom hint bar (Toasty's sprites still fly over the top,
      * see draw_toasty_fg below). */
-    int immersive = nebula || spin_mode || gif_mode || (g_now_playing_bg == NOW_PLAYING_BG_TOASTY);
+    int immersive = nebula || spin_mode || tunnel_mode || (g_now_playing_bg == NOW_PLAYING_BG_TOASTY);
 
     if      (g_now_playing_bg == 1) draw_rain(fb);
     else if (nebula)                 draw_nebula(fb, af_buf, af_n);
     else if (g_now_playing_bg == NOW_PLAYING_BG_TOASTY) { draw_toasty_bg(fb); draw_now_playing_gradient(fb); }
     else if (spin_mode)             {}   /* its own background (the EQ bar) is drawn below, alongside the disc — needs the layout math there */
-    else if (gif_mode)               draw_gif_bg(fb);
+    else if (tunnel_mode)            draw_tunnel(fb, af_buf, af_n);
     else                            draw_starfield(fb);
 
     /* The brief "which background" label on SELECT is shown in every mode
@@ -4069,10 +4067,10 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
     /* In the immersive modes the title is otherwise hidden, so flash it at the
      * top for a few seconds on each track change (see g_np_title_shown_until,
      * set in play_audio). Nudged down a line if the bg-name label happens to
-     * be up at the same moment so the two don't overlap. GIF mode excluded:
+     * be up at the same moment so the two don't overlap. Tunnel excluded:
      * it shows the title permanently in its own corner overlay below, so
      * this transient flash would just be redundant clutter there. */
-    if (immersive && !gif_mode && now_sec() < g_np_title_shown_until) {
+    if (immersive && !tunnel_mode && now_sec() < g_np_title_shown_until) {
         int ty0 = (now_sec() < g_now_playing_bg_shown_until) ? SAFE_Y + 12 : SAFE_Y;
         char tflash[300];
         snprintf(tflash, sizeof(tflash), "%s", it->name);
@@ -4085,27 +4083,18 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
             draw_text(fb, SAFE_X, SAFE_Y + 10, "PAUSED", 1, COL_RESUME);
     }
 
-    if (gif_mode) {
-        /* VizGif's own overlay, per user spec: the (small) cover CENTERED
-         * over the GIF, title/artist small in the top-left, and the clock
-         * big (scale 2 — twice the usual header clock) in the top-right.
-         * Deliberately NOT the other immersive modes' big centered cover:
-         * the GIF stays the star, the cover is a compact centerpiece. */
-        if (g_nowplaying_cover_px) {
-            int cover_h = (fb->height == 288) ? 100 : 84;
-            int cover_w = (int)(cover_h * par_correction(fb) + 0.5);
-            int top    = SAFE_Y;
-            int bottom = fb->height - 8 - SAFE_Y_BOT - 6;
-            blit_fit_centered(fb, g_nowplaying_cover_px, g_nowplaying_cover_w, g_nowplaying_cover_h,
-                               fb->width / 2, (top + bottom) / 2, cover_w, cover_h, 255);
-        }
+    if (tunnel_mode) {
+        /* Tunnel's own corner overlay (inherited from the retired VizGif
+         * layout, per user request): title/artist small in the top-left,
+         * the clock big (scale 2 — twice the usual header clock) in the
+         * top-right. The big centered cover still comes from the shared
+         * immersive block below — this only ADDS the corners. */
 
-        /* Same top edge as the clock on the opposite corner, per user
-         * request — except for the brief window right after switching
-         * modes, where the "which background" name label (e.g. "VizGif")
-         * occupies this exact row; bumped down out of its way for that
-         * window, same pattern the other immersive modes use just above,
-         * and back up the instant the label clears. */
+        /* Same top edge as the clock on the opposite corner — except for
+         * the brief window right after switching modes, where the "which
+         * background" name label occupies this exact row; bumped down out
+         * of its way for that window, same pattern the other immersive
+         * modes use just above, and back up the instant the label clears. */
         int ty0 = (now_sec() < g_now_playing_bg_shown_until) ? SAFE_Y + 12 : SAFE_Y;
         char tflash[300];
         snprintf(tflash, sizeof(tflash), "%s", it->name);
@@ -4120,16 +4109,13 @@ static void draw_now_playing(FBDev *fb, JfItem *it, double pos)
 
         /* draw_clock() is the shared scale-1 header clock — this mode
          * wants it double-size per user request, so it draws its own. */
-        {
-            time_t now_t = time(NULL);
-            struct tm now_tm;
-            localtime_r(&now_t, &now_tm);
-            char clock_buf[8];
-            snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
-            draw_text(fb, fb->width - SAFE_X - text_width(fb, clock_buf, 2), SAFE_Y,
-                      clock_buf, 2, COL_HINT);
-        }
-        goto np_hint;
+        time_t now_t = time(NULL);
+        struct tm now_tm;
+        localtime_r(&now_t, &now_tm);
+        char clock_buf[8];
+        snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", now_tm.tm_hour, now_tm.tm_min);
+        draw_text(fb, fb->width - SAFE_X - text_width(fb, clock_buf, 2), SAFE_Y,
+                  clock_buf, 2, COL_HINT);
     }
 
     if (immersive) {
@@ -4435,45 +4421,43 @@ static int run_preview_now_spinning(double t_offset)
     return 0;
 }
 
-/* Hidden dev tool for the VizGif now-playing mode — exercises the real
- * draw_now_playing() (not a hand-rolled layout copy), so this checks the
- * actual centered-cover/title/clock overlay against whatever vizgif.gif
- * is in place. */
-static int run_preview_gifviz(void)
+/* Hidden dev tool for the Tunnel now-playing mode — runs draw_tunnel in a
+ * real-time loop (it's dt-based, so faking time isn't an option) at a
+ * settable constant "energy" level, for tuning speed/wobble/colour without
+ * a live playback round-trip. Dumps only the final frame like every other
+ * preview tool; TUNNEL_SECS/TUNNEL_ENERGY are read from the environment so
+ * a tuning pass doesn't need a rebuild between tries. */
+static int run_preview_tunnel(void)
 {
     FBDev fb;
     if (fb_open(&fb, "/dev/fb0") < 0) { fprintf(stderr, "no framebuffer\n"); return 1; }
-    SAFE_Y = (int)(SAFE_X / par_correction(&fb) + 0.5);
 
-    gifviz_scan();
-    if (!gifviz_present()) { fprintf(stderr, "no vizgif.gif found\n"); return 1; }
-    gifviz_load(&fb);
+    double secs   = getenv("TUNNEL_SECS")   ? atof(getenv("TUNNEL_SECS"))   : 3.0;
+    double energy = getenv("TUNNEL_ENERGY") ? atof(getenv("TUNNEL_ENERGY")) : 0.0;
+    double bpm    = getenv("TUNNEL_BPM")    ? atof(getenv("TUNNEL_BPM"))    : 0.0;
+    int16_t buf[256];
 
-    int cw = 120, ch = 120;
-    uint8_t *cover = malloc((size_t)cw * ch * 4);
-    for (int y = 0; y < ch; y++) {
-        for (int x = 0; x < cw; x++) {
-            uint8_t *p = cover + ((size_t)y * cw + x) * 4;
-            int qx = x < cw / 2, qy = y < ch / 2;
-            p[0] = qx && qy ? 220 : (qx && !qy ? 40  : (!qx && qy ? 40  : 220));
-            p[1] = qx && qy ? 40  : (qx && !qy ? 220 : (!qx && qy ? 40  : 220));
-            p[2] = qx && qy ? 40  : (qx && !qy ? 40  : (!qx && qy ? 220 : 40));
-            p[3] = 255;
+    double start = now_sec();
+    int frames = 0;
+    while (now_sec() - start < secs) {
+        /* Optional TUNNEL_BPM pulses the level like a kick drum would —
+         * a flat constant level can never trip the transient detector,
+         * so without this the beat-lit panels are untestable headless. */
+        double lvl = energy;
+        if (bpm > 0.0) {
+            double ph = fmod((now_sec() - start) * bpm / 60.0, 1.0);
+            lvl = energy * (0.25 + 0.75 * exp(-ph * 6.0));
         }
+        int16_t s = (int16_t)(lvl * 32767.0);
+        for (int i = 0; i < 256; i++) buf[i] = s;
+
+        fb_clear(&fb);
+        draw_tunnel(&fb, buf, 256);
+        fb_flip(&fb);
+        frames++;
+        if (fb.headless) usleep(20000);
     }
-    g_nowplaying_cover_px = cover;
-    g_nowplaying_cover_w = cw;
-    g_nowplaying_cover_h = ch;
-
-    g_now_playing_bg = NOW_PLAYING_BG_COUNT;   /* the VizGif mode */
-
-    JfItem it;
-    memset(&it, 0, sizeof(it));
-    snprintf(it.name, sizeof(it.name), "Preview Track Title");
-    snprintf(it.artist, sizeof(it.artist), "Preview Artist Name");
-
-    draw_now_playing(&fb, &it, 0.0);
-    free(cover);
+    fprintf(stderr, "tunnel: %d frames in %.2fs = %.1f fps\n", frames, now_sec() - start, frames / (now_sec() - start));
     return 0;
 }
 
@@ -4675,12 +4659,11 @@ int main(int argc, char **argv)
                                                                                     : SUBMENU_TAB_SUBS);
     if (argc > 1 && strcmp(argv[1], "--preview-now-spinning") == 0)
         return run_preview_now_spinning(argc > 2 ? atof(argv[2]) : 0.0);
-    if (argc > 1 && strcmp(argv[1], "--preview-gifviz") == 0)
-        return run_preview_gifviz();
+    if (argc > 1 && strcmp(argv[1], "--preview-tunnel") == 0)
+        return run_preview_tunnel();
 
     srand((unsigned)time(NULL));   /* for the About screen's starfield */
     grid_init(&g_cfg);             /* just stores the pointer — config itself loads below */
-    gifviz_scan();                 /* just a presence check — the GIF decodes lazily on first select */
 
     signal(SIGTERM,  on_signal);
     signal(SIGINT,   on_signal);
@@ -5449,11 +5432,6 @@ int main(int argc, char **argv)
                      * of the load being the first thing drawn this tick. */
                     draw_now_playing(&fb, cur, play_position());
                     toasty_load(&fb);
-                } else if (g_now_playing_bg >= NOW_PLAYING_BG_COUNT && !gifviz_is_loaded()) {
-                    /* Same one-frame-first pattern as Toasty above — the
-                     * screen's own UI stays visible while the GIF decodes. */
-                    draw_now_playing(&fb, cur, play_position());
-                    gifviz_load(&fb);
                 }
             } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
                 g_last_progress_report = loop_now;
