@@ -715,36 +715,59 @@ static int fetch_frame_window(int start_index)
          * "Continue...". The full name is used for the frame title once you
          * drill in (see the STATE_BROWSE handler), where there's room. */
         int n_synth = 0;
-        static const struct { const char *id, *name; int kind; } synth[] = {
-            { JF_VIEW_RESUME, "Continue", JF_SYNTH_RESUME },
-            { JF_VIEW_NEXTUP, "Next Up",  JF_SYNTH_NEXTUP },
-        };
-        for (int s = 0; s < 2; s++) {
-            JfItem probe[1];
-            int64_t total = 0;
-            int got = (s == 0) ? jf_list_resume(&g_cfg, probe, 1, &total)
-                                : jf_list_nextup(&g_cfg, probe, 1, &total);
-            if (got <= 0) continue;
-            if (total <= 0) total = got;
-
-            JfItem *card = &g_items[n_synth];
-            memset(card, 0, sizeof(*card));
-            strncpy(card->id,   synth[s].id,   sizeof(card->id) - 1);
-            strncpy(card->name, synth[s].name, sizeof(card->name) - 1);
-            card->type = JF_TYPE_FOLDER;
-            card->synthetic = synth[s].kind;
-            card->index_number = -1;
-            g_view_counts[n_synth] = total;
-            n_synth++;
-        }
-
+        int n_views = 0;
         int live_tv_slot = g_tunarr_available ? 1 : 0;
-        int n_views = jf_list_views(&g_cfg, g_items + n_synth,
+
+        /* g_cfg.server[0] is empty precisely when jellyfin.conf never
+         * loaded (jf_config_load memsets cfg to 0 and only sets server on
+         * success) — the Tunarr-only startup path (see
+         * startup_resolve_thread's STARTUP_TUNARR_ONLY branch) reaches this
+         * frame without ever having a real Jellyfin server to ask, so
+         * skip straight to just the synthetic Live TV card below rather
+         * than issuing Jellyfin requests against an empty config. */
+        if (g_cfg.server[0]) {
+            /* Continue Watching and Next Up go in front of the real libraries:
+             * they're what someone opening the app usually wants, and putting
+             * them first means the carousel starts there. Each is added only when
+             * it actually has something in it — an empty "Continue Watching" card
+             * is worse than no card, and both are empty on a fresh install.
+             *
+             * Probed with Limit=1 rather than fetched in full: all that's needed
+             * here is the count for the card, and drilling in re-fetches anyway. */
+            /* Card labels are short because the carousel draws them at double
+             * size and clips to CAROUSEL_CARD_W — "Continue Watching" came out as
+             * "Continue...". The full name is used for the frame title once you
+             * drill in (see the STATE_BROWSE handler), where there's room. */
+            static const struct { const char *id, *name; int kind; } synth[] = {
+                { JF_VIEW_RESUME, "Continue", JF_SYNTH_RESUME },
+                { JF_VIEW_NEXTUP, "Next Up",  JF_SYNTH_NEXTUP },
+            };
+            for (int s = 0; s < 2; s++) {
+                JfItem probe[1];
+                int64_t total = 0;
+                int got = (s == 0) ? jf_list_resume(&g_cfg, probe, 1, &total)
+                                    : jf_list_nextup(&g_cfg, probe, 1, &total);
+                if (got <= 0) continue;
+                if (total <= 0) total = got;
+
+                JfItem *card = &g_items[n_synth];
+                memset(card, 0, sizeof(*card));
+                strncpy(card->id,   synth[s].id,   sizeof(card->id) - 1);
+                strncpy(card->name, synth[s].name, sizeof(card->name) - 1);
+                card->type = JF_TYPE_FOLDER;
+                card->synthetic = synth[s].kind;
+                card->index_number = -1;
+                g_view_counts[n_synth] = total;
+                n_synth++;
+            }
+
+            n_views = jf_list_views(&g_cfg, g_items + n_synth,
                                      JF_MAX_ITEMS - n_synth - live_tv_slot);
-        for (int i = 0; i < n_views; i++) {
-            JfItem *v = &g_items[n_synth + i];
-            g_view_counts[n_synth + i] =
-                jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
+            for (int i = 0; i < n_views; i++) {
+                JfItem *v = &g_items[n_synth + i];
+                g_view_counts[n_synth + i] =
+                    jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
+            }
         }
         g_item_count = n_synth + n_views;
 
@@ -2783,6 +2806,7 @@ static void player_pause_toggle(void)
 }
 
 static void play(FBDev *fb, const char *item_id, double offset_secs);   /* forward decl — used below */
+static void play_channel(FBDev *fb, const TunarrChannel *ch);   /* forward decl — used below */
 
 /* Jellyfin's transcode stream is a plain progressive HTTP GET with
  * "Accept-Ranges: none" (confirmed against a real server) — there is no
@@ -3710,6 +3734,24 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
         player_stop();
         jf_log_line("play: stopped by user at %.0fs", pos);
         return PLAYER_FRAME_ENDED;
+    } else if (g_playing_source == PLAY_SOURCE_TUNARR && g_channel_count > 0 &&
+               (inp & (INP_L | INP_R | INP_SELECT))) {
+        /* Real "zap" mode: change channel without leaving playback and
+         * without going back through the guide screen first. Same
+         * stop-then-restart pattern player_seek() uses for a Jellyfin seek
+         * (player_stop() kills the running mplayer, play_channel() forks a
+         * fresh one in its place) — works whether paused or not, since
+         * play_channel() itself resets g_paused to 0. Takes over L/R here
+         * instead of their Jellyfin-playback VSync-toggle binding (see the
+         * g_paused/else branches below) — the two never overlap, gated on
+         * g_playing_source. Checked before the pause/unpause split so it
+         * fires the same way in either state. */
+        if (inp & INP_L)        channel_move_sel(-1);
+        else if (inp & INP_R)   channel_move_sel(+1);
+        else                    g_channel_sel = rand() % g_channel_count;
+        player_stop();
+        play_channel(fb, &g_channels[g_channel_sel]);
+        return PLAYER_FRAME_HANDLED;
     } else if (g_paused) {
         /* The subtitle/audio-track/picture-mode submenu is entirely
          * Jellyfin-shaped (its "confirm" actions restart playback via
@@ -5003,6 +5045,12 @@ static void redraw_current_screen(FBDev *fb, AppState state)
 #define STARTUP_PENDING -2
 #define STARTUP_CONFIG_MISSING -3
 #define STARTUP_NEED_QUICK_CONNECT -4
+/* jellyfin.conf is absent/incomplete, but tunarr.conf is present and
+ * usable — skip the whole Jellyfin auth flow and land straight on the
+ * root screen with only the synthetic Live TV card (see fetch_frame_window's
+ * FRAME_VIEWS case), instead of the config-missing error screen. A real
+ * no-Jellyfin-no-Tunarr setup still gets STARTUP_CONFIG_MISSING as before. */
+#define STARTUP_TUNARR_ONLY -5
 static pthread_mutex_t g_startup_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_startup_result = STARTUP_PENDING;
 
@@ -5019,9 +5067,23 @@ static void *startup_resolve_thread(void *arg)
     (void)arg;
     int result;
 
+    /* Checked before the Jellyfin config load (not just additively after
+     * it, as this used to be) so a Tunarr-only setup — tunarr.conf present,
+     * jellyfin.conf absent — can be detected below instead of falling into
+     * the "no Jellyfin config" error screen. A missing/absent tunarr.conf
+     * just leaves g_tunarr_available at 0 and every other branch behaves
+     * exactly as it did before this feature existed. */
+    g_tunarr_available = tunarr_config_load(&g_tunarr_cfg);
+
     if (!jf_config_load(&g_cfg)) {
+        if (g_tunarr_available) {
+            result = STARTUP_TUNARR_ONLY;
+            startup_enter_browse();
+        } else {
+            result = STARTUP_CONFIG_MISSING;
+        }
         pthread_mutex_lock(&g_startup_mutex);
-        g_startup_result = STARTUP_CONFIG_MISSING;
+        g_startup_result = result;
         pthread_mutex_unlock(&g_startup_mutex);
         return NULL;
     }
@@ -5031,11 +5093,6 @@ static void *startup_resolve_thread(void *arg)
     jf_device_id_init(&g_cfg);
 
     jf_log_init(&g_cfg);   /* no-op unless "DEBUGLOG" is in jellyfin.conf */
-
-    /* Additive, never blocking: a missing/absent tunarr.conf just leaves
-     * g_tunarr_available at 0 and the Jellyfin startup path below continues
-     * exactly as it did before this feature existed. */
-    g_tunarr_available = tunarr_config_load(&g_tunarr_cfg);
 
     if (jf_token_load(&g_cfg) && jf_credential_works(&g_cfg)) {
         /* A previously earned Quick Connect token, still accepted. Checked
@@ -5245,7 +5302,7 @@ int main(int argc, char **argv)
         pthread_create(&qc_tid, NULL, quick_connect_thread, NULL);
         qc_running = 1;
         draw_quick_connect(&fb);
-    } else if (resolved == 1) {
+    } else if (resolved == 1 || resolved == STARTUP_TUNARR_ONLY) {
         state = STATE_BROWSE;
     } else {
         state = STATE_CONFIG_ERROR;
@@ -5282,6 +5339,7 @@ int main(int argc, char **argv)
                 resolved == 1 ? "signed in (saved token or API key)" :
                 resolved == STARTUP_NEED_QUICK_CONNECT ? "Quick Connect required" :
                 resolved == STARTUP_CONFIG_MISSING ? "jellyfin.conf not found or incomplete" :
+                resolved == STARTUP_TUNARR_ONLY ? "Tunarr-only (no jellyfin.conf)" :
                 g_setup_reason);
 
     /* Open the server's command socket (admin messages, dashboard remote
