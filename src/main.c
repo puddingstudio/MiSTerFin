@@ -273,6 +273,23 @@ static void emergency_cleanup(void)
     cursor_show();
 }
 
+/* crash.log deliberately only ever records the raw signal number — nothing
+ * more is safe to do from inside a signal handler (no backtrace, no
+ * symbolication), and there's no crash-report infrastructure on a MiSTer to
+ * hand a core dump to anyway.
+ *
+ * When that alone isn't enough to localize a real crash (confirmed
+ * necessary once: a stack-buffer overflow in fb_blit()/fb_blit_opaque(),
+ * see src/fb.c — sx_row[640] was hardcoded on the assumption the
+ * framebuffer is always <=640px wide, which a 1280-wide HDMI/scaler
+ * framebuffer overflowed), the fix isn't more signal-handler cleverness —
+ * it's temporary jf_log_line() trace calls (see jellyfin.h's own doc
+ * comment; needs DEBUGLOG set in jellyfin.conf) bracketing the suspected
+ * code path, one per step. Rebuild, reproduce once on the real device, and
+ * whichever trace line is LAST in debug.log is exactly where it died —
+ * narrower than a stack trace would even give you, since it survives a
+ * corrupted stack that a real backtrace wouldn't. Remove the trace calls
+ * once the bug is found; they're not meant to stay in the tree. */
 static void on_fatal(int s)
 {
     int lfd = open(CRASH_LOG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -530,51 +547,36 @@ static void info_assets_free(void)
  * wait (several sequential downloads) has visible feedback. */
 static void info_assets_load(FBDev *fb, const JfItem *list_item, int *spinner_frame)
 {
-    jf_log_line("trace: info_assets_load entered, id=%s", list_item->id);   /* TEMP DEBUG */
     info_assets_free();
-    jf_log_line("trace: info_assets_free done, fetching details");   /* TEMP DEBUG */
 
     if (!jf_get_item_details(&g_cfg, list_item->id, &g_info_item))
         g_info_item = *list_item;   /* degrade gracefully: keep the shallow row copy */
-    jf_log_line("trace: details fetched, backdrop_tag=%s logo_tag=%s cast_count=%d",
-                g_info_item.backdrop_tag, g_info_item.logo_tag, g_info_item.cast_count);   /* TEMP DEBUG */
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
-    jf_log_line("trace: spinner 1 drawn");   /* TEMP DEBUG */
     if (g_info_item.backdrop_tag[0]) {
         int dl_ok = jf_download_item_image(&g_cfg, g_info_item.backdrop_item_id, "Backdrop/0",
                                             g_info_item.backdrop_tag, 640, POSTER_TMP);
-        jf_log_line("trace: backdrop download dl_ok=%d", dl_ok);   /* TEMP DEBUG */
         if (dl_ok)
             g_backdrop_px = load_image_tmp(POSTER_TMP, &g_backdrop_w, &g_backdrop_h);
-        jf_log_line("trace: backdrop decoded px=%p w=%d h=%d",
-                    (void*)g_backdrop_px, g_backdrop_w, g_backdrop_h);   /* TEMP DEBUG */
     }
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
-    jf_log_line("trace: spinner 2 drawn");   /* TEMP DEBUG */
     if (g_info_item.logo_tag[0]) {
         int dl_ok = jf_download_item_image(&g_cfg, g_info_item.logo_item_id, "Logo",
                                             g_info_item.logo_tag, 400, POSTER_TMP);
-        jf_log_line("trace: logo download dl_ok=%d", dl_ok);   /* TEMP DEBUG */
         if (dl_ok)
             g_logo_px = load_image_tmp(POSTER_TMP, &g_logo_w, &g_logo_h);
-        jf_log_line("trace: logo decoded px=%p w=%d h=%d",
-                    (void*)g_logo_px, g_logo_w, g_logo_h);   /* TEMP DEBUG */
     }
 
     int cast_n = g_info_item.cast_count;
     if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
-    jf_log_line("trace: about to load %d cast images", cast_n);   /* TEMP DEBUG */
     for (int i = 0; i < cast_n; i++) {
         draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
         JfPerson *p = &g_info_item.cast[i];
         if (!p->image_tag[0]) continue;
         if (jf_download_item_image(&g_cfg, p->id, "Primary", p->image_tag, 48, POSTER_TMP))
             g_cast_px[i] = load_image_tmp(POSTER_TMP, &g_cast_px_w[i], &g_cast_px_h[i]);
-        jf_log_line("trace: cast[%d] loaded px=%p", i, (void*)g_cast_px[i]);   /* TEMP DEBUG */
     }
-    jf_log_line("trace: info_assets_load returning");   /* TEMP DEBUG */
 }
 
 /* ── loading spinner (animated GIF, shown while (re)connecting to the
@@ -3816,7 +3818,6 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
 
 static void play(FBDev *fb, const char *item_id, double offset_secs)
 {
-    jf_log_line("trace: play() entered");   /* TEMP DEBUG */
     g_playing_source = PLAY_SOURCE_JELLYFIN;
     g_seek_accum = 0.0;
     g_seek_fire_at = 0.0;
@@ -3839,16 +3840,12 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
      * headroom for a quality bump too. */
     int64_t start_ticks = (int64_t)(offset_secs * 10000000.0);
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
-    jf_log_line("trace: session id made");   /* TEMP DEBUG */
 
     char url[700];
     const JfStreamProfile profile = stream_profile();
-    jf_log_line("trace: stream_profile() returned %dx%d@%d",
-                profile.max_width, profile.max_height, profile.video_bitrate);   /* TEMP DEBUG */
     jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
                   g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
     stream_via_curl_if_https(url, sizeof(url));
-    jf_log_line("trace: jf_stream_url() returned, len=%zu", strlen(url));   /* TEMP DEBUG */
     /* Deliberately no item_id/title/url here — those identify what's in
      * someone's library, not how MiSTerFin behaved. */
     jf_log_line("play: profile=%dx%d@%d fb_phys_h=%d line_double=%d resume=%.0fs",
@@ -4095,7 +4092,6 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                  target_w, target_h, expand_arg, vw, vh);
     }
 vf_done:;
-    jf_log_line("trace: vf chain built: %s", vf_arg);   /* TEMP DEBUG */
 
     /* A selected client-rendered (text) subtitle rides the COMMAND LINE
      * (-sub/-subdelay) rather than slave commands sent after the fork:
@@ -4124,12 +4120,10 @@ vf_done:;
         cmdline_sub = 1;
     }
 
-    jf_log_line("trace: cmdline_sub=%d, about to pageflip_begin()", cmdline_sub);   /* TEMP DEBUG */
     /* Hardware page flipping for the interlaced modes — must be engaged
      * (flag file + Main_MiSTer stopped) before the fork, so the fresh
      * mplayer's vo config sees the flag. See pageflip_begin()'s comment. */
     pageflip_begin();
-    jf_log_line("trace: pageflip_begin() returned, about to fork");   /* TEMP DEBUG */
 
     int pfd[2];
     pipe(pfd);
@@ -4312,7 +4306,6 @@ vf_done:;
 
     close(pfd[0]);
     g_cmd_fd = pfd[1];
-    jf_log_line("trace: forked, pid=%d, about to spinner_show", (int)g_player_pid);   /* TEMP DEBUG */
 
     /* mplayer is connecting + filling its cache in the background at this
      * point and hasn't touched /dev/fb0 yet — safe window to show the
@@ -4326,7 +4319,6 @@ vf_done:;
      * deliberate — see the no-clear comment at the top of this function. */
     if (fb->ui_scaled) { fb_clear(fb); fb_flip(fb); }
     spinner_show(fb, 2.0);
-    jf_log_line("trace: spinner_show returned, play() about to return");   /* TEMP DEBUG */
 
     /* Nothing subtitle-related to send here: a client-rendered selection
      * rides the command line (see cmdline_sub above — slave commands sent
@@ -5899,9 +5891,7 @@ int main(int argc, char **argv)
             } else if (inp & INP_A) {
                 double offset = (g_info_item.played) ? 0.0 :
                     (double)g_info_item.resume_ticks / 10000000.0;
-                jf_log_line("trace: A pressed, offset=%.0fs", offset);   /* TEMP DEBUG */
                 info_assets_free();
-                jf_log_line("trace: info_assets_free done");            /* TEMP DEBUG */
                 playing = 1;
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
@@ -5910,9 +5900,7 @@ int main(int argc, char **argv)
                  * picker can show a meaningful "current" row before any
                  * choice has been made. */
                 g_current_audio_index = default_audio_index();
-                jf_log_line("trace: default_audio_index=%d, calling play()", g_current_audio_index); /* TEMP DEBUG */
                 play(&fb, g_info_item.id, offset);
-                jf_log_line("trace: play() returned");                  /* TEMP DEBUG */
                 input_drain();
             } else if ((inp & INP_SELECT) && g_info_item.resume_ticks > 0 && !g_info_item.played) {
                 info_assets_free();
