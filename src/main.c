@@ -32,6 +32,7 @@
 #include "stb_image.h"
 #include "ddr.h"
 #include "jellyfin.h"
+#include "tunarr.h"
 #include "json.h"
 #include "subtitles.h"
 #include "update.h"
@@ -365,7 +366,14 @@ static void fmt_time(char *buf, size_t sz, double secs)
 
 typedef enum {
     STATE_CONFIG_ERROR, STATE_QUICK_CONNECT,
-    STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO
+    STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO,
+    /* Tunarr live-TV channel guide — a sibling app state, not a BrowseFrame
+     * kind: the channel list is flat (a "zap list"), structurally unlike
+     * Jellyfin's tree-shaped drill-down stack, so it doesn't belong inside
+     * g_stack. Entered directly from STATE_BROWSE's root screen (see the
+     * JF_TYPE_LIVE_TV handling in the root INP_A switch) and its own B
+     * handler returns straight to STATE_BROWSE without touching g_stack. */
+    STATE_CHANNELS
 } AppState;
 typedef enum {
     FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES,
@@ -391,6 +399,22 @@ typedef struct {
 static JfConfig   g_cfg;
 static BrowseFrame g_stack[MAX_STACK];
 static int         g_stack_depth = 0;
+
+/* Tunarr (live TV) is an opt-in add-on: g_tunarr_available is set once at
+ * startup by tunarr_config_load, and stays 0 (with g_tunarr_cfg left zeroed)
+ * for anyone who hasn't created tunarr.conf — every Tunarr code path below
+ * gates on this flag, so the feature is entirely absent, not just hidden,
+ * when unconfigured. */
+static TunarrConfig g_tunarr_cfg;
+static int          g_tunarr_available = 0;
+
+/* Channel guide state for STATE_CHANNELS — a flat array, not a windowed page
+ * like g_items[]/g_window_start: TUNARR_MAX_CHANNELS (128) comfortably fits
+ * a whole real-world lineup in one GET /api/channels, so there's no pagination
+ * to model. */
+static TunarrChannel g_channels[TUNARR_MAX_CHANNELS];
+static int           g_channel_count = 0;
+static int           g_channel_sel   = 0;
 
 static JfItem g_items[JF_MAX_ITEMS];
 static int    g_item_count = 0;
@@ -506,36 +530,51 @@ static void info_assets_free(void)
  * wait (several sequential downloads) has visible feedback. */
 static void info_assets_load(FBDev *fb, const JfItem *list_item, int *spinner_frame)
 {
+    jf_log_line("trace: info_assets_load entered, id=%s", list_item->id);   /* TEMP DEBUG */
     info_assets_free();
+    jf_log_line("trace: info_assets_free done, fetching details");   /* TEMP DEBUG */
 
     if (!jf_get_item_details(&g_cfg, list_item->id, &g_info_item))
         g_info_item = *list_item;   /* degrade gracefully: keep the shallow row copy */
+    jf_log_line("trace: details fetched, backdrop_tag=%s logo_tag=%s cast_count=%d",
+                g_info_item.backdrop_tag, g_info_item.logo_tag, g_info_item.cast_count);   /* TEMP DEBUG */
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
+    jf_log_line("trace: spinner 1 drawn");   /* TEMP DEBUG */
     if (g_info_item.backdrop_tag[0]) {
         int dl_ok = jf_download_item_image(&g_cfg, g_info_item.backdrop_item_id, "Backdrop/0",
                                             g_info_item.backdrop_tag, 640, POSTER_TMP);
+        jf_log_line("trace: backdrop download dl_ok=%d", dl_ok);   /* TEMP DEBUG */
         if (dl_ok)
             g_backdrop_px = load_image_tmp(POSTER_TMP, &g_backdrop_w, &g_backdrop_h);
+        jf_log_line("trace: backdrop decoded px=%p w=%d h=%d",
+                    (void*)g_backdrop_px, g_backdrop_w, g_backdrop_h);   /* TEMP DEBUG */
     }
 
     draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
+    jf_log_line("trace: spinner 2 drawn");   /* TEMP DEBUG */
     if (g_info_item.logo_tag[0]) {
         int dl_ok = jf_download_item_image(&g_cfg, g_info_item.logo_item_id, "Logo",
                                             g_info_item.logo_tag, 400, POSTER_TMP);
+        jf_log_line("trace: logo download dl_ok=%d", dl_ok);   /* TEMP DEBUG */
         if (dl_ok)
             g_logo_px = load_image_tmp(POSTER_TMP, &g_logo_w, &g_logo_h);
+        jf_log_line("trace: logo decoded px=%p w=%d h=%d",
+                    (void*)g_logo_px, g_logo_w, g_logo_h);   /* TEMP DEBUG */
     }
 
     int cast_n = g_info_item.cast_count;
     if (cast_n > CAST_DISPLAY_MAX) cast_n = CAST_DISPLAY_MAX;
+    jf_log_line("trace: about to load %d cast images", cast_n);   /* TEMP DEBUG */
     for (int i = 0; i < cast_n; i++) {
         draw_spinner_frame(fb, (*spinner_frame)++); fb_flip(fb);
         JfPerson *p = &g_info_item.cast[i];
         if (!p->image_tag[0]) continue;
         if (jf_download_item_image(&g_cfg, p->id, "Primary", p->image_tag, 48, POSTER_TMP))
             g_cast_px[i] = load_image_tmp(POSTER_TMP, &g_cast_px_w[i], &g_cast_px_h[i]);
+        jf_log_line("trace: cast[%d] loaded px=%p", i, (void*)g_cast_px[i]);   /* TEMP DEBUG */
     }
+    jf_log_line("trace: info_assets_load returning");   /* TEMP DEBUG */
 }
 
 /* ── loading spinner (animated GIF, shown while (re)connecting to the
@@ -699,13 +738,34 @@ static int fetch_frame_window(int start_index)
             n_synth++;
         }
 
-        int n_views = jf_list_views(&g_cfg, g_items + n_synth, JF_MAX_ITEMS - n_synth);
+        int live_tv_slot = g_tunarr_available ? 1 : 0;
+        int n_views = jf_list_views(&g_cfg, g_items + n_synth,
+                                     JF_MAX_ITEMS - n_synth - live_tv_slot);
         for (int i = 0; i < n_views; i++) {
             JfItem *v = &g_items[n_synth + i];
             g_view_counts[n_synth + i] =
                 jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
         }
         g_item_count = n_synth + n_views;
+
+        /* "Live TV" card, appended last — opt-in (see g_tunarr_available's
+         * comment) and purely a UI marker: JF_TYPE_LIVE_TV is never emitted
+         * by jf_list_views itself, only synthesized here, so it can share
+         * this screen's rendering and the root INP_A switch (see that
+         * switch's JF_TYPE_LIVE_TV case) without jellyfin.c knowing Tunarr
+         * exists. No per-card channel count fetched here (would mean an
+         * extra request just for a number nobody's asked to see) — -1 is
+         * the documented "omit the count line" value, same as a failed
+         * jf_count_items above. */
+        if (live_tv_slot) {
+            JfItem *card = &g_items[g_item_count];
+            memset(card, 0, sizeof(*card));
+            strncpy(card->name, "Live TV", sizeof(card->name) - 1);
+            card->type = JF_TYPE_LIVE_TV;
+            card->index_number = -1;
+            g_view_counts[g_item_count] = -1;
+            g_item_count++;
+        }
         break;
     }
     case FRAME_RESUME:
@@ -895,6 +955,21 @@ static int browse_move_sel(FBDev *fb, int delta)
     if (g_scroll > g_item_count - vis) g_scroll = g_item_count - vis;
     if (g_scroll < 0)                  g_scroll = 0;
 
+    return 1;
+}
+
+/* Moves the channel-guide cursor by delta, wrapping around both ends —
+ * "channel up/down" wrapping from the last channel back to the first (and
+ * vice versa) matches how a TV remote's channel button behaves, unlike
+ * browse_move_sel's clamp-at-the-ends (which fits a library's start/end
+ * being real boundaries, not a loop). Returns 1 if the selection changed. */
+static int channel_move_sel(int delta)
+{
+    if (delta == 0 || g_channel_count <= 0) return 0;
+    int sel = (g_channel_sel + delta) % g_channel_count;
+    if (sel < 0) sel += g_channel_count;
+    if (sel == g_channel_sel) return 0;
+    g_channel_sel = sel;
     return 1;
 }
 
@@ -2093,6 +2168,76 @@ static void draw_browse(FBDev *fb)
     fb_flip(fb);
 }
 
+/* Tunarr channel guide screen — a flat, text-only list (no cover art, no
+ * carousel): "zap through channels" is the interaction model here, not
+ * "browse a library", so this deliberately doesn't reuse grid.c (which is
+ * tightly coupled to JfItem/Jellyfin API calls anyway) or draw_browse's
+ * cover-panel layout. Scroll offset is recomputed from g_channel_sel on
+ * every call rather than tracked in a persistent variable — cheap for a
+ * list this size (TUNARR_MAX_CHANNELS is 128) and avoids sharing g_scroll
+ * with the unrelated Jellyfin browse list. */
+static void draw_channels(FBDev *fb)
+{
+    fb_clear(fb);
+    draw_top_bar(fb, "Live TV");
+
+    if (g_channel_count == 0) {
+        const char *msg = "No channels";
+        draw_text(fb, (fb->width - text_width(fb, msg, 1))/2, fb->height/2, msg, 1, COL_HINT);
+        fb_flip(fb);
+        return;
+    }
+
+    int row_max_w = fb->width - SAFE_X - SAFE_X;
+    int vis = visible_rows(fb);
+    int scroll = (g_channel_sel >= vis) ? g_channel_sel - vis + 1 : 0;
+    if (scroll > g_channel_count - vis) scroll = g_channel_count - vis;
+    if (scroll < 0) scroll = 0;
+
+    int end = scroll + vis;
+    if (end > g_channel_count) end = g_channel_count;
+
+    time_t now = time(NULL);
+    for (int i = scroll; i < end; i++) {
+        int row = i - scroll;
+        int y   = SAFE_Y + 24 + row * ROW_H;
+        int is_sel = (i == g_channel_sel);
+        TunarrChannel *ch = &g_channels[i];
+
+        char line1[280];
+        snprintf(line1, sizeof(line1), "%3d  %s", ch->number, ch->name);
+        truncate_to_width(fb, line1, 1, row_max_w);
+
+        char line2[128] = {0};
+        if (ch->program_title[0]) {
+            if (ch->program_stop > now) {
+                char left[16];
+                fmt_time(left, sizeof(left), (double)(ch->program_stop - now));
+                snprintf(line2, sizeof(line2), "%s (%s left)", ch->program_title, left);
+            } else {
+                snprintf(line2, sizeof(line2), "%s", ch->program_title);
+            }
+        }
+        truncate_to_width(fb, line2, 1, row_max_w);
+
+        if (is_sel) {
+            fb_fill_rect_alpha(fb, SAFE_X - 4, y - 3,
+                               row_max_w + 8, ROW_H - 2, COL_SEL_BG, 220);
+            draw_text(fb, SAFE_X, y, line1, 1, COL_SEL_FG);
+            if (line2[0]) draw_text(fb, SAFE_X, y + 11, line2, 1, COL_HINT);
+        } else {
+            draw_text(fb, SAFE_X, y, line1, 1, COL_ITEM);
+            if (line2[0]) draw_text(fb, SAFE_X, y + 11, line2, 1, COL_HINT);
+        }
+    }
+
+    const char *hint = "A:watch  UP/DOWN or L/R:channel  SELECT:random  B:back";
+    draw_text(fb, (fb->width - text_width(fb, hint, 1))/2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    fb_flip(fb);
+}
+
 static void draw_info(FBDev *fb)
 {
     fb_clear(fb);
@@ -2365,6 +2510,18 @@ static int     g_paused          = 0;
 static double  g_pause_wall      = 0.0;
 static char    g_play_session_id[64];
 static double  g_last_progress_report = 0.0;
+
+/* Which source is behind the CURRENT video playback session — set at the
+ * top of play() (Jellyfin) and play_channel() (Tunarr), read by
+ * player_handle_input() and the STATE_PLAYING end-of-title handler below to
+ * decide whether Jellyfin-only bookkeeping (resume/watched-state reporting,
+ * jf_report_progress) applies and which screen to return to. player_stop(),
+ * player_pause_toggle() and play_position() need no such gate — they only
+ * touch g_player_pid/g_cmd_fd/g_play_offset/g_paused, none of which are
+ * source-specific (same reasoning play_audio's own comment already gives
+ * for why it can reuse those three unchanged). */
+typedef enum { PLAY_SOURCE_JELLYFIN, PLAY_SOURCE_TUNARR } PlaySource;
+static PlaySource g_playing_source = PLAY_SOURCE_JELLYFIN;
 
 /* Playback progress is fire-and-forget (the result is never read), but the
  * curl round-trip is blocking — running it on the main thread froze the
@@ -3527,25 +3684,42 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
          * clears the flag (no-op unless engaged). */
         pageflip_end();
         double pos = play_position();
-        int watched = playback_watched(g_info_item.runtime_ticks, pos);
-        jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                           (int64_t)(pos * 10000000.0), watched);
-        g_info_item.played = watched;
-        g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
-        jf_log_line("play: ended on its own at %.0fs, watched=%d", pos, watched);
+        /* Resume/watched-state reporting is a Jellyfin-only concept — a live
+         * TV channel has neither, so a Tunarr session skips this entirely
+         * rather than reporting bogus state against g_info_item (which
+         * belongs to whatever Jellyfin item was last viewed, not this
+         * channel) or against the server at all. */
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN) {
+            int watched = playback_watched(g_info_item.runtime_ticks, pos);
+            jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                               (int64_t)(pos * 10000000.0), watched);
+            g_info_item.played = watched;
+            g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        }
+        jf_log_line("play: ended on its own at %.0fs", pos);
         return PLAYER_FRAME_ENDED;
     } else if (inp & INP_B) {
         double pos = play_position();
-        int watched = playback_watched(g_info_item.runtime_ticks, pos);
-        jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
-                           (int64_t)(pos * 10000000.0), watched);
-        g_info_item.played = watched;
-        g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN) {
+            int watched = playback_watched(g_info_item.runtime_ticks, pos);
+            jf_report_stopped(&g_cfg, g_info_item.id, g_play_session_id,
+                               (int64_t)(pos * 10000000.0), watched);
+            g_info_item.played = watched;
+            g_info_item.resume_ticks = watched ? 0 : (int64_t)(pos * 10000000.0);
+        }
         player_stop();
-        jf_log_line("play: stopped by user at %.0fs, watched=%d", pos, watched);
+        jf_log_line("play: stopped by user at %.0fs", pos);
         return PLAYER_FRAME_ENDED;
     } else if (g_paused) {
-        if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
+        /* The subtitle/audio-track/picture-mode submenu is entirely
+         * Jellyfin-shaped (its "confirm" actions restart playback via
+         * play(g_info_item.id, ...)) — offering it during a Tunarr session
+         * would silently restart Jellyfin's last-viewed item instead of the
+         * live channel actually playing. Not offered for Tunarr; nothing
+         * in scope replaces it yet. */
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN && (inp & INP_SELECT)) {
+            submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED;
+        }
         if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
         if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
         if (inp & INP_A) player_pause_toggle();
@@ -3564,9 +3738,14 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
          * accumulated seek too, so this timeline moves live as the
          * user taps LEFT/RIGHT instead of waiting for the debounce
          * to actually fire the restart. */
-        draw_paused(fb, g_info_item.name, seek_pending_target());
+        const char *paused_title = (g_playing_source == PLAY_SOURCE_TUNARR &&
+                                     g_channel_count > 0)
+                                    ? g_channels[g_channel_sel].name : g_info_item.name;
+        draw_paused(fb, paused_title, seek_pending_target());
     } else {
-        if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN && (inp & INP_SELECT)) {
+            submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED;
+        }
         if (inp & INP_A) player_pause_toggle();
         if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
         if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
@@ -3582,7 +3761,8 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
             }
         }
 
-        if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN &&
+            loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
             g_last_progress_report = loop_now;
             report_progress_async(g_info_item.id, g_play_session_id,
                                   (int64_t)(play_position() * 10000000.0), 0);
@@ -3594,6 +3774,8 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
 
 static void play(FBDev *fb, const char *item_id, double offset_secs)
 {
+    jf_log_line("trace: play() entered");   /* TEMP DEBUG */
+    g_playing_source = PLAY_SOURCE_JELLYFIN;
     g_seek_accum = 0.0;
     g_seek_fire_at = 0.0;
 
@@ -3615,12 +3797,16 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
      * headroom for a quality bump too. */
     int64_t start_ticks = (int64_t)(offset_secs * 10000000.0);
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
+    jf_log_line("trace: session id made");   /* TEMP DEBUG */
 
     char url[700];
     const JfStreamProfile profile = stream_profile();
+    jf_log_line("trace: stream_profile() returned %dx%d@%d",
+                profile.max_width, profile.max_height, profile.video_bitrate);   /* TEMP DEBUG */
     jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
                   g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
     stream_via_curl_if_https(url, sizeof(url));
+    jf_log_line("trace: jf_stream_url() returned, len=%zu", strlen(url));   /* TEMP DEBUG */
     /* Deliberately no item_id/title/url here — those identify what's in
      * someone's library, not how MiSTerFin behaved. */
     jf_log_line("play: profile=%dx%d@%d fb_phys_h=%d line_double=%d resume=%.0fs",
@@ -3867,6 +4053,7 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
                  target_w, target_h, expand_arg, vw, vh);
     }
 vf_done:;
+    jf_log_line("trace: vf chain built: %s", vf_arg);   /* TEMP DEBUG */
 
     /* A selected client-rendered (text) subtitle rides the COMMAND LINE
      * (-sub/-subdelay) rather than slave commands sent after the fork:
@@ -3895,10 +4082,12 @@ vf_done:;
         cmdline_sub = 1;
     }
 
+    jf_log_line("trace: cmdline_sub=%d, about to pageflip_begin()", cmdline_sub);   /* TEMP DEBUG */
     /* Hardware page flipping for the interlaced modes — must be engaged
      * (flag file + Main_MiSTer stopped) before the fork, so the fresh
      * mplayer's vo config sees the flag. See pageflip_begin()'s comment. */
     pageflip_begin();
+    jf_log_line("trace: pageflip_begin() returned, about to fork");   /* TEMP DEBUG */
 
     int pfd[2];
     pipe(pfd);
@@ -4081,6 +4270,7 @@ vf_done:;
 
     close(pfd[0]);
     g_cmd_fd = pfd[1];
+    jf_log_line("trace: forked, pid=%d, about to spinner_show", (int)g_player_pid);   /* TEMP DEBUG */
 
     /* mplayer is connecting + filling its cache in the background at this
      * point and hasn't touched /dev/fb0 yet — safe window to show the
@@ -4094,11 +4284,128 @@ vf_done:;
      * deliberate — see the no-clear comment at the top of this function. */
     if (fb->ui_scaled) { fb_clear(fb); fb_flip(fb); }
     spinner_show(fb, 2.0);
+    jf_log_line("trace: spinner_show returned, play() about to return");   /* TEMP DEBUG */
 
     /* Nothing subtitle-related to send here: a client-rendered selection
      * rides the command line (see cmdline_sub above — slave commands sent
      * this early get their sub_delay wiped by playback init, issue #12),
      * and a burned-in one is baked into the url. */
+}
+
+/* ── Tunarr channel playback ─────────────────────────────────────────────
+ * A deliberately separate, simpler function rather than a play()/play_core()
+ * split: play() above is a single ~450-line function whose vf-chain,
+ * subtitle handling and picture-zoom logic are all keyed off per-item
+ * Jellyfin metadata (g_info_item's source aspect/id, jellyfin.conf's
+ * transcode profile) that has no Tunarr equivalent. Reusing the SAME
+ * mplayer flag set and fork/pipe/-slave control mechanism play() uses (this
+ * function's exec argv is deliberately built the same way, just without the
+ * Jellyfin-specific pieces) while keeping the two entry points apart avoids
+ * threading a "is this Jellyfin or Tunarr" branch through play()'s already
+ * dense, hardware-tuned vf-chain math — which is exactly the kind of change
+ * that risks a silent regression nobody notices until it's on real
+ * hardware. player_stop()/player_pause_toggle()/play_position() are still
+ * fully shared (see g_playing_source's own comment for why that's safe).
+ *
+ * The vf-chain here assumes a 16:9 source aspect — Tunarr channels carry no
+ * per-item DAR the way a Jellyfin item does (see item_dar()), and most
+ * broadcast-style content is 16:9, but this is a real assumption, not a
+ * measured one, and may need adjusting once real Tunarr streams are watched
+ * on actual MiSTer hardware (flagged in the project plan as an open
+ * unknown). */
+static void play_channel(FBDev *fb, const TunarrChannel *ch)
+{
+    g_playing_source = PLAY_SOURCE_TUNARR;
+    g_seek_accum = 0.0;
+    g_seek_fire_at = 0.0;
+
+    char url[512];
+    tunarr_stream_url(&g_tunarr_cfg, ch->id, url, sizeof(url));
+    jf_log_line("play_channel: number=%d fb_phys_h=%d line_double=%d",
+                ch->number, fb->phys_height, fb->line_double);
+
+    char delay_arg[16];
+    snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
+
+    g_play_offset     = 0.0;
+    g_play_start_wall = now_sec();
+    g_paused          = 0;
+    g_last_progress_report = now_sec();
+
+    int vh = fb->phys_height;
+    const double dar = 16.0 / 9.0;   /* assumed — see function comment */
+    int target_h = (int)(4.0 * vh / (3.0 * dar) + 0.5);
+    target_h &= ~1;
+    if (target_h < 2) target_h = 2;
+    if (target_h > vh) target_h = vh;
+
+    char expand_arg[48];
+    if (fb->line_double) {
+        /* Same visible-window centering as play()'s general branch — see
+         * that function's comment for why [40, vh) rather than [0, vh). */
+        int visible_h = vh - 40;
+        if (target_h > visible_h) target_h = visible_h & ~1;
+        int top = 40 + (visible_h - target_h) / 2;
+        if (top < 40) top = 40;
+        snprintf(expand_arg, sizeof(expand_arg), "expand=%d:%d:-1:%d:0", fb->width, vh, top);
+    } else {
+        snprintf(expand_arg, sizeof(expand_arg), "expand=%d:%d:-1:-1:1", fb->width, vh);
+    }
+    char vf_arg[128];
+    snprintf(vf_arg, sizeof(vf_arg), "scale=%d:%d,%s,dsize=%d:%d",
+             fb->width, target_h, expand_arg, fb->width, vh);
+
+    pageflip_begin();
+
+    int pfd[2];
+    pipe(pfd);
+
+    g_player_pid = fork();
+    if (g_player_pid == 0) {
+        setpgid(0, 0);
+        if (g_pageflip_mode) {
+            unsigned long cpumask = 0x3;
+            syscall(SYS_sched_setaffinity, 0, sizeof(cpumask), &cpumask);
+        }
+        dup2(pfd[0], 0);
+        close(pfd[0]); close(pfd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        nice(-5);
+
+        const char *args[48];
+        int an = 0;
+        args[an++] = "mplayer";
+        args[an++] = "-slave";      args[an++] = "-quiet";
+        args[an++] = "-nojoystick"; args[an++] = "-noconsolecontrols";
+        args[an++] = "-vo";         args[an++] = "fbdev:/dev/fb0";
+        args[an++] = "-ao";         args[an++] = "alsa";
+        args[an++] = "-osdlevel";   args[an++] = "0";
+        args[an++] = "-font";
+        args[an++] = fb->line_double ? "/media/fat/misterfin/font2x/font.desc"
+                                     : "/media/fat/misterfin/font/font.desc";
+        args[an++] = "-framedrop";
+        args[an++] = "-autosync"; args[an++] = "30";
+        args[an++] = "-cache";    args[an++] = "8192";
+        args[an++] = "-cache-min"; args[an++] = "20";
+        /* Same forced demuxer play() uses for Jellyfin's transcoded TS —
+         * a starting assumption for Tunarr's own TS output, not a confirmed
+         * fit (see function comment). */
+        args[an++] = "-demuxer"; args[an++] = "lavf";
+        args[an++] = "-sws"; args[an++] = "0";
+        args[an++] = "-vf";       args[an++] = vf_arg;
+        args[an++] = "-lavdopts"; args[an++] = "threads=2:fast";
+        args[an++] = "-af";       args[an++] = "volume=-3,format=s16le";
+        args[an++] = "-delay"; args[an++] = delay_arg;
+        args[an++] = url;
+        args[an]   = NULL;
+        execvp(MPLAYER, (char *const *)args);
+        _exit(1);
+    }
+
+    close(pfd[0]);
+    g_cmd_fd = pfd[1];
+    spinner_show(fb, 2.0);
 }
 
 /* ── music playback (audio-only, direct play — see jf_audio_stream_url) ──── */
@@ -4678,6 +4985,7 @@ static void redraw_current_screen(FBDev *fb, AppState state)
     case STATE_BROWSE:       draw_browse(fb); break;
     case STATE_INFO:         draw_info(fb); break;
     case STATE_PLAYING_AUDIO: draw_now_playing(fb, &g_items[g_audio_queue_pos], play_position()); break;
+    case STATE_CHANNELS:     draw_channels(fb); break;
     default: break;
     }
 }
@@ -4723,6 +5031,11 @@ static void *startup_resolve_thread(void *arg)
     jf_device_id_init(&g_cfg);
 
     jf_log_init(&g_cfg);   /* no-op unless "DEBUGLOG" is in jellyfin.conf */
+
+    /* Additive, never blocking: a missing/absent tunarr.conf just leaves
+     * g_tunarr_available at 0 and the Jellyfin startup path below continues
+     * exactly as it did before this feature existed. */
+    g_tunarr_available = tunarr_config_load(&g_tunarr_cfg);
 
     if (jf_token_load(&g_cfg) && jf_credential_works(&g_cfg)) {
         /* A previously earned Quick Connect token, still accepted. Checked
@@ -5433,6 +5746,25 @@ int main(int argc, char **argv)
                     draw_now_playing(&fb, &g_items[g_sel], 0.0);
                     input_drain();
                     break;
+                case JF_TYPE_LIVE_TV:
+                    /* Fetched lazily here rather than at startup — same
+                     * "nothing loaded until you actually open it" convention
+                     * every other frame already follows (see fetch_frame()).
+                     * A failed/empty fetch just leaves the card doing
+                     * nothing rather than entering an empty channel screen. */
+                    g_channel_count = tunarr_list_channels(&g_tunarr_cfg, g_channels,
+                                                            TUNARR_MAX_CHANNELS);
+                    if (g_channel_count > 0) {
+                        for (int c = 0; c < g_channel_count; c++)
+                            tunarr_get_now_playing(&g_tunarr_cfg, &g_channels[c]);
+                        g_channel_sel = 0;
+                        state = STATE_CHANNELS;
+                        draw_channels(&fb);
+                    } else {
+                        g_channel_count = 0;
+                    }
+                    input_drain();
+                    break;
                 default:
                     break;
                 }
@@ -5464,6 +5796,42 @@ int main(int argc, char **argv)
             break;
         }
 
+        case STATE_CHANNELS: {
+            inp |= nav_repeat;
+            int nav = 0;
+            if (inp & INP_B) {
+                state = STATE_BROWSE;   /* no pop_frame() — g_stack was never
+                                          * touched to get here, see the
+                                          * STATE_CHANNELS AppState comment */
+                draw_browse(&fb);
+                input_drain();
+                break;
+            }
+            if (inp & INP_UP)   nav |= channel_move_sel(-1);
+            if (inp & INP_DOWN) nav |= channel_move_sel(+1);
+            /* L/R: a second, TV-remote-shaped input for the same channel
+             * up/down action as UP/DOWN — the channel list has no secondary
+             * axis to page through the way a long Jellyfin library does, so
+             * unlike STATE_BROWSE's L/R (a whole-page jump) these move the
+             * selection by exactly one channel, same as UP/DOWN. */
+            if (inp & INP_L) nav |= channel_move_sel(-1);
+            if (inp & INP_R) nav |= channel_move_sel(+1);
+            /* SELECT: random channel — SELECT already means "randomize"
+             * elsewhere (music library shuffle, STATE_BROWSE above), so
+             * this reuses the same gesture rather than inventing a new one. */
+            if ((inp & INP_SELECT) && g_channel_count > 0) {
+                g_channel_sel = rand() % g_channel_count;
+                nav = 1;
+            }
+            if (nav) draw_channels(&fb);
+            if ((inp & INP_A) && g_channel_count > 0) {
+                play_channel(&fb, &g_channels[g_channel_sel]);
+                state = STATE_PLAYING;
+                input_drain();
+            }
+            break;
+        }
+
         case STATE_INFO:
             if (inp & INP_B) {
                 info_assets_free();
@@ -5473,7 +5841,9 @@ int main(int argc, char **argv)
             } else if (inp & INP_A) {
                 double offset = (g_info_item.played) ? 0.0 :
                     (double)g_info_item.resume_ticks / 10000000.0;
+                jf_log_line("trace: A pressed, offset=%.0fs", offset);   /* TEMP DEBUG */
                 info_assets_free();
+                jf_log_line("trace: info_assets_free done");            /* TEMP DEBUG */
                 playing = 1;
                 state = STATE_PLAYING;
                 g_current_sub_index = -1;
@@ -5482,7 +5852,9 @@ int main(int argc, char **argv)
                  * picker can show a meaningful "current" row before any
                  * choice has been made. */
                 g_current_audio_index = default_audio_index();
+                jf_log_line("trace: default_audio_index=%d, calling play()", g_current_audio_index); /* TEMP DEBUG */
                 play(&fb, g_info_item.id, offset);
+                jf_log_line("trace: play() returned");                  /* TEMP DEBUG */
                 input_drain();
             } else if ((inp & INP_SELECT) && g_info_item.resume_ticks > 0 && !g_info_item.played) {
                 info_assets_free();
@@ -5501,9 +5873,18 @@ int main(int argc, char **argv)
             if (r == PLAYER_FRAME_HANDLED) continue;
             if (r == PLAYER_FRAME_ENDED) {
                 playing = 0;
-                state = STATE_BROWSE;
-                refetch_frame_keep_selection(&fb);
-                draw_browse(&fb);
+                if (g_playing_source == PLAY_SOURCE_TUNARR) {
+                    /* Back to the channel list, not the Jellyfin browse
+                     * screen — matches a TV remote's "back" staying inside
+                     * TV mode rather than leaving it, and there's no
+                     * Jellyfin browse frame to refetch for this session. */
+                    state = STATE_CHANNELS;
+                    draw_channels(&fb);
+                } else {
+                    state = STATE_BROWSE;
+                    refetch_frame_keep_selection(&fb);
+                    draw_browse(&fb);
+                }
             }
             break;
         }

@@ -29,6 +29,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [During video playback](#during-playback)
   - [Track picker (SELECT during video playback)](#track-picker)
   - [Now playing (music)](#now-playing)
+- [Live TV (Tunarr)](#live-tv)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
   - [v1.0.1](#v1-0-1) · [v1.0.0](#v1-0-0) · [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
@@ -327,6 +328,16 @@ VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing
 Reaching the end of a track auto-advances to the next one in the same list, same as any normal music player. Audio is direct-played, so seeking is a real in-place seek (no stop/restart the way video's seek needs).
 
 A keyboard works standalone, with no gamepad attached.
+
+---
+
+## <a id="live-tv"></a>Live TV (Tunarr)
+
+MiSTerFin can also browse and play channels from a [Tunarr](https://github.com/chrisbenincasa/tunarr) server — Tunarr turns a media library into scheduled "TV channels" you can zap through like a real tuner. It's entirely optional and opt-in: create `/media/fat/misterfin/tunarr.conf` with one line, your Tunarr server's URL, and a "Live TV" card appears on the root screen. With no `tunarr.conf`, nothing about the app changes.
+
+Once you're in the channel list: Up/Down or the L/R shoulder buttons zap channels, SELECT jumps to a random one, A tunes in. No configuration beyond the server URL is needed — Tunarr's API needs no authentication.
+
+**Want to generate a Tunarr channel lineup from your Jellyfin library in the first place?** See [`tunarr_scripts/`](tunarr_scripts/) — a self-contained toolkit for building genre-based movie channels and per-show channels automatically, including a docker-compose reference for deploying Tunarr itself.
 
 ---
 

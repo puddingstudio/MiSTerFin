@@ -252,6 +252,19 @@ static void grid_dim_covers(GridLibCache *gc)
 static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
                                  const char *dest_path, FBDev *fb, int show_ui)
 {
+    /* The "Live TV" root card (main.c's synthetic JF_TYPE_LIVE_TV entry) has
+     * no ParentId and an empty id — falling through to the normal path below
+     * would either misroute it into the resume/nextup synthetic branch or,
+     * worse, issue a real /Items request with an empty ParentId. There's
+     * also nothing meaningful to show as a background cover grid for it, so
+     * this just marks the slot permanently empty rather than fetching
+     * anything. */
+    if (view->type == JF_TYPE_LIVE_TV) {
+        gc->count = 0;
+        __atomic_store_n(&gc->ready, 1, __ATOMIC_RELEASE);
+        return;
+    }
+
     const char *item_type = collection_item_type(view->collection_type);
     /* Music gets square cells, every other library (and the synthetic
      * Continue/Next Up rows, mixed movies and episodes, never music) keeps
