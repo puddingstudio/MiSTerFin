@@ -3,8 +3,12 @@
 # matches your setup into your own compose.yml/.env.
 #
 # Base shape below is a real, already-running configuration — same idea as
-# Tunarr's own quickstart, with two additions worth calling out: the GPU
-# passthrough block and the Jellyfin-library bind mount.
+# Tunarr's own quickstart (https://github.com/chrisbenincasa/tunarr,
+# docker/example.compose.yaml), with two additions worth calling out: the
+# GPU passthrough block and the Jellyfin-library bind mount. Full install
+# docs: https://tunarr.com/getting-started/installation/ — "Stream from
+# Disk" section referenced below is under
+# https://tunarr.com/configure/media_sources/jellyfin/
 
 # ─────────────────────────────────────────────────────────────────────────
 # 1. Base + Jellyfin library bind mount (Intel/AMD VAAPI GPU)

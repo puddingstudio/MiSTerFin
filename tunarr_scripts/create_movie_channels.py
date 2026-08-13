@@ -127,7 +127,7 @@ def main():
     parser.add_argument("--library", required=True, help="Jellyfin/Plex/Emby library name, as shown by tunarr_status.py sources")
     parser.add_argument("--source", help="Media source name (omit to search all connected sources)")
     parser.add_argument("--config", default="channel_genres.txt", help="Path to channel_genres.txt")
-    parser.add_argument("--transcode-config", default="Default-1080", help="Tunarr transcode config name")
+    parser.add_argument("--transcode-config", default="Default", help="Tunarr transcode config name")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be created without touching Tunarr")
     args = parser.parse_args()
 

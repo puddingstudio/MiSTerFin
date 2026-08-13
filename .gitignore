@@ -14,3 +14,4 @@ local-preview.png
 tunarr_scripts/.env_tunarr
 tunarr_scripts/channel_genres.txt
 tunarr_scripts/.venv/
+tunarr_scripts/uv.lock

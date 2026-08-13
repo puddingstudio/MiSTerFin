@@ -21,7 +21,7 @@ import uuid
 import series_classify as sc
 import tunarr_client as tc
 
-TRANSCODE_CONFIG_DEFAULT = "Default-1080"
+TRANSCODE_CONFIG_DEFAULT = "Default"
 
 
 def resolve_library(source_name: str, library_name: str) -> dict:

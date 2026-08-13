@@ -8,15 +8,64 @@ small to warrant their own channel.
 This is a slimmed-down reference implementation, not a full automation
 suite — see "Scope" below.
 
+![Channels created by the scripts, including overflow channels](screenshots/12-channels-created.png)
+
+See `WORKFLOW.md` for the full step-by-step walkthrough with screenshots,
+from a fresh Tunarr install through a real script run.
+
 ## Install
+
+A virtual environment is effectively required now — modern Debian/Ubuntu
+Python refuses a bare `pip install` system-wide (PEP 668,
+"externally-managed-environment").
+
+**With [uv](https://github.com/astral-sh/uv)** (recommended if you have it —
+faster, and `uv run` below means you don't even have to remember to
+activate the venv):
 
 ```bash
 cd tunarr_scripts
-python3 -m venv .venv && source .venv/bin/activate   # optional but recommended
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+Confirmed real output from this exact sequence:
+```
+$ uv venv
+Using CPython 3.14.4 interpreter at: /usr/bin/python3
+Creating virtual environment at: .venv
+Activate with: source .venv/bin/activate
+$ source .venv/bin/activate
+$ uv pip install -r requirements.txt
+Resolved 5 packages in 386ms
+Prepared 1 package in 49ms
+Installed 5 packages in 37ms
+ + certifi==2026.7.22
+ + charset-normalizer==3.4.9
+ + idna==3.18
+ + requests==2.34.2
+ + urllib3==2.7.0
+```
+
+Once installed, either run scripts normally inside the activated venv
+(`python3 create_movie_channels.py ...`), or skip activation entirely with
+`uv run` (it finds `.venv` automatically):
+```bash
+uv run create_movie_channels.py --library "Movies" --config channel_genres.txt
+```
+
+**Without uv** (stdlib only):
+
+```bash
+cd tunarr_scripts
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The only third-party dependency is `requests`.
+Either way, the only third-party dependency is `requests` (plus its own
+small transitive deps — `certifi`/`charset-normalizer`/`idna`/`urllib3` —
+pulled in automatically).
 
 ## Setup
 
@@ -45,13 +94,19 @@ The only third-party dependency is `requests`.
 | `create_series_channels.py backfill --library <name>` | No¹ | Per-show channels for every channel-worthy show |
 | `create_series_channels.py create --library <name> --series "<title>" --number N` | No¹ | One specific show's channel |
 | `create_mix_channels.py --library <name>` | No¹ | Small-series genre mix channels |
+| `dump_library.py --library <name>` | No¹ | Preview table: every title, genre(s), runtime, and where it would land — no changes made |
 
 ¹ None of these need a Jellyfin API key *from this toolkit* — see Auth
 below — but they do need the library already connected and scanned
 *inside Tunarr itself* first.
 
 All of the `create_*` scripts accept `--dry-run` to preview what would be
-created without touching Tunarr.
+created without touching Tunarr. `dump_library.py` is read-only by nature —
+it uses the exact same placement logic the `create_*` scripts do (imported
+from them directly), so it can't drift out of sync with what a real run
+would do. Run it any time, before or after creating channels, as a
+guide/reference for "what genre is this movie matched to" or "which channel
+is this show on."
 
 See `WORKFLOW.md` for what each script actually does and why, including the
 duplicate-show-entry behavior and the Merge Versions warning — read that

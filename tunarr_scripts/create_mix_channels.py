@@ -93,7 +93,7 @@ def main():
     parser.add_argument("--library", required=True)
     parser.add_argument("--source", help="Media source name (omit to search all connected sources)")
     parser.add_argument("--config", default="channel_genres.txt")
-    parser.add_argument("--transcode-config", default="Default-1080")
+    parser.add_argument("--transcode-config", default="Default")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

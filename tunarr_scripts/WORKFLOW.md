@@ -7,20 +7,85 @@ cover internal API details — read the scripts themselves for that.
 ## Prerequisites (do this once, in Tunarr's own web UI)
 
 None of this toolkit works until Tunarr itself knows about your Jellyfin
-library. In Tunarr's web UI (`http://<host>:8000/web`):
+library. This is all done in Tunarr's own web UI (`http://<host>:8000/web`)
+— none of it touches this toolkit yet. Screenshots below are from a real
+walkthrough on a fresh Tunarr instance.
 
-1. **Settings → Sources → Add** → choose Jellyfin, enter your server URL and
-   an API key (Admin Dashboard → API Keys in Jellyfin) or username/password.
-2. On that same source, **Edit Libraries** → enable the libraries you want
-   channels built from. Enabling a library triggers a scan automatically.
-3. Wait for the scan to finish (the library's row shows progress; large
-   libraries can take a while the first time). You can also trigger a
-   rescan on demand later — see `tunarr_status.py sources` and
-   `tunarr_status.py rescan`, which surface the same scan Tunarr runs
-   automatically every 6 hours by default.
+1. First run lands on the welcome/setup wizard:
+
+   ![Welcome to Tunarr](screenshots/01-welcome.png)
+
+2. **Connect Sources → Add** → choose your media server (Jellyfin, Plex, or
+   Emby):
+
+   ![Add source menu](screenshots/02-add-source-menu.png)
+
+   Enter your server's URL and either a username/password (Tunarr exchanges
+   it for a session token and doesn't store the password) or an API key:
+
+   ![New media source form](screenshots/02b-new-media-source-form.png)
+
+   This is the *only* place Jellyfin credentials are ever entered — nothing
+   in this toolkit ever asks for them, see README.md's Auth section for why.
+
+3. Once connected, the source shows up and you can move on:
+
+   ![Source connected](screenshots/03-source-connected.png)
+
+4. Tunarr checks for FFmpeg (bundled or on `PATH`) — required for
+   transcoding:
+
+   ![FFmpeg check](screenshots/04-ffmpeg-check.png)
+
+5. Wizard complete:
+
+   ![All set](screenshots/05-all-set.png)
+
+6. **Now enable the actual libraries** you want channels built from —
+   Settings → Sources shows your connected source(s):
+
+   ![Media Sources list](screenshots/05b-media-sources-list.png)
+
+   → Edit Libraries. Enabling a library triggers a scan automatically:
+
+   ![Manage libraries dialog](screenshots/06-manage-libraries.png)
+
+   ![Libraries enabled](screenshots/07-libraries-enabled.png)
+
+7. Under Library, watch the scan progress:
+
+   ![Library scan in progress](screenshots/08-library-scan-progress.png)
+
+   ...until it's done:
+
+   ![Library scan finished](screenshots/09-library-scan-finished.png)
+
+   You can trigger a rescan on demand later too — see `tunarr_status.py
+   sources` and `tunarr_status.py rescan`, which surface the same scan
+   Tunarr runs automatically every 6 hours by default.
+
+8. Worth a look while you're in Settings → FFMPEG: this is also where you'd
+   confirm/create the transcode config these scripts reference by name
+   (`--transcode-config`, default `Default`):
+
+   ![FFmpeg settings](screenshots/10-settings-ffmpeg.png)
+
+   ![Transcode configs — a fresh install only has "Default"](screenshots/11-settings-transcode-configs.png)
+
+   A fresh Tunarr install only ships one, named `Default` — that's why the
+   scripts default to it. If you rename it or add another, pass
+   `--transcode-config <name>` to any `create_*` script.
 
 Nothing in this toolkit needs your Jellyfin credentials — see README.md's
 Auth section for why.
+
+**Before running anything else**, `dump_library.py --library <name>` is
+worth running first — a read-only table of every title, its genre(s),
+runtime, and exactly where it would land (which genre channel(s), its own
+per-show channel, or which mix channel), using the same placement logic the
+`create_*` scripts actually run. It also flags duplicate show titles up
+front. Keep using it after channels exist too, as a quick "what genre is
+this on" / "where's this show" reference.
 
 ## Movie genre channels (`create_movie_channels.py`)
 
@@ -94,6 +159,20 @@ don't be surprised if that catch-all ends up with most of your small shows
 — it's a limitation of your source library's metadata, not a bug in this
 script. If you want better mix-channel genre coverage, tag your shows'
 genres more completely in Jellyfin first.
+
+## What it looks like once it's run
+
+A real `create_movie_channels.py` run against a real library, showing the
+overflow behavior in action — `Action` filled up past the 50-movie/72-hour
+ceiling and spilled into `Action-2` and `Action-3`, same for `Sci-Fi` and
+`Comedy`:
+
+![Channels created by the scripts, including overflow channels](screenshots/12-channels-created.png)
+
+And the resulting live guide — real scheduled programming, each channel
+playing through its lineup:
+
+![Live guide with real scheduled programming](screenshots/13-guide-live.png)
 
 ## What's deliberately out of scope
 
