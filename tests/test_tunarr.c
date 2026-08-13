@@ -8,7 +8,14 @@
  * somewhere disposable — the Makefile target uses a temp dir. */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "tunarr.h"
+
+/* Internal to tunarr.c (not part of tunarr.h's public API), but not
+ * `static` specifically so this file can exercise them directly — see
+ * their definitions in tunarr.c for why. */
+time_t xmltv_parse_time(const char *s);
+void   xml_unescape_inplace(char *s);
 
 static int fails = 0, checks = 0;
 
@@ -64,6 +71,53 @@ int main(void)
         if (strcmp(url, want) != 0) {
             fails++;
             printf("  FAIL sanitized stream url\n    got  \"%s\"\n    want \"%s\"\n", url, want);
+        }
+    }
+
+    /* xmltv_parse_time: hand-rolled civil-date math, no timegm() dependency
+     * (see its comment in tunarr.c) — worth pinning against known-correct
+     * epoch values, unlike this file's usual policy of not fixture-testing
+     * response parsing. Expected values cross-checked against Python's
+     * datetime (UTC-aware) for the same wall-clock/offset inputs. */
+    {
+        struct { const char *label; const char *in; time_t want; } cases[] = {
+            { "epoch",             "19700101000000 +0000", 0 },
+            { "plain utc",         "20260812153159 +0000", 1786548719 },
+            { "positive offset",   "20260812200159 +0530", 1786545119 },
+            { "negative offset",   "20260812113159 -0400", 1786548719 },
+            { "too short",         "2026081215",           0 },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            checks++;
+            time_t got = xmltv_parse_time(cases[i].in);
+            if (got != cases[i].want) {
+                fails++;
+                printf("  FAIL xmltv_parse_time %s\n    got  %lld\n    want %lld\n",
+                       cases[i].label, (long long)got, (long long)cases[i].want);
+            }
+        }
+    }
+
+    /* xml_unescape_inplace: the entities XMLTV titles actually carry. */
+    {
+        struct { const char *label; const char *in; const char *want; } cases[] = {
+            { "no entities",  "Plain Title",                 "Plain Title" },
+            { "amp",          "Rock &amp; Roll",              "Rock & Roll" },
+            { "apos + #39",   "Don&apos;t &#39;Look Up&#39;", "Don't 'Look Up'" },
+            { "lt/gt/quot",   "&lt;A &quot;B&quot; C&gt;",    "<A \"B\" C>" },
+            { "unknown amp",  "Tom &amp Jerry",               "Tom &amp Jerry" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char buf[128];
+            strncpy(buf, cases[i].in, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            xml_unescape_inplace(buf);
+            checks++;
+            if (strcmp(buf, cases[i].want) != 0) {
+                fails++;
+                printf("  FAIL xml_unescape_inplace %s\n    got  \"%s\"\n    want \"%s\"\n",
+                       cases[i].label, buf, cases[i].want);
+            }
         }
     }
 

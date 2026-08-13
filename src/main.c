@@ -432,6 +432,76 @@ static int          g_tunarr_available = 0;
 static TunarrChannel g_channels[TUNARR_MAX_CHANNELS];
 static int           g_channel_count = 0;
 static int           g_channel_sel   = 0;
+/* Which of the selected channel's schedule[] entries L/R is currently
+ * showing — 0 is always "now" (see TunarrChannel's own comment on why
+ * schedule[0] isn't guaranteed to literally be airing this instant).
+ * Reset to 0 whenever the channel selection itself changes (channel_move_sel
+ * does this), so paging into a channel's future always starts from "now",
+ * never carries over from whatever was being browsed on a different
+ * channel. */
+static int            g_channel_sched_idx = 0;
+
+/* Decorative backdrop for the channel guide screen — the currently-selected
+ * channel's CURRENT program's poster (real per-program artwork from
+ * tunarr_get_guide()'s poster_url, not a generic channel icon — Tunarr
+ * channel icons are typically blank/identical across channels, confirmed
+ * against a real instance, so they weren't worth using here). Deliberately
+ * separate from g_backdrop_px (the Jellyfin info-screen hero image): the two
+ * screens' load/free lifecycles don't line up, and STATE_INFO's
+ * info_assets_free() has no business touching Live TV state. */
+static uint8_t *g_channel_bg_px = NULL;
+static int      g_channel_bg_w = 0, g_channel_bg_h = 0;
+static char      g_channel_bg_url[256] = "";
+
+static void channel_bg_free(void)
+{
+    if (g_channel_bg_px) { stbi_image_free(g_channel_bg_px); g_channel_bg_px = NULL; }
+    g_channel_bg_w = g_channel_bg_h = 0;
+    g_channel_bg_url[0] = '\0';
+}
+
+/* Loads the currently-shown schedule entry's poster (the selected channel's
+ * schedule[g_channel_sched_idx] — "now" by default, or whatever's being
+ * browsed via L/R) as the guide backdrop if it isn't already loaded — a
+ * plain string compare against g_channel_bg_url makes this cheap to call
+ * after every selection/browse change without re-downloading on every
+ * redraw. One blocking curl round trip + one stb_image decode when the
+ * poster actually changes; a no-op otherwise. */
+static void channel_bg_update(void)
+{
+    if (g_channel_count <= 0) { channel_bg_free(); return; }
+    TunarrChannel *ch = &g_channels[g_channel_sel];
+    int idx = (g_channel_sched_idx < ch->schedule_count) ? g_channel_sched_idx : 0;
+    const char *url = (ch->schedule_count > 0) ? ch->schedule[idx].poster_url : "";
+    if (!strcmp(url, g_channel_bg_url)) return;
+
+    channel_bg_free();
+    if (!url[0]) return;
+
+    if (tunarr_download_image(url, 480, POSTER_TMP))
+        g_channel_bg_px = load_image_tmp(POSTER_TMP, &g_channel_bg_w, &g_channel_bg_h);
+    strncpy(g_channel_bg_url, url, sizeof(g_channel_bg_url) - 1);
+}
+
+/* Root-menu hover preview for the "Live TV" carousel card — a dimmed
+ * mini-EPG behind the carousel (see draw_tv_preview_background below),
+ * fetched once per session the first time the card is hovered, same
+ * "cache once, never invalidate" convention grid.c's own per-library cover
+ * mosaics already use. Populates the SAME g_channels/g_channel_count the
+ * real guide screen (STATE_CHANNELS) uses — a deliberate freebie, not
+ * required for correctness, since entering the real screen re-fetches for
+ * freshness regardless (see the JF_TYPE_LIVE_TV root handler). */
+static int g_tv_preview_ready = 0;
+
+static void tv_preview_sync(void)
+{
+    if (g_tv_preview_ready) return;
+    int n = tunarr_list_channels(&g_tunarr_cfg, g_channels, TUNARR_MAX_CHANNELS);
+    if (n <= 0) return;
+    g_channel_count = n;
+    tunarr_get_guide(&g_tunarr_cfg, g_channels, g_channel_count);
+    g_tv_preview_ready = 1;
+}
 
 static JfItem g_items[JF_MAX_ITEMS];
 static int    g_item_count = 0;
@@ -646,6 +716,87 @@ static void spinner_show(FBDev *fb, double seconds)
         fb_flip(fb);
         usleep(SPINNER_BLINK_MS * 1000);
         frame_idx++;
+    }
+}
+
+/* Same safe-window reasoning as spinner_show above (the freshly-forked
+ * mplayer is still connecting/buffering and hasn't touched /dev/fb0 yet, so
+ * our own draw can't race its frame writes — same polling-for-real-video
+ * loop to detect the moment that stops being true), but for a Tunarr
+ * channel zap: shows a channel-info card — number, name, what's airing now
+ * (with time left) and what's next — instead of the generic blinking
+ * spinner. The zap already changed the picture; the useful thing to show
+ * during the couple seconds before the new stream's real frames arrive is
+ * "which channel did I just land on", not "loading". Deliberately a
+ * separate function rather than a spinner_show parameter: play()'s
+ * Jellyfin spinner has no per-channel "what's now/next" concept to show,
+ * so a shared function would need a bigger, uglier signature than just
+ * having two (same rationale play_channel() itself gives for not sharing
+ * play()'s body — see that comment). */
+static void channel_card_show(FBDev *fb, const TunarrChannel *ch, double seconds)
+{
+    fb_sync_back(fb);
+    fb_fill_rect_alpha(fb, 0, 0, fb->width, fb->height, 0, 0, 0, 150);
+
+    int cy = fb->height / 2 - 20;
+    fb_fill_rect_alpha(fb, 0, cy - 8, fb->width, 60, 0, 0, 0, 200);
+
+    /* Channel.icon.path — most real channels don't have one set (confirmed
+     * against a live 57-channel instance: none did), so this is a graceful
+     * "show it if it's there" rather than something load-bearing. Same
+     * scratch path / decode helper every other downloaded image in this
+     * file uses; a failed download or decode just leaves icon_px NULL and
+     * the header falls back to text-only, centered as before. */
+    uint8_t *icon_px = NULL;
+    int icon_w = 0, icon_h = 0;
+    if (ch->icon_path[0] && tunarr_download_image(ch->icon_path, 64, POSTER_TMP))
+        icon_px = load_image_tmp(POSTER_TMP, &icon_w, &icon_h);
+
+    char head[48];
+    snprintf(head, sizeof(head), "%d  %s", ch->number, ch->name);
+    int head_w   = text_width(fb, head, 2);
+    int icon_dsp = icon_px ? 28 : 0;
+    int gap      = icon_px ? 8 : 0;
+    int start_x  = (fb->width - (icon_dsp + gap + head_w)) / 2;
+    if (icon_px) {
+        fb_blit(fb, icon_px, icon_w, icon_h, start_x, cy - 4, icon_dsp, icon_dsp, 255);
+        stbi_image_free(icon_px);
+    }
+    draw_text(fb, start_x + icon_dsp + gap, cy, head, 2, 0xFF, 0xFF, 0x00);
+
+    if (ch->schedule_count > 0 && ch->schedule[0].title[0]) {
+        char left_s[16], now_buf[TUNARR_TITLE_LEN + 32];
+        double left = difftime(ch->schedule[0].stop, time(NULL));
+        fmt_time(left_s, sizeof(left_s), left > 0 ? left : 0.0);
+        snprintf(now_buf, sizeof(now_buf), "Now: %s (%s left)", ch->schedule[0].title, left_s);
+        draw_text(fb, (fb->width - text_width(fb, now_buf, 1)) / 2, cy + 22, now_buf, 1, COL_ITEM);
+    }
+    if (ch->schedule_count > 1 && ch->schedule[1].title[0]) {
+        char next_buf[TUNARR_TITLE_LEN + 16];
+        snprintf(next_buf, sizeof(next_buf), "Next: %s", ch->schedule[1].title);
+        draw_text(fb, (fb->width - text_width(fb, next_buf, 1)) / 2, cy + 34, next_buf, 1, COL_HINT);
+    }
+    fb_flip(fb);
+
+    uint32_t ref[SPINNER_SAMPLE_N];
+    int valid[SPINNER_SAMPLE_N];
+    for (int i = 0; i < SPINNER_SAMPLE_N; i++) {
+        valid[i] = SPINNER_SAMPLE_PTS[i].x < fb->width && SPINNER_SAMPLE_PTS[i].y < fb->height;
+        ref[i] = valid[i] ? *(const uint32_t *)(fb_mem_row(fb, SPINNER_SAMPLE_PTS[i].y)
+                                                          + SPINNER_SAMPLE_PTS[i].x * 4) : 0;
+    }
+
+    double until = now_sec() + seconds;
+    while (now_sec() < until) {
+        int changed = 0;
+        for (int i = 0; i < SPINNER_SAMPLE_N && !changed; i++) {
+            if (!valid[i]) continue;
+            uint32_t cur = *(const uint32_t *)(fb_mem_row(fb, SPINNER_SAMPLE_PTS[i].y)
+                                                         + SPINNER_SAMPLE_PTS[i].x * 4);
+            if (cur != ref[i]) changed = 1;
+        }
+        if (changed) return;   /* real frames arrived — stop holding the card up */
+        usleep(SPINNER_BLINK_MS * 1000);
     }
 }
 
@@ -995,6 +1146,27 @@ static int channel_move_sel(int delta)
     if (sel < 0) sel += g_channel_count;
     if (sel == g_channel_sel) return 0;
     g_channel_sel = sel;
+    g_channel_sched_idx = 0;   /* new channel — always start browsing from "now" */
+    return 1;
+}
+
+/* Moves the SELECTED channel's schedule cursor (g_channel_sched_idx) by
+ * delta — L/R "paging" forward/back through that one channel's upcoming
+ * programs, each with its own duration, rather than moving the channel
+ * selection (that's UP/DOWN's job). Clamped, not wrapping: a schedule is a
+ * real chronological sequence, not a cyclic list like the channels
+ * themselves, so there's no meaningful "wrap past the last known program
+ * back to now". Returns 1 if the cursor actually moved. */
+static int schedule_move(int delta)
+{
+    if (delta == 0 || g_channel_count <= 0) return 0;
+    TunarrChannel *ch = &g_channels[g_channel_sel];
+    if (ch->schedule_count <= 0) return 0;
+    int idx = g_channel_sched_idx + delta;
+    if (idx < 0) idx = 0;
+    if (idx > ch->schedule_count - 1) idx = ch->schedule_count - 1;
+    if (idx == g_channel_sched_idx) return 0;
+    g_channel_sched_idx = idx;
     return 1;
 }
 
@@ -1986,6 +2158,93 @@ static void draw_carousel_update_notice(FBDev *fb)
  * to the display's real refresh rate (an explicit sleep on top of that
  * just made every step slower for no benefit, once fb_flip started
  * waiting for vsync itself). */
+/* Which kind of dimmed background is currently behind the carousel — the
+ * per-library cover mosaic (grid.c) for an ordinary library card, or the
+ * Live TV mini-EPG below for the synthetic "Live TV" card. Switched at
+ * exactly the same point grid.c's own g_grid_active would be (see
+ * carousel_background_sync's call sites), so the background changes at the
+ * same fade-to-black midpoint during a slide either way — one is not a
+ * special case of the other from the animation's point of view. */
+typedef enum { CAROUSEL_BG_GRID, CAROUSEL_BG_TV_PREVIEW } CarouselBgKind;
+static CarouselBgKind g_carousel_bg_kind = CAROUSEL_BG_GRID;
+
+static void carousel_background_sync(FBDev *fb, const JfItem *item)
+{
+    if (item->type == JF_TYPE_LIVE_TV) {
+        g_carousel_bg_kind = CAROUSEL_BG_TV_PREVIEW;
+        tv_preview_sync();
+    } else {
+        g_carousel_bg_kind = CAROUSEL_BG_GRID;
+        grid_covers_sync(fb, item);
+    }
+}
+
+/* Kodi-style mini-EPG behind the carousel while "Live TV" is the hovered
+ * card — up to as many channel rows fit vertically, each a channel name
+ * plus a colored timeline segment for its current (and, space permitting,
+ * next) program, all on a shared time axis. Sourced entirely from
+ * tv_preview_sync()'s one xmltv.xml fetch, nothing further to load here.
+ * No program-title text on the bars themselves — at this font size and row
+ * height there's no room to make it legible, and the real guide screen
+ * (STATE_CHANNELS) already exists for that; this is a preview, not a
+ * duplicate of it. (An earlier version of this also drew a bright vertical
+ * "now" line across every row — dropped per user feedback: the bars alone
+ * already read fine, the line didn't add anything.) */
+static void draw_tv_preview_background(FBDev *fb)
+{
+    if (!g_tv_preview_ready || g_channel_count <= 0) return;
+
+    const int row_h = 15;
+    int content_top    = SAFE_Y + 24;
+    int content_bottom = fb->height - SAFE_Y_BOT - 20;
+    int rows = (content_bottom - content_top) / row_h;
+    if (rows > g_channel_count) rows = g_channel_count;
+    if (rows < 1) return;
+
+    int name_w = fb->width * 28 / 100;
+    int tl_x0  = SAFE_X + name_w;
+    int tl_w   = fb->width - SAFE_X - name_w - SAFE_X;
+    if (tl_w < 20) return;
+
+    time_t now       = time(NULL);
+    time_t win_start = now - 10 * 60;
+    time_t win_end   = now + 50 * 60;
+    double span      = (double)(win_end - win_start);
+
+#define TV_PREVIEW_X(t) (tl_x0 + (int)(((double)((t) - win_start) / span) * tl_w))
+
+    for (int i = 0; i < rows; i++) {
+        TunarrChannel *ch = &g_channels[i];
+        int y = content_top + i * row_h;
+
+        char label[40];
+        snprintf(label, sizeof(label), "%d %s", ch->number, ch->name);
+        truncate_to_width(fb, label, 1, name_w - 6);
+        draw_text(fb, SAFE_X, y + 2, label, 1, COL_DIM);
+
+        if (ch->schedule_count > 0) {
+            TunarrScheduleItem *now_item = &ch->schedule[0];
+            if (now_item->title[0] && now_item->stop > win_start && now_item->start < win_end) {
+                time_t s = now_item->start < win_start ? win_start : now_item->start;
+                time_t e = now_item->stop  > win_end   ? win_end   : now_item->stop;
+                int x0 = TV_PREVIEW_X(s), x1 = TV_PREVIEW_X(e);
+                if (x1 - x0 < 2) x1 = x0 + 2;
+                fb_fill_rect_alpha(fb, x0, y, x1 - x0, row_h - 3, COL_SEL_BG, 130);
+            }
+        }
+        if (ch->schedule_count > 1) {
+            TunarrScheduleItem *next_item = &ch->schedule[1];
+            if (next_item->title[0] && next_item->start < win_end) {
+                time_t s = next_item->start < win_start ? win_start : next_item->start;
+                int x0 = TV_PREVIEW_X(s), x1 = TV_PREVIEW_X(win_end);
+                if (x1 - x0 < 2) x1 = x0 + 2;
+                fb_fill_rect_alpha(fb, x0, y, x1 - x0, row_h - 3, COL_SEL_BG, 60);
+            }
+        }
+    }
+#undef TV_PREVIEW_X
+}
+
 static void carousel_slide_animate(FBDev *fb, int old_sel, int new_sel)
 {
     int cy = carousel_cy(fb);
@@ -1997,12 +2256,13 @@ static void carousel_slide_animate(FBDev *fb, int old_sel, int new_sel)
         uint8_t black_alpha = (uint8_t)(255 * fade_t);
 
         if (!switched && t >= 0.5) {
-            grid_covers_sync(fb, &g_items[new_sel]);
+            carousel_background_sync(fb, &g_items[new_sel]);
             switched = 1;
         }
 
         fb_clear(fb);
-        draw_grid_background(fb);
+        if (g_carousel_bg_kind == CAROUSEL_BG_TV_PREVIEW) draw_tv_preview_background(fb);
+        else draw_grid_background(fb);
         fb_fill_rect_alpha(fb, 0, 0, fb->width, fb->height, 0, 0, 0, black_alpha);
         draw_grid_gradient(fb);
         draw_top_bar(fb, "MiSTerFin");
@@ -2024,10 +2284,11 @@ static void draw_browse_carousel(FBDev *fb)
         return;
     }
 
-    grid_covers_sync(fb, &g_items[g_sel]);
+    carousel_background_sync(fb, &g_items[g_sel]);
 
     fb_clear(fb);
-    draw_grid_background(fb);
+    if (g_carousel_bg_kind == CAROUSEL_BG_TV_PREVIEW) draw_tv_preview_background(fb);
+    else draw_grid_background(fb);
     draw_grid_gradient(fb);
     draw_top_bar(fb, "MiSTerFin");
     draw_carousel_update_notice(fb);
@@ -2204,6 +2465,17 @@ static void draw_browse(FBDev *fb)
 static void draw_channels(FBDev *fb)
 {
     fb_clear(fb);
+
+    /* Selected channel's current-program poster, dimmed well below full
+     * opacity (blended against fb_clear's black) so the list stays
+     * readable on top — a real per-program image beats a generic channel
+     * icon here (Tunarr channel icons are typically blank/identical, see
+     * channel_bg_update()'s comment), and costs nothing extra beyond the
+     * one guide fetch already done to get "now"/"next" text. */
+    if (g_channel_bg_px)
+        fb_blit(fb, g_channel_bg_px, g_channel_bg_w, g_channel_bg_h,
+                0, 0, fb->width, fb->height, 70);
+
     draw_top_bar(fb, "Live TV");
 
     if (g_channel_count == 0) {
@@ -2233,14 +2505,44 @@ static void draw_channels(FBDev *fb)
         snprintf(line1, sizeof(line1), "%3d  %s", ch->number, ch->name);
         truncate_to_width(fb, line1, 1, row_max_w);
 
-        char line2[128] = {0};
-        if (ch->program_title[0]) {
-            if (ch->program_stop > now) {
-                char left[16];
-                fmt_time(left, sizeof(left), (double)(ch->program_stop - now));
-                snprintf(line2, sizeof(line2), "%s (%s left)", ch->program_title, left);
+        /* Every row but the selected one always shows schedule[0] ("now")
+         * plus a "-> Next" preview of schedule[1] — cheap, since every
+         * channel already has this from the one xmltv.xml fetch. The
+         * SELECTED row instead shows whichever schedule[] entry L/R has
+         * paged to (schedule_move()) — "now" by default, so it looks
+         * identical to every other row until you actually browse. */
+        int sched_idx = is_sel ? g_channel_sched_idx : 0;
+        if (sched_idx >= ch->schedule_count) sched_idx = 0;
+
+        char line2[256] = {0};
+        if (ch->schedule_count > 0) {
+            TunarrScheduleItem *cur = &ch->schedule[sched_idx];
+            if (sched_idx == 0) {
+                if (cur->stop > now) {
+                    char left[16];
+                    fmt_time(left, sizeof(left), (double)(cur->stop - now));
+                    snprintf(line2, sizeof(line2), "%s (%s left)", cur->title, left);
+                } else {
+                    snprintf(line2, sizeof(line2), "%s", cur->title);
+                }
+                /* "-> Next: <title>" appended rather than a 3rd row — ROW_H
+                 * (30px) only has room for 2 text rows at this font size. */
+                if (ch->schedule_count > 1) {
+                    size_t used = strlen(line2);
+                    snprintf(line2 + used, sizeof(line2) - used,
+                             "%s-> Next: %s", used ? "   " : "", ch->schedule[1].title);
+                }
             } else {
-                snprintf(line2, sizeof(line2), "%s", ch->program_title);
+                /* Browsing ahead: show what it is, how long it runs, and
+                 * how far off it is, plus a [n/total] cursor so paging
+                 * further with L/R (or back with L) has something to
+                 * orient against. */
+                char dur[16], starts_in[16];
+                fmt_time(dur, sizeof(dur), (double)(cur->stop - cur->start));
+                fmt_time(starts_in, sizeof(starts_in),
+                         (double)(cur->start > now ? cur->start - now : 0));
+                snprintf(line2, sizeof(line2), "<< %s (%s) in %s   [%d/%d] >>",
+                         cur->title, dur, starts_in, sched_idx + 1, ch->schedule_count);
             }
         }
         truncate_to_width(fb, line2, 1, row_max_w);
@@ -2256,7 +2558,7 @@ static void draw_channels(FBDev *fb)
         }
     }
 
-    const char *hint = "A:watch  UP/DOWN or L/R:channel  SELECT:random  B:back";
+    const char *hint = "A:watch  UP/DOWN:channel  LEFT/RIGHT:schedule  L/R:page  SELECT:random  B:back";
     draw_text(fb, (fb->width - text_width(fb, hint, 1))/2,
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
@@ -3752,6 +4054,9 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
         else if (inp & INP_R)   channel_move_sel(+1);
         else                    g_channel_sel = rand() % g_channel_count;
         player_stop();
+        /* play_channel() itself shows the "which channel did I land on"
+         * feedback (channel_card_show, during its own connecting-window —
+         * see that function's comment) — nothing further needed here. */
         play_channel(fb, &g_channels[g_channel_sel]);
         return PLAYER_FRAME_HANDLED;
     } else if (g_paused) {
@@ -3764,8 +4069,19 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
         if (g_playing_source == PLAY_SOURCE_JELLYFIN && (inp & INP_SELECT)) {
             submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED;
         }
-        if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
-        if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        /* No LEFT/RIGHT seek for Tunarr — it's a live channel, not a file
+         * with a seekable position, and seek_accumulate()'s eventual
+         * player_seek() unconditionally restarts via play(g_info_item.id,
+         * ...), the Jellyfin path with whatever item was last viewed there
+         * (stale/unrelated during a Tunarr session) — silently killing the
+         * live channel and playing that instead. Gated the same way the
+         * submenu binding right above already is. L/R already covers
+         * "move" for Tunarr here (channel zap, see the branch above this
+         * whole function). */
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN) {
+            if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+            if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        }
         if (inp & INP_A) player_pause_toggle();
         if (!g_pageflip_mode) {
             if (inp & INP_L) {
@@ -3791,8 +4107,12 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
             submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED;
         }
         if (inp & INP_A) player_pause_toggle();
-        if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
-        if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        /* No LEFT/RIGHT seek for Tunarr — see the paused branch above's
+         * comment for why (live channel, not a seekable file). */
+        if (g_playing_source == PLAY_SOURCE_JELLYFIN) {
+            if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
+            if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
+        }
         if (!g_pageflip_mode) {
             if (inp & INP_L) {
                 int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
@@ -4439,7 +4759,7 @@ static void play_channel(FBDev *fb, const TunarrChannel *ch)
 
     close(pfd[0]);
     g_cmd_fd = pfd[1];
-    spinner_show(fb, 2.0);
+    channel_card_show(fb, ch, 0.5);
 }
 
 /* ── music playback (audio-only, direct play — see jf_audio_stream_url) ──── */
@@ -5805,9 +6125,14 @@ int main(int argc, char **argv)
                     g_channel_count = tunarr_list_channels(&g_tunarr_cfg, g_channels,
                                                             TUNARR_MAX_CHANNELS);
                     if (g_channel_count > 0) {
-                        for (int c = 0; c < g_channel_count; c++)
-                            tunarr_get_now_playing(&g_tunarr_cfg, &g_channels[c]);
+                        /* One xmltv.xml fetch fills now+next for every
+                         * channel at once — see tunarr_get_guide()'s header
+                         * comment for why this replaced a per-channel
+                         * now_playing loop. */
+                        tunarr_get_guide(&g_tunarr_cfg, g_channels, g_channel_count);
                         g_channel_sel = 0;
+                        g_channel_sched_idx = 0;
+                        channel_bg_update();
                         state = STATE_CHANNELS;
                         draw_channels(&fb);
                     } else {
@@ -5859,21 +6184,37 @@ int main(int argc, char **argv)
             }
             if (inp & INP_UP)   nav |= channel_move_sel(-1);
             if (inp & INP_DOWN) nav |= channel_move_sel(+1);
-            /* L/R: a second, TV-remote-shaped input for the same channel
-             * up/down action as UP/DOWN — the channel list has no secondary
-             * axis to page through the way a long Jellyfin library does, so
-             * unlike STATE_BROWSE's L/R (a whole-page jump) these move the
-             * selection by exactly one channel, same as UP/DOWN. */
-            if (inp & INP_L) nav |= channel_move_sel(-1);
-            if (inp & INP_R) nav |= channel_move_sel(+1);
+            /* LEFT/RIGHT (the D-pad, not the shoulder buttons): page
+             * through the SELECTED channel's own upcoming schedule
+             * (schedule[], each entry with its own duration) — "now" by
+             * default, further with RIGHT, back with LEFT. The real
+             * xmltv.xml guide fetch gives every channel a short forward
+             * chain of programs that was otherwise going unused past
+             * "next", so this is what "browsing" a channel means here. */
+            if (inp & INP_LEFT)  nav |= schedule_move(-1);
+            if (inp & INP_RIGHT) nav |= schedule_move(+1);
+            /* L/R (shoulder buttons): page up/down the CHANNEL list itself
+             * (channel_move_sel already wraps for any delta, not just ±1,
+             * so a page jump is just a bigger one) — same
+             * "L/R is PageUp/PageDown" convention STATE_BROWSE's list mode
+             * uses. Kept distinct from LEFT/RIGHT above on purpose: paging
+             * through a schedule and paging through the channel list are
+             * different axes, and both are worth having a dedicated input
+             * for on a guide screen this dense. */
+            if (inp & INP_L) nav |= channel_move_sel(-visible_rows(&fb));
+            if (inp & INP_R) nav |= channel_move_sel(+visible_rows(&fb));
             /* SELECT: random channel — SELECT already means "randomize"
              * elsewhere (music library shuffle, STATE_BROWSE above), so
              * this reuses the same gesture rather than inventing a new one. */
             if ((inp & INP_SELECT) && g_channel_count > 0) {
                 g_channel_sel = rand() % g_channel_count;
+                g_channel_sched_idx = 0;
                 nav = 1;
             }
-            if (nav) draw_channels(&fb);
+            if (nav) {
+                channel_bg_update();
+                draw_channels(&fb);
+            }
             if ((inp & INP_A) && g_channel_count > 0) {
                 play_channel(&fb, &g_channels[g_channel_sel]);
                 state = STATE_PLAYING;
@@ -6075,6 +6416,7 @@ int main(int argc, char **argv)
     jf_log_close();
     player_stop();
     info_assets_free();
+    channel_bg_free();
     ddr_close();
     cursor_show();
     /* Blanking on the way out leaves the MiSTer showing an empty screen

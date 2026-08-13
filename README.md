@@ -335,7 +335,13 @@ A keyboard works standalone, with no gamepad attached.
 
 MiSTerFin can also browse and play channels from a [Tunarr](https://github.com/chrisbenincasa/tunarr) server — Tunarr turns a media library into scheduled "TV channels" you can zap through like a real tuner. It's entirely optional and opt-in: create `/media/fat/misterfin/tunarr.conf` with one line, your Tunarr server's URL, and a "Live TV" card appears on the root screen. With no `tunarr.conf`, nothing about the app changes.
 
-Once you're in the channel list: Up/Down or the L/R shoulder buttons zap channels, SELECT jumps to a random one, A tunes in. No configuration beyond the server URL is needed — Tunarr's API needs no authentication.
+Once you're in the channel list: Up/Down moves between channels, Left/Right pages through the *selected* channel's own upcoming schedule (each program with its duration and how far off it is — the backdrop follows along), the L/R shoulder buttons page the channel list a screen at a time, SELECT jumps to a random channel, and A tunes in. No configuration beyond the server URL is needed — Tunarr's API needs no authentication.
+
+The guide shows what's airing now (with time left) and what's up next on every channel, and the currently-shown program's real artwork appears dimmed behind the list — all from one fetch of Tunarr's own XMLTV export, the same feed a Kodi IPTV EPG import would use.
+
+Hovering the "Live TV" card on the root menu (before you've even opened it) shows a dimmed mini-guide behind the carousel — the same idea as Kodi's own Live TV preview. And while actually watching a channel, L/R zaps up/down and SELECT jumps to a random one without leaving playback, with a brief on-screen card (channel, what's now/next, and its logo if Tunarr has one set) confirming where you landed.
+
+LEFT/RIGHT don't seek during Tunarr playback the way they do for a Jellyfin file — a live channel has no seekable position to rewind or fast-forward into, so those two are simply inert there; L/R (channel zap) is the "move" gesture for Tunarr instead.
 
 **Want to generate a Tunarr channel lineup from your Jellyfin library in the first place?** See [`tunarr_scripts/`](tunarr_scripts/) — a self-contained toolkit for building genre-based movie channels and per-show channels automatically, including a docker-compose reference for deploying Tunarr itself.
 
