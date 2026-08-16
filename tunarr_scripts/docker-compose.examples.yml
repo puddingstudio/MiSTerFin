@@ -1,0 +1,94 @@
+# Annotated Tunarr deployment examples — NOT meant to be run as-is (this
+# file is documentation, not a real compose stack). Copy the block that
+# matches your setup into your own compose.yml/.env.
+#
+# Base shape below is a real, already-running configuration — same idea as
+# Tunarr's own quickstart (https://github.com/chrisbenincasa/tunarr,
+# docker/example.compose.yaml), with two additions worth calling out: the
+# GPU passthrough block and the Jellyfin-library bind mount. Full install
+# docs: https://tunarr.com/getting-started/installation/ — "Stream from
+# Disk" section referenced below is under
+# https://tunarr.com/configure/media_sources/jellyfin/
+
+# ─────────────────────────────────────────────────────────────────────────
+# 1. Base + Jellyfin library bind mount (Intel/AMD VAAPI GPU)
+# ─────────────────────────────────────────────────────────────────────────
+services:
+  tunarr:
+    image: ghcr.io/chrisbenincasa/tunarr:latest
+    container_name: tunarr
+    ports:
+      - "${TUNARR_PORT:-8000}:8000"
+    volumes:
+      - ${TUNARR_DATA_DIR:-/var/lib/tunarr}:/config/tunarr
+      - ${TUNARR_BACKUP_DIR:-/homelab_persistent/tunarr/backups}:/config/tunarr/backups
+      # Confirmed against Tunarr's own docs ("Stream from Disk" section):
+      # letting Tunarr read media files directly (instead of pulling them
+      # over the network through Jellyfin's API) meaningfully improves
+      # streaming performance and stability. The ONLY requirement is that
+      # the CONTAINER-SIDE path here is byte-identical to whatever
+      # container-side path Jellyfin itself uses for the same library — if
+      # Jellyfin's own compose has "- /mnt/media:/media/videos", use that
+      # exact right-hand side here too, regardless of what the host path
+      # looks like on either side. Get this wrong and streaming silently
+      # falls back to going over the network — no error, just slower.
+      - /media/videos:/media/videos:ro
+    tmpfs:
+      - ${TUNARR_TRANSCODE_DIR:-/tmp/tunarr-transcode}:size=${TUNARR_TRANSCODE_SIZE:-536870912}
+    environment:
+      - TZ=${TZ:-America/Los_Angeles}
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      # Find your own host's GIDs with: getent group render video
+      - "${DRI_RENDER_GID:-990}"
+      - "${DRI_VIDEO_GID:-44}"
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2. NVIDIA GPU variant — swap in for the `devices:`/`group_add:` block
+#    above if you have an NVIDIA GPU instead of Intel/AMD. Requires
+#    nvidia-container-toolkit installed on the HOST regardless of which
+#    form below you use — Compose alone doesn't provide GPU access.
+# ─────────────────────────────────────────────────────────────────────────
+#   environment:
+#     - TZ=${TZ:-America/Los_Angeles}
+#     - NVIDIA_VISIBLE_DEVICES=all
+#     - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+#   deploy:
+#     resources:
+#       reservations:
+#         devices:
+#           - driver: nvidia
+#             count: 1
+#             capabilities: [gpu]
+#
+# This is the modern Compose-spec form. Tunarr's own upstream example
+# (docker/example.compose.yaml) instead uses the older:
+#   runtime: nvidia
+# That form still works, but needs the deprecated nvidia Docker runtime
+# configured system-wide; the `deploy.resources.reservations.devices` form
+# above works with the current NVIDIA Container Toolkit without that
+# global daemon config, so it's the one to reach for on a fresh setup.
+
+# ─────────────────────────────────────────────────────────────────────────
+# 3. .env values referenced above
+# ─────────────────────────────────────────────────────────────────────────
+# TUNARR_PORT=8000
+# TUNARR_DATA_DIR=/var/lib/tunarr        # must be a LOCAL block device — SQLite
+#                                          # uses file locking, this can't be NFS
+# TUNARR_BACKUP_DIR=/homelab_persistent/tunarr/backups   # NFS is fine here,
+#                                          # backups are file copies, not live SQLite
+# TUNARR_TRANSCODE_DIR=/tmp/tunarr-transcode
+# TUNARR_TRANSCODE_SIZE=536870912         # 512 MiB tmpfs
+# TZ=America/Los_Angeles
+# DRI_RENDER_GID=990                       # from: getent group render
+# DRI_VIDEO_GID=44                         # from: getent group video
+
+# ─────────────────────────────────────────────────────────────────────────
+# After `docker compose up -d`: this container alone does nothing useful
+# yet — see README.md's "Prerequisites" section for the one-time step of
+# connecting Jellyfin and scanning your libraries inside Tunarr's own web
+# UI (http://<host>:8000/web) before running any of the create_*_channels
+# scripts.
+# ─────────────────────────────────────────────────────────────────────────

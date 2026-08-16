@@ -1,0 +1,22 @@
+# Genre -> channel mapping for create_movie_channels.py / create_mix_channels.py.
+#
+# One line per channel: "Channel Name: genre1, genre2, ..." — any Jellyfin
+# Genres value not listed anywhere in this file is skipped (not
+# auto-channeled), so start narrow and add lines as you go.
+#
+# Order matters: this file's line order IS the channel-numbering block
+# order (see WORKFLOW.md), and it's the tie-breaker when a movie matches
+# more than 2 genres (only the first 2 matches, in file order, are used).
+# Don't reorder existing lines once you've created channels from them.
+#
+# Copy this file to channel_genres.txt and edit for your library's actual
+# genre tags (check what Jellyfin reports with a quick browse of your
+# library, or via Jellyfin's own API).
+
+Action: Action
+Sci-Fi: Science Fiction
+Comedy: Comedy
+Drama: Drama
+Horror: Horror
+Thriller: Thriller
+Animation: Animation

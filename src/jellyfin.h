@@ -44,6 +44,13 @@ typedef enum {
     JF_TYPE_ARTIST,   /* MusicArtist — drills into albums, browsed like JF_TYPE_FOLDER */
     JF_TYPE_ALBUM,    /* MusicAlbum — drills into tracks, browsed like JF_TYPE_FOLDER */
     JF_TYPE_TRACK,    /* Audio — playable leaf, like JF_TYPE_MOVIE but audio-only */
+    /* Not a real Jellyfin item type — a synthetic marker main.c appends to
+     * the root FRAME_VIEWS list for the Tunarr "Live TV" card, purely so it
+     * can share the root carousel/list rendering and the same INP_A
+     * selection switch every other top-level entry already goes through.
+     * jellyfin.c/jf_list_views never emits this; nothing in this file's own
+     * parsing path can produce it. */
+    JF_TYPE_LIVE_TV,
     JF_TYPE_OTHER
 } JfItemType;
 

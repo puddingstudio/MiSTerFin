@@ -29,6 +29,7 @@ The UI is currently tuned for PAL/NTSC-resolution CRT output (288p/240p) — it 
   - [During video playback](#during-playback)
   - [Track picker (SELECT during video playback)](#track-picker)
   - [Now playing (music)](#now-playing)
+- [Live TV (Tunarr)](#live-tv)
 - [Known limitations](#known-limitations)
 - [Changelog](#changelog)
   - [v1.0.1](#v1-0-1) · [v1.0.0](#v1-0-0) · [v0.9.9](#v0-9-9) · [v0.9.8](#v0-9-8) · [v0.9.7](#v0-9-7) · [v0.9.6](#v0-9-6) · [v0.9.5](#v0-9-5) · [v0.9.4](#v0-9-4) · [v0.9.3](#v0-9-3) · [v0.9.2](#v0-9-2) · [v0.9.1](#v0-9-1) · [v0.9](#v0-9)
@@ -327,6 +328,22 @@ VSync is ON by default (tear-free) — turn it OFF if you'd rather trade tearing
 Reaching the end of a track auto-advances to the next one in the same list, same as any normal music player. Audio is direct-played, so seeking is a real in-place seek (no stop/restart the way video's seek needs).
 
 A keyboard works standalone, with no gamepad attached.
+
+---
+
+## <a id="live-tv"></a>Live TV (Tunarr)
+
+MiSTerFin can also browse and play channels from a [Tunarr](https://github.com/chrisbenincasa/tunarr) server — Tunarr turns a media library into scheduled "TV channels" you can zap through like a real tuner. It's entirely optional and opt-in: create `/media/fat/misterfin/tunarr.conf` with one line, your Tunarr server's URL, and a "Live TV" card appears on the root screen. With no `tunarr.conf`, nothing about the app changes.
+
+Once you're in the channel list: Up/Down moves between channels, Left/Right pages through the *selected* channel's own upcoming schedule (each program with its duration and how far off it is — the backdrop follows along), the L/R shoulder buttons page the channel list a screen at a time, SELECT jumps to a random channel, and A tunes in. No configuration beyond the server URL is needed — Tunarr's API needs no authentication.
+
+The guide shows what's airing now (with time left) and what's up next on every channel, and the currently-shown program's real artwork appears dimmed behind the list — all from one fetch of Tunarr's own XMLTV export, the same feed a Kodi IPTV EPG import would use.
+
+Hovering the "Live TV" card on the root menu (before you've even opened it) shows a dimmed mini-guide behind the carousel — the same idea as Kodi's own Live TV preview. And while actually watching a channel, L/R zaps up/down and SELECT jumps to a random one without leaving playback, with a brief on-screen card (channel, what's now/next, and its logo if Tunarr has one set) confirming where you landed.
+
+LEFT/RIGHT don't seek during Tunarr playback the way they do for a Jellyfin file — a live channel has no seekable position to rewind or fast-forward into, so those two are simply inert there; L/R (channel zap) is the "move" gesture for Tunarr instead.
+
+**Want to generate a Tunarr channel lineup from your Jellyfin library in the first place?** See [`tunarr_scripts/`](tunarr_scripts/) — a self-contained toolkit for building genre-based movie channels and per-show channels automatically, including a docker-compose reference for deploying Tunarr itself.
 
 ---
 
