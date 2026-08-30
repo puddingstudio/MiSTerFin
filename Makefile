@@ -45,6 +45,9 @@ test:
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_jellyfin_queries \
 		tests/test_jellyfin_queries.c src/jellyfin.c src/json.c
 	@/tmp/misterfin_test_jellyfin_queries
+	$(CC) $(CFLAGS) -o /tmp/misterfin_test_jellyfin_auth \
+		tests/test_jellyfin_auth.c src/jellyfin.c src/json.c
+	@/tmp/misterfin_test_jellyfin_auth
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_sfx tests/test_sfx.c -lpthread
 	@/tmp/misterfin_test_sfx
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_hero tests/test_hero.c src/draw.c

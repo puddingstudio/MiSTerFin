@@ -325,9 +325,16 @@ int jf_token_save(const JfConfig *cfg);
 int jf_token_load(JfConfig *cfg);
 void jf_token_clear(void);
 
-/* Cheap authenticated request, to tell a still-valid saved token from one the
- * server has since revoked. Returns 1 if the credential works. */
-int jf_credential_works(const JfConfig *cfg);
+typedef enum {
+    JF_CREDENTIAL_UNAVAILABLE = -1,
+    JF_CREDENTIAL_REJECTED = 0,
+    JF_CREDENTIAL_VALID = 1
+} JfCredentialStatus;
+
+/* Cheap authenticated request to validate a saved token. A 401/403 means the
+ * server explicitly rejected it; transport failures and other server errors
+ * remain distinct so startup does not erase a valid token during an outage. */
+JfCredentialStatus jf_credential_status(const JfConfig *cfg);
 
 /* Looks up cfg->username in GET /Users and fills in cfg->user_id. The raw
  * Jellyfin user id (a GUID) is not something a user can easily find in the

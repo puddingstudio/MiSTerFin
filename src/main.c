@@ -4967,12 +4967,22 @@ static void *startup_resolve_thread(void *arg)
 
     jf_log_init(&g_cfg);   /* no-op unless "DEBUGLOG" is in jellyfin.conf */
 
-    if (jf_token_load(&g_cfg) && jf_credential_works(&g_cfg)) {
+    int saved_token = jf_token_load(&g_cfg);
+    JfCredentialStatus token_status = saved_token
+        ? jf_credential_status(&g_cfg) : JF_CREDENTIAL_REJECTED;
+    if (token_status == JF_CREDENTIAL_VALID) {
         /* A previously earned Quick Connect token, still accepted. Checked
          * before the config's API key so that re-authenticating once sticks
          * even if a stale key is left in the file. */
         result = 1;
         startup_enter_browse();
+    } else if (token_status == JF_CREDENTIAL_UNAVAILABLE) {
+        /* A timeout or unreachable server says nothing about whether the
+         * credential is still valid. Keep token.conf so a reboot-time network
+         * race cannot turn a temporary connection failure into a forced new
+         * Quick Connect login. */
+        jf_log_line("startup: saved token validation unavailable; token retained");
+        result = 0;
     } else if (g_cfg.api_key[0] && g_cfg.username[0]) {
         /* Classic path: an admin-issued API key plus a username to resolve.
          * jf_token_load may have overwritten the credential with a dead
@@ -4982,9 +4992,9 @@ static void *startup_resolve_thread(void *arg)
         result = jf_resolve_user_id(&g_cfg);
         if (result == 1) startup_enter_browse();
     } else {
-        /* No usable credential — a saved token that no longer works ends up
-         * here too, which is what makes a revoked or expired login recover by
-         * itself instead of showing an error nobody can act on. */
+        /* No usable credential — an explicitly rejected saved token ends up
+         * here too, which makes a revoked login recover by itself instead of
+         * showing an error nobody can act on. */
         jf_token_clear();
         g_cfg.token[0] = '\0';
         g_cfg.user_id[0] = '\0';

@@ -699,7 +699,7 @@ pid_t jf_spawn_stream_curl(const JfConfig *cfg, const char *url, const char *fif
 
 static char *jf_request_alloc(const JfConfig *cfg, const char *method,
                                const char *path_and_query, const char *body_file,
-                               int timeout_secs)
+                               int timeout_secs, long *http_status)
 {
     char auth[320];
     jf_auth_header(cfg, auth, sizeof(auth));
@@ -722,6 +722,14 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
     n = jf_add_tls_args(cfg, argv, n);
     argv[n++] = "--max-time";
     argv[n++] = timeout;
+    if (http_status) {
+        /* Keep the status out of the response body for normal requests. The
+         * saved-token probe needs it to distinguish a rejected credential
+         * from a server or network failure, but every other caller only
+         * needs curl's usual success/failure result. */
+        argv[n++] = "--write-out";
+        argv[n++] = "\n%{http_code}";
+    }
     if (method) { argv[n++] = "-X"; argv[n++] = method; }
     argv[n++] = "-H";
     argv[n++] = auth;
@@ -740,6 +748,22 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
     char *result = jf_curl_run((char *const *)argv, 1, &ok);
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
+    if (http_status) {
+        *http_status = 0;
+        if (result) {
+            char *status_line = strrchr(result, '\n');
+            if (status_line && strlen(status_line + 1) == 3) {
+                char *end = NULL;
+                long parsed = strtol(status_line + 1, &end, 10);
+                if (end && *end == '\0') {
+                    *http_status = parsed;
+                    *status_line = '\0';
+                    if (result[0] == '\0') { free(result); result = NULL; }
+                }
+            }
+        }
+    }
+
     double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     /* ok alone, not "ok && result != NULL": a 204 No Content (the normal
      * response for the Sessions/Playing family) has an empty body, so
@@ -757,7 +781,7 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
 static int jf_fetch(const JfConfig *cfg, const char *path_and_query, JfResponse *r)
 {
     memset(r, 0, sizeof(*r));
-    r->text = jf_request_alloc(cfg, NULL, path_and_query, NULL, 8);
+    r->text = jf_request_alloc(cfg, NULL, path_and_query, NULL, 8, NULL);
     if (!r->text) return 0;
     if (!json_parse(&r->doc, r->text)) { jf_response_free(r); return 0; }
     return 1;
@@ -786,7 +810,7 @@ static void jf_post_json(const JfConfig *cfg, const char *path, const char *json
     /* Reuses the same no-shell path as every other request — see
      * jf_curl_run. The response is discarded, but the arguments still carry
      * the server-issued token. */
-    if (ok) free(jf_request_alloc(cfg, "POST", path, tmp_path, 5));
+    if (ok) free(jf_request_alloc(cfg, "POST", path, tmp_path, 5, NULL));
     unlink(tmp_path);
 }
 
@@ -1065,7 +1089,7 @@ static int jf_post_fetch(const JfConfig *cfg, const char *path,
         if (!ok) { unlink(tmp_path); return 0; }
     }
 
-    r->text = jf_request_alloc(cfg, "POST", path, json_body ? tmp_path : NULL, 10);
+    r->text = jf_request_alloc(cfg, "POST", path, json_body ? tmp_path : NULL, 10, NULL);
     if (json_body) unlink(tmp_path);
 
     if (!r->text) return 0;
@@ -1158,21 +1182,31 @@ int jf_quick_connect_authenticate(JfConfig *cfg, const JfQuickConnect *qc)
     return 1;
 }
 
-int jf_credential_works(const JfConfig *cfg)
+JfCredentialStatus jf_credential_status(const JfConfig *cfg)
 {
-    if (!jf_has_credential(cfg) || !cfg->user_id[0]) return 0;
+    if (!jf_has_credential(cfg) || !cfg->user_id[0]) return JF_CREDENTIAL_REJECTED;
 
     /* UserViews is the smallest authenticated, user-scoped call available —
-     * it fails for a revoked token but doesn't need elevated access the way
-     * /Users does. */
+     * it doesn't need elevated access the way /Users does. Ask curl for the
+     * HTTP status here so an explicit rejection remains distinguishable from
+     * a reboot-time network race, timeout, or server error. */
     char path[256];
     snprintf(path, sizeof(path), "/UserViews?userId=%s", cfg->user_id);
 
-    JfResponse r;
-    if (!jf_fetch(cfg, path, &r)) return 0;
-    int ok = json_find(&r.doc, NULL, "Items") != NULL;
+    JfResponse r = {0};
+    long http_status = 0;
+    r.text = jf_request_alloc(cfg, NULL, path, NULL, 8, &http_status);
+    if (http_status == 401 || http_status == 403) {
+        free(r.text);
+        return JF_CREDENTIAL_REJECTED;
+    }
+    if (http_status != 200 || !r.text || !json_parse(&r.doc, r.text)) {
+        jf_response_free(&r);
+        return JF_CREDENTIAL_UNAVAILABLE;
+    }
+    int valid = json_find(&r.doc, NULL, "Items") != NULL;
     jf_response_free(&r);
-    return ok;
+    return valid ? JF_CREDENTIAL_VALID : JF_CREDENTIAL_UNAVAILABLE;
 }
 
 int jf_resolve_user_id(JfConfig *cfg)
