@@ -6,6 +6,7 @@ jellyfin.conf
 token.conf
 device.conf
 crash.log
+debug.log
 __pycache__/
 *.pyc
 .DS_Store

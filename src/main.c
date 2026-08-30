@@ -52,16 +52,15 @@
  * GRID_POSTER_TMP) for its own main-thread downloads — same thread, so
  * sharing is deliberate and safe; keep the two in sync. */
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
-/* Per-item browse-list cover art, cached to the SD card (same idea as the
- * home-screen grid cache above) so scrolling a list reads covers from the
- * card instead of re-downloading each one — no network round-trip on the
+/* Per-item browse-list cover art, cached to persistent storage (same idea as
+ * the home-screen grid cache above) so scrolling a list reads covers from the
+ * cache instead of re-downloading each one — no network round-trip on the
  * main thread, so no scroll freeze and no blank-then-appear. A background
  * thread (cover_prefetch_thread) fills the cache for the current list;
  * COVER_TMP_BG is that thread's own download scratch path. */
 /* UI click/confirm clips. Same directory screenshot.c's shutter.wav lives in,
  * and already deployed by the Makefile and copied by the in-app updater. */
 #define SFX_DIR      "/media/fat/misterfin/sfx"
-#define COVER_CACHE_DIR "/media/fat/misterfin/covercache"
 #define COVER_TMP_BG   "/tmp/misterfin_cover_bg.img"
 #define CRASH_LOG    "/media/fat/misterfin/crash.log"
 /* mplayer's -af export writes live PCM samples to this mmap'd file for the
@@ -802,7 +801,7 @@ static void fetch_frame(void)
     }
 
     /* Fill the SD cover cache for this list in the background so scrolling
-     * reads covers off the card, never off the network. */
+     * reads covers from the persistent cache, never from the network. */
     start_cover_prefetch();
 }
 
@@ -1510,14 +1509,14 @@ static uint8_t *g_browse_cover_px = NULL;
 static int      g_browse_cover_w = 0, g_browse_cover_h = 0;
 static char     g_browse_cover_item_id[JF_ID_LEN] = "";
 
-/* Cache-file path for one item's cover on the SD card. Keyed by item id plus
+/* Cache-file path for one item's cover. Keyed by item id plus
  * a few chars of the image tag, so replacing the artwork server-side lands on
  * a new filename rather than serving stale art — and by the width it was
  * fetched at, so changing BROWSE_COVER_DL_W re-fetches instead of serving the
  * old size forever. Without that last part every card already in the wild
  * keeps whatever resolution it first cached, which is a change that silently
  * does nothing for existing users and works only on a fresh install. */
-static void cover_cache_path(const char *item_id, const char *tag, char *out, size_t outsz)
+static int cover_cache_path(const char *item_id, const char *tag, char *out, size_t outsz)
 {
     char safe[JF_ID_LEN + 12];
     size_t j = 0;
@@ -1531,23 +1530,27 @@ static void cover_cache_path(const char *item_id, const char *tag, char *out, si
         safe[j++] = isalnum((unsigned char)c) ? c : '_';
     }
     safe[j] = '\0';
-    snprintf(out, outsz, COVER_CACHE_DIR "/%s_w%d.img", safe, BROWSE_COVER_DL_W);
+    char dir[256];
+    if (!cache_dir_path("covercache", dir, sizeof(dir))) return 0;
+    int n = snprintf(out, outsz, "%s/%s_w%d.img", dir, safe, BROWSE_COVER_DL_W);
+    return n >= 0 && (size_t)n < outsz;
 }
 
-/* Downloads one cover into the SD cache if not already there. Downloads to a
- * ".tmp" sibling IN THE CACHE DIR (so the rename into place stays within one
- * filesystem — a /tmp->/media/fat rename fails with EXDEV) and renames it, so
- * the main thread's browse_cover_load never reads a half-written file. */
+/* Downloads one cover into the persistent cache if not already there.
+ * Downloads to a ".tmp" sibling IN THE CACHE DIR, then renames it so the main
+ * thread never reads a half-written file. Keeping both paths on one filesystem
+ * also avoids the EXDEV failure that a /tmp-to-/media/fat rename would cause. */
 static void cover_fetch_to_cache(const char *image_item_id, const char *tag,
                                   const char *item_id)
 {
     if (!tag[0]) return;
-    char cpath[160];
-    cover_cache_path(item_id, tag, cpath, sizeof(cpath));
+    char cpath[384];
+    if (!cover_cache_path(item_id, tag, cpath, sizeof(cpath))) return;
     struct stat st;
     if (stat(cpath, &st) == 0 && st.st_size > 0) return;   /* already cached */
-    mkdir(COVER_CACHE_DIR, 0755);   /* ensure the dir exists for tmp + final */
-    char tmp[176];
+    char dir[256];
+    if (!cache_dir_ensure("covercache", dir, sizeof(dir))) return;
+    char tmp[400];
     snprintf(tmp, sizeof(tmp), "%s.tmp", cpath);
     if (jf_download_item_image(&g_cfg, image_item_id, "Primary", tag,
                                 BROWSE_COVER_DL_W, tmp)) {
@@ -1569,10 +1572,10 @@ static const char *browse_cover_wanted_id(void)
     return wants ? it->id : "";
 }
 
-/* Loads the selected row's cover into the top-right panel — from the SD cache
- * ONLY, never the network. A cached cover shows instantly (no freeze, no
- * blank); an as-yet-uncached one leaves the panel blank until the background
- * prefetch (cover_prefetch_thread) writes it to the card, at which point the
+/* Loads the selected row's cover into the top-right panel — from the
+ * persistent cache ONLY, never the network. A cached cover shows instantly
+ * with no freeze; an uncached one leaves the panel blank until the background
+ * prefetch (cover_prefetch_thread) writes it to storage, at which point the
  * next browse redraw (~100ms, for the live clock/marquee) picks it up. So the
  * main thread never blocks on a per-item download — that was the scroll
  * freeze — and any list visited before shows every cover instantly. Stale art
@@ -1590,8 +1593,8 @@ static void browse_cover_load(void)
     g_browse_cover_item_id[0] = '\0';
     if (want[0] == '\0') return;   /* this item has no cover */
 
-    char cpath[160];
-    cover_cache_path(it->id, it->image_tag, cpath, sizeof(cpath));
+    char cpath[384];
+    if (!cover_cache_path(it->id, it->image_tag, cpath, sizeof(cpath))) return;
     int w = 0, h = 0;
     uint8_t *px = load_image_keep(cpath, &w, &h);
     if (!px) return;   /* not cached yet — blank; prefetch fills it, next redraw loads it */
@@ -1613,8 +1616,12 @@ static void browse_cover_load(void)
 static void *cache_sweep_thread(void *arg)
 {
     (void)arg;
-    int n  = cache_sweep_superseded(COVER_CACHE_DIR, ".img", "_w");
-    n     += cache_sweep_superseded(GRID_CACHE_DIR,  ".dat", "_w");
+    char cover_dir[256], grid_dir[256];
+    int n = 0;
+    if (cache_dir_path("covercache", cover_dir, sizeof(cover_dir)))
+        n += cache_sweep_superseded(cover_dir, ".img", "_w");
+    if (cache_dir_path("gridcache", grid_dir, sizeof(grid_dir)))
+        n += cache_sweep_superseded(grid_dir, ".dat", "_w");
     /* Only when it did something — on every launch after the first there is
      * nothing to find, and a line saying so each time is noise. */
     if (n > 0) jf_log_line("cache: reclaimed %d entries from a superseded key", n);
@@ -1666,7 +1673,7 @@ static char     g_hero_item_id[JF_ID_LEN] = "";
 /* 'h' prefix so a hero and a cover for the same item can't collide in the one
  * cache directory, plus the fetch width for the same reason cover_cache_path
  * carries it. */
-static void hero_cache_path(const char *item_id, const char *tag, char *out, size_t outsz)
+static int hero_cache_path(const char *item_id, const char *tag, char *out, size_t outsz)
 {
     char safe[JF_ID_LEN + 12];
     size_t j = 0;
@@ -1679,7 +1686,10 @@ static void hero_cache_path(const char *item_id, const char *tag, char *out, siz
         safe[j++] = isalnum((unsigned char)c) ? c : '_';
     }
     safe[j] = '\0';
-    snprintf(out, outsz, COVER_CACHE_DIR "/h%s_w%d.img", safe, HERO_DL_W);
+    char dir[256];
+    if (!cache_dir_path("covercache", dir, sizeof(dir))) return 0;
+    int n = snprintf(out, outsz, "%s/h%s_w%d.img", dir, safe, HERO_DL_W);
+    return n >= 0 && (size_t)n < outsz;
 }
 
 /* Mirror of cover_fetch_to_cache — same tmp-then-rename inside the cache dir
@@ -1687,13 +1697,14 @@ static void hero_cache_path(const char *item_id, const char *tag, char *out, siz
 static void hero_fetch_to_cache(const char *img_id, const char *tag, const char *item_id)
 {
     if (!tag[0] || !img_id[0]) return;
-    char cpath[176];
-    hero_cache_path(item_id, tag, cpath, sizeof(cpath));
+    char cpath[384];
+    if (!hero_cache_path(item_id, tag, cpath, sizeof(cpath))) return;
     if (access(cpath, F_OK) == 0) return;
 
-    char tmp[192];
+    char tmp[400];
     snprintf(tmp, sizeof(tmp), "%s.tmp", cpath);
-    mkdir(COVER_CACHE_DIR, 0755);
+    char dir[256];
+    if (!cache_dir_ensure("covercache", dir, sizeof(dir))) return;
     if (jf_download_item_image(&g_cfg, img_id, "Backdrop/0", tag, HERO_DL_W, tmp)) {
         if (rename(tmp, cpath) != 0) unlink(tmp);
     } else {
@@ -1711,8 +1722,8 @@ static const char *browse_hero_wanted_id(void)
     return (it && it->backdrop_tag[0]) ? it->id : "";
 }
 
-/* Same SD-cache-only rule as browse_cover_load: never a network fetch on the
- * main thread, so scrolling can't freeze. An uncached backdrop simply leaves
+/* Same persistent-cache-only rule as browse_cover_load: never a network fetch
+ * on the main thread, so scrolling can't freeze. An uncached backdrop leaves
  * the background black until the prefetch writes it and the next redraw picks
  * it up. */
 static void browse_hero_load(FBDev *fb)
@@ -1728,8 +1739,8 @@ static void browse_hero_load(FBDev *fb)
     g_hero_item_id[0] = '\0';
     if (want[0] == '\0') return;
 
-    char cpath[176];
-    hero_cache_path(it->id, it->backdrop_tag, cpath, sizeof(cpath));
+    char cpath[384];
+    if (!hero_cache_path(it->id, it->backdrop_tag, cpath, sizeof(cpath))) return;
     int w = 0, h = 0;
     uint8_t *px = load_image_keep(cpath, &w, &h);
     if (!px) return;
@@ -1741,9 +1752,10 @@ static void browse_hero_load(FBDev *fb)
     g_hero_item_id[sizeof(g_hero_item_id) - 1] = '\0';
 }
 
-/* Background fill of the SD cover cache for the current list, so scrolling
- * reads covers off the card. Snapshots the item ids/tags (never touches
- * g_items off-thread) and stops early if the list changed under it (g_cover_gen). */
+/* Background fill of the persistent cover cache for the current list, so
+ * scrolling reads covers without a network request. Snapshots the item
+ * ids/tags (never touches g_items off-thread) and stops early if the list
+ * changed under it (g_cover_gen). */
 typedef struct {
     int gen, n;
     struct { char id[JF_ID_LEN], img_id[JF_ID_LEN], tag[JF_ID_LEN],

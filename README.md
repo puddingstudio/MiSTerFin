@@ -169,11 +169,20 @@ tools/run-local.sh -k "down:200,a:1500" -o shot.png
 tools/run-local.sh --ntsc -k "a"              # 240-line NTSC geometry instead of PAL's 288
 ```
 
+Ghostty can display the framebuffer as a smooth, interactive 4:3 image through its Kitty graphics support. The helper builds the host binary, passes keyboard input directly to MiSTerFin and writes program output to `/tmp/misterfin-ghostty.log` so it cannot corrupt the image:
+
+```bash
+python3 tools/ghostty/ghostty_harness.py          # PAL
+python3 tools/ghostty/ghostty_harness.py --ntsc   # NTSC
+```
+
+See [`tools/ghostty/README.md`](tools/ghostty/README.md) for controls and additional options.
+
 It needs a `./jellyfin.conf` in the repo root pointing at a real server (gitignored, same file `--preview-browse` expects). **Video playback is not usable this way** — mplayer writes straight into a real framebuffer, which a malloc'd buffer can't stand in for; everything else (browsing, info screens, music metadata, menus, auth) works normally.
 
 `MISTERFIN_INPUT_DEBUG=1` works on real hardware too, not just on a desktop: it prints every incoming input event with its device, raw code and what it mapped to (or why it was dropped) to stderr, so run it over SSH rather than from the Scripts menu. MiSTer's input routing is genuinely unusual — it grabs directly-wired USB pads exclusively and re-emits them on a synthetic "MiSTer virtual input" device — so if a button isn't doing anything, this says whether it's arriving at all and under which code.
 
-The underlying switches are plain environment variables if you'd rather drive them yourself: `MISTERFIN_FB=640x288` picks the headless buffer size, `MISTERFIN_FRAME_OUT=<path>` dumps each frame, `MISTERFIN_STDIN=1` reads the terminal, and `MISTERFIN_KEYS="right,a:800"` plays a scripted sequence (`MISTERFIN_KEYS_HOLD=1` to stay running afterwards instead of quitting).
+The underlying switches are plain environment variables if you'd rather drive them yourself: `MISTERFIN_FB=640x288` picks the headless buffer size, `MISTERFIN_FRAME_OUT=<path>` dumps each frame, `MISTERFIN_CACHE_ROOT=<path>` selects the persistent artwork cache, `MISTERFIN_STDIN=1` reads the terminal, and `MISTERFIN_KEYS="right,a:800"` plays a scripted sequence (`MISTERFIN_KEYS_HOLD=1` to stay running afterwards instead of quitting).
 
 ---
 

@@ -26,9 +26,44 @@ uint8_t *load_image_keep(const char *path, int *w, int *h)
 }
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#define DEFAULT_CACHE_ROOT "/media/fat/misterfin"
+
+static const char *cache_root(void)
+{
+    const char *root = getenv("MISTERFIN_CACHE_ROOT");
+    return (root && root[0]) ? root : DEFAULT_CACHE_ROOT;
+}
+
+int cache_dir_path(const char *name, char *out, size_t outsz)
+{
+    if (!name || !name[0] || strchr(name, '/') || !out || outsz == 0) return 0;
+    const char *root = cache_root();
+    size_t len = strlen(root);
+    int n = snprintf(out, outsz, "%s%s%s", root,
+                     (len > 0 && root[len - 1] == '/') ? "" : "/", name);
+    return n >= 0 && (size_t)n < outsz;
+}
+
+static int ensure_dir(const char *path)
+{
+    if (mkdir(path, 0755) == 0) return 1;
+    if (errno != EEXIST) return 0;
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+int cache_dir_ensure(const char *name, char *out, size_t outsz)
+{
+    const char *root = cache_root();
+    if (!ensure_dir(root) || !cache_dir_path(name, out, outsz)) return 0;
+    return ensure_dir(out);
+}
 
 int cache_sweep_superseded(const char *dir, const char *ext, const char *keep_substr)
 {

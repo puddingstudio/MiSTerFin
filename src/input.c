@@ -266,11 +266,16 @@ static int stdin_key_to_mask(int key)
     case TK_DOWN:               return INP_DOWN;
     case TK_LEFT:               return INP_LEFT;
     case TK_RIGHT:              return INP_RIGHT;
-    /* Same pairing the evdev path uses: Enter/X confirm, Esc/Z back. */
+    /* Match literal A/B keys to the labels drawn on screen. The internal
+     * names follow controller positions: INP_A is screen B (confirm), and
+     * INP_B is screen A (back). Enter/X and Esc/Z retain the established
+     * keyboard and emulator-style alternatives. */
     case '\r': case '\n':
+    case 'b': case 'B':
     case 'x': case 'X':         return INP_A;
     case TK_ESC:
     case 0x7f: case '\b':
+    case 'a': case 'A':
     case 'z': case 'Z':         return INP_B;
     case '\t':                  return INP_SELECT;
     case TK_HOME: case 'p':     return INP_START;
@@ -634,4 +639,3 @@ int input_repeat(void)
     repeat_count++;
     return held;
 }
-

@@ -51,6 +51,7 @@ test:
 	@/tmp/misterfin_test_hero
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_cache_sweep tests/test_cache_sweep.c src/util.c
 	@/tmp/misterfin_test_cache_sweep
+	python3 -m unittest tools/ghostty/test_ghostty_harness.py
 
 # -lm: stb_image needs pow(), the Toasty sprite paths need sinf/sincosf. The
 # ARM build gets libm folded into libc by zig's target libc, so only the host

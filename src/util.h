@@ -1,6 +1,7 @@
 #ifndef UTIL_H
 #define UTIL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Monotonic seconds — the one timebase everything animates and times
@@ -13,9 +14,16 @@ double now_sec(void);
 uint8_t *load_image_tmp(const char *tmp_path, int *w, int *h);
 
 /* Like load_image_tmp but KEEPS the file — for reading a persistent cache
- * file off the SD card (the cover cache), where deleting it would defeat the
- * whole point. */
+ * file, where deleting it would defeat the whole point. */
 uint8_t *load_image_keep(const char *path, int *w, int *h);
+
+/* Builds one cache-directory path beneath MISTERFIN_CACHE_ROOT. The MiSTer
+ * install directory remains the default; the desktop harness overrides the
+ * root so the same artwork cache code works without a /media/fat mount. */
+int cache_dir_path(const char *name, char *out, size_t outsz);
+
+/* Creates the configured cache root and named child directory if needed. */
+int cache_dir_ensure(const char *name, char *out, size_t outsz);
 
 /* Deletes cache entries left behind by a superseded filename key: every
  * regular file directly in `dir` whose name ends in `ext` and does NOT

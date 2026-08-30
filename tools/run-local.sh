@@ -52,6 +52,8 @@ make --no-print-directory
 
 export MISTERFIN_FB="${WIDTH}x${HEIGHT}"
 export MISTERFIN_FRAME_OUT="$RAW"
+: "${MISTERFIN_CACHE_ROOT:=/tmp/misterfin-cache}"
+export MISTERFIN_CACHE_ROOT
 
 if [ -n "$KEYS" ]; then
     export MISTERFIN_KEYS="$KEYS"

@@ -1,5 +1,5 @@
-/* cache_sweep_superseded() — reclaiming cache entries whose filename key was
- * superseded by a change of fetch width.
+/* Cache path selection and cache_sweep_superseded(), which reclaims entries
+ * whose filename key was superseded by a change of fetch width.
  *
  * This is the one piece of code in the app that deletes the user's files, so
  * what it must NOT delete matters more than what it must. Every assertion
@@ -52,6 +52,28 @@ static int checks;
 
 int main(void)
 {
+    char cache_path[256];
+    unsetenv("MISTERFIN_CACHE_ROOT");
+    CHECK(cache_dir_path("covercache", cache_path, sizeof(cache_path)),
+          "default cache path builds");
+    CHECK(!strcmp(cache_path, "/media/fat/misterfin/covercache"),
+          "default remains the MiSTer install path");
+
+    assert(system("rm -rf /tmp/misterfin_test_cache_root") == 0);
+    setenv("MISTERFIN_CACHE_ROOT", "/tmp/misterfin_test_cache_root/", 1);
+    CHECK(cache_dir_path("gridcache", cache_path, sizeof(cache_path)),
+          "overridden cache path builds");
+    CHECK(!strcmp(cache_path, "/tmp/misterfin_test_cache_root/gridcache"),
+          "trailing slash is not duplicated");
+    CHECK(cache_dir_ensure("gridcache", cache_path, sizeof(cache_path)),
+          "override root and child are created");
+    struct stat cache_st;
+    CHECK(stat(cache_path, &cache_st) == 0 && S_ISDIR(cache_st.st_mode),
+          "created cache child is a directory");
+    CHECK(!cache_dir_path("../escape", cache_path, sizeof(cache_path)),
+          "cache child cannot contain a slash");
+    unsetenv("MISTERFIN_CACHE_ROOT");
+
     /* Fresh tree every run. */
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s/sub", DIR_PATH, DIR_PATH);
@@ -105,6 +127,7 @@ int main(void)
 
     snprintf(cmd, sizeof cmd, "rm -rf %s", DIR_PATH);
     (void)system(cmd);
+    assert(system("rm -rf /tmp/misterfin_test_cache_root") == 0);
     printf("cache sweep: %d checks, 0 failures\n", checks);
     return 0;
 }

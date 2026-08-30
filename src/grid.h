@@ -5,20 +5,15 @@
 #include "jellyfin.h"
 
 /* The home carousel's dimmed cover-art mosaic background: per-library cover
- * caches (RAM for the session, SD card across launches), a silent background
- * prefetch of every library, and the slow direction-alternating crawl it's
- * drawn with. Owns all of its own state — the only thing it needs from the
- * app is the server config, handed over once via grid_init(). */
+ * caches (RAM for the session, persistent storage across launches), a silent
+ * background prefetch of every library, and the slow direction-alternating
+ * crawl it's drawn with. Owns all of its own state — the only thing it needs
+ * from the app is the server config, handed over once via grid_init(). */
 
 /* Stores the config pointer every later download/count call uses. Call once
  * at startup, before anything else here — the pointed-to config must outlive
  * the app (it's main.c's global). */
 void grid_init(const JfConfig *cfg);
-
-/* Where the persisted mosaic caches live. In the header rather than grid.c
- * because startup also sweeps it for entries under a superseded filename key
- * (see cache_sweep_superseded). */
-#define GRID_CACHE_DIR "/media/fat/misterfin/gridcache"
 
 /* Makes `view`'s mosaic the active one, populating its cache slot first if
  * this is the first visit (blocking: disk cache, else network fetch with a

@@ -116,7 +116,7 @@ static void grid_cell_order_shuffle(GridLibCache *gc)
 
 /* Turns a Jellyfin GUID view_id into a safe filename — GUIDs are already
  * hex+dashes so this is just a defensive fallback, not real sanitizing. */
-static void grid_cache_disk_path(const char *view_id, int cell_w, char *out, size_t outsz)
+static int grid_cache_disk_path(const char *view_id, int cell_w, char *out, size_t outsz)
 {
     char safe[JF_ID_LEN];
     size_t j = 0;
@@ -129,8 +129,11 @@ static void grid_cache_disk_path(const char *view_id, int cell_w, char *out, siz
      * whatever width the mosaic asked for, and the staleness check below only
      * compares item counts — so without this, changing the fetch width (or
      * simply switching to a display mode with a different cell size) would go
-     * on serving the old resolution off the card forever. */
-    snprintf(out, outsz, GRID_CACHE_DIR "/%s_w%d.dat", safe, cell_w);
+     * on serving the old cached resolution forever. */
+    char dir[256];
+    if (!cache_dir_path("gridcache", dir, sizeof(dir))) return 0;
+    int n = snprintf(out, outsz, "%s/%s_w%d.dat", dir, safe, cell_w);
+    return n >= 0 && (size_t)n < outsz;
 }
 
 /* Persisted grid cache survives an app restart — without it, every
@@ -143,15 +146,15 @@ static void grid_cache_disk_path(const char *view_id, int cell_w, char *out, siz
  * that's a rare edge case for what's purely decorative background art.
  * Pixels are stored raw/uncompressed rather than re-encoded to JPEG (this
  * build's stb_image.h is decode-only, no encoder) — at most ~480KB per
- * library (12 covers * ~100x100x4 bytes), trivial for an SD card. */
+ * library (12 covers * ~100x100x4 bytes), trivial for persistent storage. */
 static int grid_cache_load_from_disk(GridLibCache *gc, const JfItem *view,
                                     const char *item_type, int cell_w)
 {
     int64_t current_count = jf_count_items(s_cfg, view->id, item_type);
     if (current_count < 0) return 0;
 
-    char path[300];
-    grid_cache_disk_path(view->id, cell_w, path, sizeof(path));
+    char path[384];
+    if (!grid_cache_disk_path(view->id, cell_w, path, sizeof(path))) return 0;
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
 
@@ -199,9 +202,10 @@ static void grid_cache_save_to_disk(const GridLibCache *gc, const char *view_id,
                                    int64_t count, int cell_w)
 {
     if (gc->count <= 0) return;
-    mkdir(GRID_CACHE_DIR, 0755);   /* ignore EEXIST/already-there */
-    char path[300];
-    grid_cache_disk_path(view_id, cell_w, path, sizeof(path));
+    char dir[256];
+    if (!cache_dir_ensure("gridcache", dir, sizeof(dir))) return;
+    char path[384];
+    if (!grid_cache_disk_path(view_id, cell_w, path, sizeof(path))) return;
     FILE *f = fopen(path, "wb");
     if (!f) return;
 
