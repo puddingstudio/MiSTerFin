@@ -292,7 +292,9 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
     JfItem grid_items[GRID_FETCH_MAX];
     int n;
 
-    if (view_is_synthetic(view)) {
+    if (view_is_live_tv(view)) {
+        n = 0;   /* channel images are logos, not a useful poster mosaic */
+    } else if (view_is_synthetic(view)) {
         /* No ParentId to list under — the covers are just the row's own
          * items. Deliberately not disk-cached either: the whole point of
          * these rows is that they change as things get watched, so a cache
@@ -332,7 +334,7 @@ static void grid_cache_populate(GridLibCache *gc, const JfItem *view,
         }
     }
     grid_cell_order_shuffle(gc);
-    if (!view_is_synthetic(view)) {
+    if (!view_is_synthetic(view) && !view_is_live_tv(view)) {
         int64_t count = jf_count_items(s_cfg, view->id, item_type);
         if (count >= 0) grid_cache_save_to_disk(gc, view->id, count, cell_w);
     }

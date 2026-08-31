@@ -2,11 +2,9 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-/* Jellyfin REST client — curl shelled out via popen(), no libcurl dependency.
- * All endpoints/params below were verified
- * against the official Jellyfin OpenAPI spec (see plan doc); a few optional
- * fields (MediaSourceId, PlaybackInfo negotiation) are intentionally omitted
- * rather than guessed — see README "Known limitations". */
+/* Jellyfin REST client — curl is executed directly, with no libcurl
+ * dependency. Endpoints and parameters are based on Jellyfin's API and the
+ * request flow used by Jellyfin Web. */
 
 #define JF_MAX_ITEMS   256
 /* How many items one browse request asks for. Smaller than JF_MAX_ITEMS on
@@ -23,6 +21,8 @@
  * the alternative is trusting a remote integer not to overflow int math. */
 #define JF_MAX_TOTAL_ITEMS 100000000
 #define JF_ID_LEN      40
+#define JF_LIVE_ID_LEN 256
+#define JF_STREAM_URL_LEN 1536
 #define JF_NAME_LEN    256
 #define JF_OVERVIEW_LEN 1024
 #define JF_PERSON_NAME_LEN 64
@@ -45,6 +45,7 @@ typedef enum {
     JF_TYPE_ARTIST,   /* MusicArtist — drills into albums, browsed like JF_TYPE_FOLDER */
     JF_TYPE_ALBUM,    /* MusicAlbum — drills into tracks, browsed like JF_TYPE_FOLDER */
     JF_TYPE_TRACK,    /* Audio — playable leaf, like JF_TYPE_MOVIE but audio-only */
+    JF_TYPE_LIVE_CHANNEL, /* TvChannel/LiveTvChannel — tuner-backed live stream */
     JF_TYPE_OTHER
 } JfItemType;
 
@@ -113,6 +114,8 @@ typedef struct {
      * essential for the Continue Watching / Next Up rows, where an episode
      * called "Episode 03" is otherwise unidentifiable. */
     char       series_name[JF_NAME_LEN];
+    char       channel_number[32];       /* Number/ChannelNumber — live channels only */
+    char       current_program[JF_NAME_LEN]; /* CurrentProgram.Name — live channels only */
     char       collection_type[16];  /* CollectionType — "movies"/"tvshows"/"music"/...,
                                        * library views only (jf_list_views), empty otherwise */
     JfItemType type;
@@ -394,26 +397,42 @@ int jf_list_items_recursive(const JfConfig *cfg, const char *parent_id,
  * this, refetching a fresh batch each time the current one runs out. */
 int jf_list_random_tracks(const JfConfig *cfg, const char *parent_id, JfItem *out, int max);
 
-/* Sentinel ids for the two synthetic home-screen entries. These aren't real
+/* Sentinel ids for the synthetic home-screen entries. These aren't real
  * library views — there is nothing on the server they correspond to — so they
  * get ids that cannot collide with a Jellyfin GUID while still surviving
  * jf_sanitize_id unchanged (which is what makes them safe as grid-cache
  * filenames). */
 #define JF_VIEW_RESUME  "misterfin-resume"
 #define JF_VIEW_NEXTUP  "misterfin-nextup"
+#define JF_VIEW_LIVE_TV "misterfin-live-tv"
 
 /* Values for JfItem.synthetic. The ids above remain as grid-cache keys; these
  * are what the code actually branches on. */
 #define JF_SYNTH_RESUME 1
 #define JF_SYNTH_NEXTUP 2
+#define JF_SYNTH_LIVE_TV 3
 
-/* The two home rows are presented as extra cards on the library carousel, but
- * they aren't libraries — no ParentId to list, no collection type, and their
- * contents change every time something is watched. Everything that would
- * normally reach for the server via a view id has to route around them. */
+/* Synthetic entries are extra cards on the library carousel, but they are
+ * not library views and have no ParentId or collection type. Everything that
+ * would normally reach for the server through a view id must route around
+ * them to the corresponding home-row or Live TV endpoint. */
 int view_is_resume(const JfItem *v);
 int view_is_nextup(const JfItem *v);
+int view_is_live_tv(const JfItem *v);
 int view_is_synthetic(const JfItem *v);
+
+/* Returns 1 when the authenticated user has at least one visible Live TV
+ * channel, 0 when Live TV is unavailable or empty. */
+int jf_live_tv_available(const JfConfig *cfg);
+
+/* Lists Jellyfin Live TV channels with each channel's current program.
+ * Results retain the server's order and are paginated like library items. */
+int jf_list_live_tv_channels(const JfConfig *cfg, int start_index,
+                              JfItem *out, int max, int64_t *total_out);
+
+/* Builds the request path used by jf_list_live_tv_channels. */
+void jf_build_live_tv_channels_path(const JfConfig *cfg, int start_index, int max,
+                                     char *path, size_t path_size);
 
 /* The BaseItemKind that actually represents "one unit" of a library, keyed
  * off CollectionType — used both for the carousel's "N movies/series/
@@ -468,6 +487,13 @@ typedef struct {
     int max_height;
     int video_bitrate;   /* bits/sec */
 } JfStreamProfile;
+
+typedef struct {
+    char live_stream_id[JF_LIVE_ID_LEN];
+    char media_source_id[JF_LIVE_ID_LEN];
+    char play_session_id[64];
+    char stream_url[JF_STREAM_URL_LEN];
+} JfLivePlayback;
 
 /* What the client asks the server to transcode down to, before mplayer scales
  * it back up (or down) to fill the framebuffer.
@@ -536,6 +562,39 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
                    const char *play_session_id, int burn_in_sub_index,
                    int audio_stream_index,
                    char *out, int outlen);
+
+/* Opens a tuner-backed channel through Jellyfin's playback-info workflow.
+ * The result retains the negotiated URL and identifiers for playback session
+ * reporting. A stopped session report normally releases the live stream.
+ * jf_close_live_tv_stream is the cleanup fallback when reporting is not
+ * possible, such as an incomplete response or application shutdown. */
+int jf_open_live_tv_stream(const JfConfig *cfg, const char *channel_id,
+                            const JfStreamProfile *profile,
+                            JfLivePlayback *playback);
+int jf_build_live_tv_playback_info_body(const JfConfig *cfg,
+                                         const JfStreamProfile *profile,
+                                         char *out, int outlen);
+void jf_build_live_tv_playback_info_path(const char *channel_id,
+                                          char *path, size_t path_size);
+void jf_close_live_tv_stream(const JfConfig *cfg, const char *live_stream_id);
+/* Builds Jellyfin's playback-session payload. Pass failed=-1 for start and
+ * progress reports, where Failed is not part of the request. */
+int jf_build_live_tv_playstate_body(const JfLivePlayback *playback,
+                                     const char *item_id, int64_t position_ticks,
+                                     int paused, int failed,
+                                     char *out, int outlen);
+void jf_report_live_tv_start(const JfConfig *cfg, const JfLivePlayback *playback,
+                              const char *item_id);
+void jf_report_live_tv_progress(const JfConfig *cfg, const JfLivePlayback *playback,
+                                 const char *item_id, int64_t position_ticks);
+void jf_report_live_tv_stopped(const JfConfig *cfg, const JfLivePlayback *playback,
+                                const char *item_id, int64_t position_ticks,
+                                int failed);
+
+/* Resolves Jellyfin's negotiated transcode path against the configured server
+ * and adds URL authentication for mplayer. */
+int jf_live_tv_transcoding_url(const JfConfig *cfg, const char *transcoding_url,
+                                char *out, int outlen);
 
 /* Builds a direct-play audio stream URL (static=true — no server transcode:
  * confirmed against a real server that a plain FLAC/MP3 track streams back

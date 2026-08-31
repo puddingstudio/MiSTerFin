@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/hero.png" width="100%" alt="MiSTerFin screenshot collage"></p>
 
-A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfpga.org) platform. Browse your Movies/TV/Music library, see cover art and overview, and play back on a CRT — video is server-side transcoded and letterboxed to PAL or NTSC, with client-side subtitles, full pause/seek/resume support, and a proper music player with a now-playing screen. Works with whatever analog output your MiSTer is already set up for (SCART, composite, component, ...) — MiSTerFin just writes to the standard framebuffer, same as any other MiSTer app.
+A [Jellyfin](https://jellyfin.org) client for the [MiSTer FPGA](https://misterfpga.org) platform. Browse your Movies/TV/Music libraries and Live TV channels, see cover art and overview, and play back on a CRT — video is server-side transcoded and letterboxed to PAL or NTSC, with client-side subtitles, full pause/seek/resume support for library video, and a proper music player with a now-playing screen. Works with whatever analog output your MiSTer is already set up for (SCART, composite, component, ...) — MiSTerFin just writes to the standard framebuffer, same as any other MiSTer app.
 
 Having trouble getting it onto a CRT? Check [docs/DISPLAY_COMPATIBILITY.md](docs/DISPLAY_COMPATIBILITY.md) for confirmed working display/cable/`MiSTer.ini` combinations.
 
@@ -93,6 +93,7 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 - **Browsing within a library** (movies/series/albums/episodes/tracks) uses a list with cover art per item, watched/resume badges, a live clock, and a scrolling marquee for titles too long to fit (e.g. "Artist / Album", "Series / Season"). Albums show year + track count, artists show album count, and series show season + episode count
 - **Info screen** with cover art, description, year, and status
 - **Video playback** is server-side transcoded with correct letterbox/pillarbox scaling for any source aspect ratio
+- **Live TV** lists the authenticated user's Jellyfin channels in server order, shows each channel's current program, and uses Jellyfin's provider-independent playback negotiation and session-reporting flow to request a MiSTer-compatible stream
 - **True interlaced output (576i/480i)** is possible on a CRT TV — smoother, broadcast-style motion instead of the scanline look, and genuinely tear-free thanks to a hardware page-flip technique. It runs on a standalone core that doesn't touch any MiSTer system files, switched live with a button combo: see the [step-by-step guide](docs/DISPLAY_COMPATIBILITY.md#interlaced-output), confirmed working over SCART and Component/YPbPr, both PAL and NTSC
 - **Pause menu** with a live progress bar, VSync ON/OFF toggle, resume/stop
 - **Subtitles** are rendered client-side (instant toggle/switch, no re-buffering) for text-based tracks, with a picker menu and live sync fine-tuning; image-based tracks (PGS/VobSub — no text to hand back client-side) fall back to a server-side burn-in automatically instead of silently failing to show. ASS/SSA subtitles are cleaned up on the way in — inline override codes like `{\an8}` and `{\i1}` are stripped rather than drawn on screen as literal text
@@ -105,7 +106,7 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 
 ## <a id="scope"></a>Scope (v1)
 
-- Movies, TV shows, Music, and Music Videos — no photo libraries
+- Movies, TV shows, Music, Music Videos, and Jellyfin Live TV — no photo libraries
 - Server-side transcode for video (the MiSTer's ARM Cortex-A9 can't decode arbitrary HEVC/4K sources locally) to a CRT-sized stream, then letterboxed/pillarboxed client-side to exactly fill the PAL/NTSC frame
 - Audio plays back directly (`static=true`, no server transcode) — this mplayer build decodes FLAC/MP3 natively, and there's no letterboxing concern for audio the way there is for video
 
@@ -333,8 +334,9 @@ A keyboard works standalone, with no gamepad attached.
 
 ## <a id="known-limitations"></a>Known limitations
 
-Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, including Music), resume position, cover art, subtitles, video playback (transcoded over TS), and music playback (direct-played FLAC/MP3) all confirmed working end-to-end on real MiSTer hardware.
+Verified against a real Jellyfin 10.11 server: auth, browsing (views/items, including Music), resume position, cover art, subtitles, video playback (transcoded over TS), music playback (direct-played FLAC/MP3), and Live TV channel browsing/playback all confirmed working end-to-end on real MiSTer hardware.
 
+- **Live TV currently covers channel browsing and playback, not the full TV experience.** It requires a working Live TV source already configured in Jellyfin. MiSTerFin uses only Jellyfin's standard Live TV and playback APIs, so the implementation is provider-agnostic. Playback has been tested with Jellyfin's built-in HDHomeRun integration; other Jellyfin Live TV providers should work but have not yet been verified. There is no program-grid view, recording management, pause, seek, or track picker during a live stream.
 - **`playSessionId` is required on the video stream URL.** Without it, Jellyfin can silently serve back a stale cached transcode from an earlier request instead of honoring the current `maxWidth`/`maxHeight`/`videoBitRate` — confirmed on a real server. Already handled in `jf_stream_url()`.
 - **Hardware-accelerated server transcoding (QSV/NVENC/VAAPI) may be broken on the user's server and is outside this client's control.** If `/Videos/{id}/stream` returns HTTP 500, check the Jellyfin server log (`/System/Logs`) for `FfmpegException` — if the ffmpeg command line shows `h264_qsv`/`h264_nvenc`/`vaapi`, the fix is server-side: Dashboard → Playback → Transcoding → Hardware acceleration → None (or fix the GPU driver).
 - **No NEON-accelerated colorspace conversion in this mplayer/ffmpeg build.** Total pixel count (resolution) is what actually costs CPU, not bitrate — confirmed on hardware that doubling `videoBitRate` at a fixed resolution moved average CPU usage by only ~1 percentage point, while trying native PAL resolution (720x576) instead of the default 480x270 caused continuously growing A/V desync and pegged the CPU. Keep the transcode resolution small and spend bitrate freely on quality instead; let mplayer's own `-vf` scale it back up, which is cheap relative to decode.

@@ -87,8 +87,8 @@ VIEWS = [
     {"Id": "view-movies", "Name": "Movies",   "CollectionType": "movies"},
     {"Id": "view-tv",     "Name": "TV Shows", "CollectionType": "tvshows"},
     {"Id": "view-music",  "Name": "Music",    "CollectionType": "music"},
+    {"Id": "view-live-tv", "Name": "Live TV", "CollectionType": "livetv"},
 ]
-
 
 def base_item(item_id, name, item_type, **extra):
     item = {
@@ -102,6 +102,19 @@ def base_item(item_id, name, item_type, **extra):
     }
     item.update(extra)
     return item
+
+
+LIVE_CHANNELS = [
+    base_item("channel-2-1", "WGBH", "TvChannel", Number="2.1",
+              CurrentProgram={"Name": "Nature", "StartDate": "2026-08-30T19:00:00Z",
+                              "EndDate": "2026-08-30T20:00:00Z"}),
+    base_item("channel-5-1", "WCVB", "TvChannel", Number="5.1",
+              CurrentProgram={"Name": "Evening News", "StartDate": "2026-08-30T19:30:00Z",
+                              "EndDate": "2026-08-30T20:00:00Z"}),
+    base_item("channel-7-1", "WHDH", "TvChannel", Number="7.1",
+              CurrentProgram={"Name": "Local Sports", "StartDate": "2026-08-30T19:00:00Z",
+                              "EndDate": "2026-08-30T21:00:00Z"}),
+]
 
 
 def build_library():
@@ -366,6 +379,13 @@ class Handler(BaseHTTPRequestHandler):
                                CollectionType=v["CollectionType"]) for v in VIEWS]
             return self._send({"Items": views, "TotalRecordCount": len(views)})
 
+        if path == "/LiveTv/Channels":
+            total = len(LIVE_CHANNELS)
+            start = int(query.get("StartIndex", [0])[0])
+            limit = int(query.get("Limit", [total])[0])
+            return self._send({"Items": LIVE_CHANNELS[start:start + limit],
+                               "TotalRecordCount": total, "StartIndex": start})
+
         if path == "/QuickConnect/Enabled":
             return self._send("true")
 
@@ -457,6 +477,54 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"AccessToken": "mock-access-token",
                                "ServerId": "mockserver",
                                "User": {"Id": USER_ID, "Name": USER_NAME}})
+
+        m = re.match(r"^/Items/([^/]+)/PlaybackInfo$", path)
+        if m:
+            if not self._authorized():
+                return self._send_401()
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            required = {
+                "UserId": USER_ID,
+                "StartTimeTicks": 0,
+                "IsPlayback": True,
+                "AutoOpenLiveStream": True,
+                "EnableDirectPlay": False,
+                "EnableDirectStream": False,
+                "EnableTranscoding": True,
+                "AllowVideoStreamCopy": False,
+                "AllowAudioStreamCopy": False,
+            }
+            if any(body.get(key) != value for key, value in required.items()):
+                return self._send({"Error": "invalid PlaybackInfo request"}, status=400)
+            profile = body.get("DeviceProfile", {})
+            transcodes = profile.get("TranscodingProfiles", [])
+            codec_profiles = profile.get("CodecProfiles", [])
+            conditions = codec_profiles[0].get("Conditions", []) if codec_profiles else []
+            properties = {condition.get("Property") for condition in conditions}
+            if (not transcodes or
+                    transcodes[0].get("Container") != "ts" or
+                    transcodes[0].get("VideoCodec") != "mpeg2video" or
+                    transcodes[0].get("AudioCodec") != "mp3" or
+                    profile.get("MaxStreamingBitrate") != body.get("MaxStreamingBitrate") or
+                    not {"Width", "Height", "VideoFramerate"} <= properties):
+                return self._send({"Error": "invalid device profile"}, status=400)
+            channel_id = m.group(1)
+            media_source_id = "native_" + "a" * 72
+            live_stream_id = "mock_" + "b" * 160
+            return self._send({
+                "MediaSources": [{
+                    "Id": media_source_id,
+                    "LiveStreamId": live_stream_id,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": (
+                        f"/Videos/{channel_id}/stream.ts?MediaSourceId={media_source_id}"
+                        f"&mpeg2video-level=4&LiveStreamId={live_stream_id}"
+                        "&ApiKey=mock-api-key"
+                    ),
+                }],
+                "PlaySessionId": "mock-play-session",
+            })
 
         # Playback reporting / user data writes — accepted and ignored.
         length = int(self.headers.get("Content-Length", 0))

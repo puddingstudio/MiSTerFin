@@ -288,6 +288,8 @@ static void parse_item_fields(const JsonDoc *doc, const JsonNode *item, JfItem *
     else if (!strcmp(type_buf, "MusicArtist"))   it->type = JF_TYPE_ARTIST;
     else if (!strcmp(type_buf, "MusicAlbum"))    it->type = JF_TYPE_ALBUM;
     else if (!strcmp(type_buf, "Audio"))         it->type = JF_TYPE_TRACK;
+    else if (!strcmp(type_buf, "TvChannel") ||
+             !strcmp(type_buf, "LiveTvChannel")) it->type = JF_TYPE_LIVE_CHANNEL;
     else if (!strcmp(type_buf, "CollectionFolder") ||
              !strcmp(type_buf, "Folder"))        it->type = JF_TYPE_FOLDER;
     else                                          it->type = JF_TYPE_OTHER;
@@ -298,6 +300,14 @@ static void parse_item_fields(const JsonDoc *doc, const JsonNode *item, JfItem *
     }
     if (it->type == JF_TYPE_EPISODE)
         copy_display_str(doc, item, "SeriesName", it->series_name, sizeof(it->series_name));
+    if (it->type == JF_TYPE_LIVE_CHANNEL) {
+        if (!copy_display_str(doc, item, "Number", it->channel_number,
+                              sizeof(it->channel_number)))
+            copy_display_str(doc, item, "ChannelNumber", it->channel_number,
+                             sizeof(it->channel_number));
+        copy_display_str(doc, item, "CurrentProgram.Name", it->current_program,
+                         sizeof(it->current_program));
+    }
 
     copy_raw_str(doc, item, "CollectionType", it->collection_type, sizeof(it->collection_type));
 
@@ -616,7 +626,7 @@ void jf_log_line(const char *fmt, ...)
  * secret, an ApiKey on a media URL) lands after that character, so the cut
  * removes it regardless of which endpoint this is. */
 static void jf_log_request(const char *method, const char *path_and_query,
-                            int ok, double elapsed_ms, long bytes)
+                            int ok, int http_status, double elapsed_ms, long bytes)
 {
     if (!g_jf_log) return;
 
@@ -630,9 +640,9 @@ static void jf_log_request(const char *method, const char *path_and_query,
     char ts[16];
     strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&now));
 
-    fprintf(g_jf_log, "[%s] %-4s %-48s %-4s %6.0fms %6ld bytes\n",
+    fprintf(g_jf_log, "[%s] %-4s %-48s %-4s http=%03d %6.0fms %6ld bytes\n",
             ts, method ? method : "GET", path_only,
-            ok ? "ok" : "FAIL", elapsed_ms, bytes);
+            ok ? "ok" : "FAIL", http_status, elapsed_ms, bytes);
     fflush(g_jf_log);   /* request rate is low; a crash right after must not lose this line */
 }
 
@@ -715,7 +725,7 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
 
     /* Built as a plain argv. Each element reaches curl exactly as written,
      * with no quoting, escaping or word splitting anywhere in between. */
-    const char *argv[24];
+    const char *argv[26];
     int n = 0;
     argv[n++] = "curl";
     argv[n++] = "-sf";
@@ -731,6 +741,8 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
         argv[n++] = "--data-binary";
         argv[n++] = body_arg;
     }
+    argv[n++] = "--write-out";
+    argv[n++] = "\n%{http_code}";
     argv[n++] = url;
     argv[n]   = NULL;
 
@@ -745,8 +757,23 @@ static char *jf_request_alloc(const JfConfig *cfg, const char *method,
      * response for the Sessions/Playing family) has an empty body, so
      * result is NULL even though curl's own exit status says the request
      * succeeded — logging that as FAIL was blaming the wrong thing. */
-    jf_log_request(method, path_and_query, ok, elapsed_ms,
-                    result ? (long)strlen(result) : 0);
+    int http_status = 0;
+    long body_bytes = 0;
+    if (result) {
+        size_t len = strlen(result);
+        if (len >= 4 && result[len - 4] == '\n' &&
+            result[len - 3] >= '0' && result[len - 3] <= '9' &&
+            result[len - 2] >= '0' && result[len - 2] <= '9' &&
+            result[len - 1] >= '0' && result[len - 1] <= '9') {
+            http_status = (result[len - 3] - '0') * 100 +
+                          (result[len - 2] - '0') * 10 +
+                          (result[len - 1] - '0');
+            result[len - 4] = '\0';
+        }
+        body_bytes = (long)strlen(result);
+        if (!body_bytes) { free(result); result = NULL; }
+    }
+    jf_log_request(method, path_and_query, ok, http_status, elapsed_ms, body_bytes);
 
     return result;
 }
@@ -1196,6 +1223,8 @@ int jf_resolve_user_id(JfConfig *cfg)
 
 /* ── browsing ─────────────────────────────────────────────────────────────── */
 
+static void parse_total_count(const JsonDoc *doc, int64_t *total_out);
+
 int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
 {
     char path[256];
@@ -1207,6 +1236,40 @@ int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
     for (int i = 0; i < n; i++) out[i].type = JF_TYPE_FOLDER;
     jf_response_free(&r);
     return n;
+}
+
+void jf_build_live_tv_channels_path(const JfConfig *cfg, int start_index, int max,
+                                     char *path, size_t path_size)
+{
+    if (start_index < 0) start_index = 0;
+    snprintf(path, path_size,
+        "/LiveTv/Channels?userId=%s&StartIndex=%d&Limit=%d"
+        "&AddCurrentProgram=true"
+        "&EnableImages=true&ImageTypeLimit=1&EnableImageTypes=Primary",
+        cfg->user_id, start_index, max);
+}
+
+int jf_list_live_tv_channels(const JfConfig *cfg, int start_index,
+                              JfItem *out, int max, int64_t *total_out)
+{
+    char path[384];
+    jf_build_live_tv_channels_path(cfg, start_index, max, path, sizeof(path));
+
+    JfResponse r;
+    if (!jf_fetch(cfg, path, &r)) return -1;
+    int n = parse_item_list(&r.doc, out, max);
+    parse_total_count(&r.doc, total_out);
+    for (int i = 0; i < n; i++) out[i].type = JF_TYPE_LIVE_CHANNEL;
+    jf_response_free(&r);
+    return n;
+}
+
+int jf_live_tv_available(const JfConfig *cfg)
+{
+    JfItem channel;
+    int64_t total = 0;
+    int n = jf_list_live_tv_channels(cfg, 0, &channel, 1, &total);
+    return n > 0 || total > 0;
 }
 
 int64_t jf_count_items(const JfConfig *cfg, const char *parent_id, const char *item_type)
@@ -1648,6 +1711,153 @@ int jf_stream_url(const JfConfig *cfg, const char *item_id,
     return 1;
 }
 
+void jf_build_live_tv_playback_info_path(const char *channel_id,
+                                          char *path, size_t path_size)
+{
+    char safe_channel[JF_ID_LEN];
+    jf_sanitize_id(channel_id, safe_channel, sizeof(safe_channel));
+    snprintf(path, path_size, "/Items/%s/PlaybackInfo", safe_channel);
+}
+
+int jf_build_live_tv_playback_info_body(const JfConfig *cfg,
+                                         const JfStreamProfile *profile,
+                                         char *out, int outlen)
+{
+    if (!cfg || !profile || !out || outlen <= 0) return 0;
+    int fps_cap = (strcasecmp(cfg->tv_mode, "NTSC") == 0) ? 30 : 25;
+    int n = snprintf(out, outlen,
+        "{\"UserId\":\"%s\",\"StartTimeTicks\":0,\"IsPlayback\":true,"
+        "\"AutoOpenLiveStream\":true,\"EnableDirectPlay\":false,"
+        "\"EnableDirectStream\":false,\"EnableTranscoding\":true,"
+        "\"AllowVideoStreamCopy\":false,\"AllowAudioStreamCopy\":false,"
+        "\"MaxStreamingBitrate\":%d,\"DeviceProfile\":{\"Name\":\"MiSTerFin\","
+        "\"MaxStreamingBitrate\":%d,\"MaxStaticBitrate\":%d,"
+        "\"DirectPlayProfiles\":[],\"TranscodingProfiles\":[{"
+        "\"Container\":\"ts\",\"Type\":\"Video\",\"Protocol\":\"http\","
+        "\"AudioCodec\":\"mp3\",\"VideoCodec\":\"mpeg2video\","
+        "\"Context\":\"Streaming\",\"MaxAudioChannels\":\"2\"}],"
+        "\"CodecProfiles\":[{\"Type\":\"Video\",\"Codec\":\"mpeg2video\","
+        "\"Conditions\":[{\"Condition\":\"LessThanEqual\","
+        "\"Property\":\"Width\",\"Value\":\"%d\",\"IsRequired\":true},{"
+        "\"Condition\":\"LessThanEqual\",\"Property\":\"Height\","
+        "\"Value\":\"%d\",\"IsRequired\":true},{\"Condition\":"
+        "\"LessThanEqual\",\"Property\":\"VideoFramerate\",\"Value\":"
+        "\"%d\",\"IsRequired\":true}]}],\"SubtitleProfiles\":[]}}",
+        cfg->user_id, profile->video_bitrate,
+        profile->video_bitrate, profile->video_bitrate,
+        profile->max_width, profile->max_height, fps_cap);
+    return n >= 0 && n < outlen;
+}
+
+int jf_live_tv_transcoding_url(const JfConfig *cfg, const char *transcoding_url,
+                                char *out, int outlen)
+{
+    if (!out || outlen <= 0) return 0;
+    out[0] = '\0';
+    if (!cfg || !transcoding_url || !transcoding_url[0]) return 0;
+
+    /* Jellyfin can inherit the source MPEG-2 level into this URL without a
+     * profile. Its ffmpeg builder then emits `-level` but deliberately strips
+     * MPEG-2 profiles, and the encoder rejects that incomplete pair before
+     * frame one. Remove only the unsupported level hint; Jellyfin retains all
+     * other negotiated live-stream and output constraints. */
+    char cleaned[JF_STREAM_URL_LEN];
+    const char *query = strchr(transcoding_url, '?');
+    size_t prefix_len = query ? (size_t)(query - transcoding_url) : strlen(transcoding_url);
+    if (prefix_len >= sizeof(cleaned)) return 0;
+    memcpy(cleaned, transcoding_url, prefix_len);
+    size_t used = prefix_len;
+    cleaned[used] = '\0';
+    int has_api_key = 0;
+
+    if (query) {
+        const char *p = query + 1;
+        int first = 1;
+        while (*p) {
+            const char *end = strchr(p, '&');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            const char *equals = memchr(p, '=', len);
+            size_t key_len = equals ? (size_t)(equals - p) : len;
+            int is_level = (key_len == 5 && !strncasecmp(p, "level", 5)) ||
+                           (key_len == 16 && !strncasecmp(p, "mpeg2video-level", 16));
+            if (key_len == 6 && !strncasecmp(p, "ApiKey", 6))
+                has_api_key = 1;
+            if (!is_level) {
+                if (used + 1 + len >= sizeof(cleaned)) return 0;
+                cleaned[used++] = first ? '?' : '&';
+                memcpy(cleaned + used, p, len);
+                used += len;
+                cleaned[used] = '\0';
+                first = 0;
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+
+    if (cleaned[0] != '/') return 0;
+    const char *separator = strchr(cleaned, '?') ? "&" : "?";
+    int n = has_api_key
+        ? snprintf(out, outlen, "%s%s", cfg->server, cleaned)
+        : snprintf(out, outlen, "%s%s%sApiKey=%s", cfg->server,
+                   cleaned, separator, cfg->token);
+    return n >= 0 && n < outlen;
+}
+
+int jf_open_live_tv_stream(const JfConfig *cfg, const char *channel_id,
+                            const JfStreamProfile *profile,
+                            JfLivePlayback *playback)
+{
+    if (!playback) return 0;
+    memset(playback, 0, sizeof(*playback));
+    if (!cfg || !channel_id || !channel_id[0] || !profile) return 0;
+
+    char path[384];
+    jf_build_live_tv_playback_info_path(channel_id, path, sizeof(path));
+
+    char body[1536];
+    if (!jf_build_live_tv_playback_info_body(cfg, profile, body, sizeof(body)))
+        return 0;
+
+    JfResponse r;
+    if (!jf_post_fetch(cfg, path, body, &r)) return 0;
+    copy_raw_str(&r.doc, NULL, "MediaSources[0].LiveStreamId",
+                 playback->live_stream_id, sizeof(playback->live_stream_id));
+    copy_raw_str(&r.doc, NULL, "MediaSources[0].Id",
+                 playback->media_source_id, sizeof(playback->media_source_id));
+    copy_raw_str(&r.doc, NULL, "PlaySessionId",
+                 playback->play_session_id, sizeof(playback->play_session_id));
+    char transcoding_url[JF_STREAM_URL_LEN] = "";
+    copy_raw_str(&r.doc, NULL, "MediaSources[0].TranscodingUrl",
+                 transcoding_url, sizeof(transcoding_url));
+    /* Like Jellyfin Web, consume the URL selected by PlaybackInfo instead of
+     * reconstructing a request or falling back to a raw tuner stream that the
+     * advertised device profile said this client cannot play. */
+    int url_ok = jf_live_tv_transcoding_url(cfg, transcoding_url,
+                                             playback->stream_url,
+                                             sizeof(playback->stream_url));
+    jf_response_free(&r);
+    if (playback->live_stream_id[0] && playback->media_source_id[0] &&
+        playback->play_session_id[0] && url_ok)
+        return 1;
+
+    /* AutoOpenLiveStream may have acquired a tuner before returning a response
+     * that this client cannot use. Release it on every validation failure. */
+    jf_close_live_tv_stream(cfg, playback->live_stream_id);
+    memset(playback, 0, sizeof(*playback));
+    return 0;
+}
+
+void jf_close_live_tv_stream(const JfConfig *cfg, const char *live_stream_id)
+{
+    if (!live_stream_id || !live_stream_id[0]) return;
+    char safe_id[JF_LIVE_ID_LEN];
+    jf_sanitize_id(live_stream_id, safe_id, sizeof(safe_id));
+    char path[JF_LIVE_ID_LEN + 64];
+    snprintf(path, sizeof(path), "/LiveStreams/Close?LiveStreamId=%s", safe_id);
+    free(jf_request_alloc(cfg, "POST", path, NULL, 5));
+}
+
 /* Codec strings per ffmpeg/Jellyfin's known text subtitle codecs — anything
  * not in this list is treated as image-based (safer default: an unknown
  * text codec would just fail jf_download_subtitle's fetch harmlessly via
@@ -1730,6 +1940,45 @@ static void build_playstate_json(const char *item_id, const char *play_session_i
         "\"PositionTicks\":%lld,\"IsPaused\":%s,\"PlayMethod\":\"%s\"}",
         safe_id, safe_session, (long long)position_ticks,
         is_paused ? "true" : "false", g_play_method);
+}
+
+int jf_build_live_tv_playstate_body(const JfLivePlayback *playback,
+                                     const char *item_id, int64_t position_ticks,
+                                     int paused, int failed,
+                                     char *out, int outlen)
+{
+    if (!out || outlen <= 0) return 0;
+    out[0] = '\0';
+    if (!playback || !item_id || !item_id[0] ||
+        !playback->media_source_id[0] || !playback->live_stream_id[0] ||
+        !playback->play_session_id[0])
+        return 0;
+
+    char safe_item[JF_ID_LEN], safe_source[JF_LIVE_ID_LEN];
+    char safe_live[JF_LIVE_ID_LEN], safe_session[64];
+    jf_sanitize_id(item_id, safe_item, sizeof(safe_item));
+    jf_sanitize_id(playback->media_source_id, safe_source, sizeof(safe_source));
+    jf_sanitize_id(playback->live_stream_id, safe_live, sizeof(safe_live));
+    jf_sanitize_id(playback->play_session_id, safe_session, sizeof(safe_session));
+    int n;
+    if (failed >= 0)
+        n = snprintf(out, outlen,
+            "{\"ItemId\":\"%s\",\"MediaSourceId\":\"%s\","
+            "\"LiveStreamId\":\"%s\",\"PlaySessionId\":\"%s\","
+            "\"PositionTicks\":%lld,\"IsPaused\":%s,\"PlayMethod\":\"Transcode\","
+            "\"CanSeek\":false,\"Failed\":%s}",
+            safe_item, safe_source, safe_live, safe_session,
+            (long long)position_ticks, paused ? "true" : "false",
+            failed ? "true" : "false");
+    else
+        n = snprintf(out, outlen,
+            "{\"ItemId\":\"%s\",\"MediaSourceId\":\"%s\","
+            "\"LiveStreamId\":\"%s\",\"PlaySessionId\":\"%s\","
+            "\"PositionTicks\":%lld,\"IsPaused\":%s,\"PlayMethod\":\"Transcode\","
+            "\"CanSeek\":false}",
+            safe_item, safe_source, safe_live, safe_session,
+            (long long)position_ticks, paused ? "true" : "false");
+    return n >= 0 && n < outlen;
 }
 
 void jf_report_start(const JfConfig *cfg, const char *item_id,
@@ -1830,6 +2079,36 @@ static void jf_post_json_async(const JfConfig *cfg, const char *path, const char
     }
 }
 
+void jf_report_live_tv_start(const JfConfig *cfg, const JfLivePlayback *playback,
+                              const char *item_id)
+{
+    char body[1024];
+    if (!jf_build_live_tv_playstate_body(playback, item_id, 0, 0, -1,
+                                          body, sizeof(body)))
+        return;
+    jf_post_json(cfg, "/Sessions/Playing", body);
+    jf_post_json(cfg, "/Sessions/Playing/Progress", body);
+}
+
+void jf_report_live_tv_progress(const JfConfig *cfg, const JfLivePlayback *playback,
+                                 const char *item_id, int64_t position_ticks)
+{
+    char body[1024];
+    if (jf_build_live_tv_playstate_body(playback, item_id, position_ticks, 0, -1,
+                                         body, sizeof(body)))
+        jf_post_json(cfg, "/Sessions/Playing/Progress", body);
+}
+
+void jf_report_live_tv_stopped(const JfConfig *cfg, const JfLivePlayback *playback,
+                                const char *item_id, int64_t position_ticks,
+                                int failed)
+{
+    char body[1024];
+    if (jf_build_live_tv_playstate_body(playback, item_id, position_ticks, 0,
+                                         failed, body, sizeof(body)))
+        jf_post_json_async(cfg, "/Sessions/Playing/Stopped", body);
+}
+
 void jf_report_stopped(const JfConfig *cfg, const char *item_id,
                         const char *play_session_id, int64_t position_ticks,
                         int played)
@@ -1875,6 +2154,10 @@ void jf_report_capabilities(const JfConfig *cfg)
 
 int view_is_resume(const JfItem *v)    { return v->synthetic == JF_SYNTH_RESUME; }
 int view_is_nextup(const JfItem *v)    { return v->synthetic == JF_SYNTH_NEXTUP; }
+int view_is_live_tv(const JfItem *v)
+{
+    return v->synthetic == JF_SYNTH_LIVE_TV || !strcmp(v->collection_type, "livetv");
+}
 int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
 
 const char *collection_item_type(const char *collection_type)

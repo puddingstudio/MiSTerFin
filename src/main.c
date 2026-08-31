@@ -374,7 +374,8 @@ typedef enum {
 typedef enum {
     FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES,
     FRAME_RESUME,   /* Continue Watching — see JF_VIEW_RESUME */
-    FRAME_NEXTUP    /* Next Up          — see JF_VIEW_NEXTUP */
+    FRAME_NEXTUP,   /* Next Up          — see JF_VIEW_NEXTUP */
+    FRAME_LIVE_TV   /* Jellyfin Live TV channels */
 } FrameKind;
 
 /* Rows fetched for each home row. Both are "what to watch next" lists rather
@@ -715,12 +716,29 @@ static int fetch_frame_window(int start_index)
         }
 
         int n_views = jf_list_views(&g_cfg, g_items + n_synth, JF_MAX_ITEMS - n_synth);
+        int has_live_tv_view = 0;
         for (int i = 0; i < n_views; i++) {
             JfItem *v = &g_items[n_synth + i];
-            g_view_counts[n_synth + i] =
-                jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
+            if (view_is_live_tv(v)) {
+                has_live_tv_view = 1;
+                g_view_counts[n_synth + i] = -1;
+            } else {
+                g_view_counts[n_synth + i] =
+                    jf_count_items(&g_cfg, v->id, collection_item_type(v->collection_type));
+            }
         }
         g_item_count = n_synth + n_views;
+        if (!has_live_tv_view && g_item_count < JF_MAX_ITEMS && jf_live_tv_available(&g_cfg)) {
+            JfItem *card = &g_items[g_item_count];
+            memset(card, 0, sizeof(*card));
+            strncpy(card->id, JF_VIEW_LIVE_TV, sizeof(card->id) - 1);
+            strncpy(card->name, "Live TV", sizeof(card->name) - 1);
+            card->type = JF_TYPE_FOLDER;
+            card->synthetic = JF_SYNTH_LIVE_TV;
+            card->index_number = -1;
+            g_view_counts[g_item_count] = -1;
+            g_item_count++;
+        }
         break;
     }
     case FRAME_RESUME:
@@ -732,6 +750,13 @@ static int fetch_frame_window(int start_index)
         g_window_start = 0;
         g_item_count = jf_list_nextup(&g_cfg, g_items, HOME_ROW_MAX, &g_total_count);
         home_row_label_episodes();
+        break;
+    case FRAME_LIVE_TV:
+        /* Match Jellyfin Web's channel browser: preserve the order returned
+         * by /LiveTv/Channels and page through the complete result. */
+        paginated = 1;
+        g_item_count = jf_list_live_tv_channels(&g_cfg, start_index, g_items,
+                                                 JF_PAGE_SIZE, &g_total_count);
         break;
     case FRAME_ITEMS:
         /* Episode counts for series rows used to be fetched here with one
@@ -2241,7 +2266,9 @@ static void draw_browse(FBDev *fb)
         JfItem *it = &g_items[i];
 
         char line1[280];
-        if (it->year[0] &&
+        if (it->type == JF_TYPE_LIVE_CHANNEL && it->channel_number[0])
+            snprintf(line1, sizeof(line1), "%s  %s", it->channel_number, it->name);
+        else if (it->year[0] &&
             (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_MUSIC_VIDEO ||
              it->type == JF_TYPE_SERIES))
             snprintf(line1, sizeof(line1), "%s%s (%s)", type_folder_icon(it->type), it->name, it->year);
@@ -2256,7 +2283,10 @@ static void draw_browse(FBDev *fb)
          * and episode rows show runtime plus watched/resume state. */
         char line2[64] = {0};
         uint8_t l2r = 0x58, l2g = 0x58, l2b = 0x58;
-        if (it->type == JF_TYPE_ALBUM) {
+        if (it->type == JF_TYPE_LIVE_CHANNEL) {
+            snprintf(line2, sizeof(line2), "%s",
+                     it->current_program[0] ? it->current_program : "No guide information");
+        } else if (it->type == JF_TYPE_ALBUM) {
             if (it->year[0] && it->child_count > 0)
                 snprintf(line2, sizeof(line2), "%s - %d track%s",
                          it->year, it->child_count, it->child_count == 1 ? "" : "s");
@@ -2608,6 +2638,10 @@ static int     g_paused          = 0;
 static double  g_pause_wall      = 0.0;
 static char    g_play_session_id[64];
 static double  g_last_progress_report = 0.0;
+/* Live TV reuses the video process and transcode path, but it is not a
+ * seekable library item and must not acquire resume or watched state. */
+static int     g_live_playback = 0;
+static JfLivePlayback g_live;
 
 /* Playback progress is fire-and-forget (the result is never read), but the
  * curl round-trip is blocking — running it on the main thread froze the
@@ -2639,6 +2673,29 @@ static void report_progress_async(const char *item_id, const char *session,
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&t, &at, progress_report_thread, j) != 0) free(j);
+    pthread_attr_destroy(&at);
+}
+typedef struct { char item_id[JF_ID_LEN]; JfLivePlayback playback; int64_t pos; } LiveProgressJob;
+static void *live_progress_report_thread(void *arg)
+{
+    LiveProgressJob *j = (LiveProgressJob *)arg;
+    jf_report_live_tv_progress(&g_cfg, &j->playback, j->item_id, j->pos);
+    free(j);
+    return NULL;
+}
+static void report_live_progress_async(const char *item_id,
+                                       const JfLivePlayback *playback,
+                                       int64_t pos)
+{
+    LiveProgressJob *j = malloc(sizeof(*j));
+    if (!j) return;
+    snprintf(j->item_id, sizeof(j->item_id), "%s", item_id);
+    j->playback = *playback;
+    j->pos = pos;
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, live_progress_report_thread, j) != 0) free(j);
     pthread_attr_destroy(&at);
 }
 /* -1 = off, otherwise JfSubtitle.index of the loaded/active track. Text
@@ -2737,6 +2794,9 @@ static int player_running(void)
         if (waitpid(g_curl_pid, &cstatus, WNOHANG) > 0) {
             g_curl_pid = -1;
             if (!(WIFEXITED(cstatus) && WEXITSTATUS(cstatus) == 0)) {
+                jf_log_line("stream curl: exited=%d signal=%d",
+                            WIFEXITED(cstatus) ? WEXITSTATUS(cstatus) : -1,
+                            WIFSIGNALED(cstatus) ? WTERMSIG(cstatus) : 0);
                 /* curl died (bad TLS, DNS, connection refused, ...) — mplayer
                  * is left blocked opening/reading a FIFO with no writer left
                  * and would otherwise hang on it forever. Tear the whole
@@ -2753,7 +2813,13 @@ static int player_running(void)
         }
     }
     int status;
-    if (waitpid(g_player_pid, &status, WNOHANG) > 0) { g_player_pid = -1; return 0; }
+    if (waitpid(g_player_pid, &status, WNOHANG) > 0) {
+        jf_log_line("mplayer: exited=%d signal=%d",
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                    WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        g_player_pid = -1;
+        return 0;
+    }
     return 1;
 }
 
@@ -3764,6 +3830,35 @@ static void seek_accumulate(double delta, double now)
 #define PLAYER_FRAME_HANDLED 2
 static int player_handle_input(FBDev *fb, int inp, double loop_now)
 {
+    if (g_live_playback) {
+        if (!player_running()) {
+            double pos = play_position();
+            pageflip_end();
+            jf_report_live_tv_stopped(&g_cfg, &g_live, g_info_item.id,
+                                       (int64_t)(pos * 10000000.0), 1);
+            memset(&g_live, 0, sizeof(g_live));
+            g_live_playback = 0;
+            jf_log_line("live tv: stream ended");
+            return PLAYER_FRAME_ENDED;
+        }
+        if (inp & INP_B) {
+            double pos = play_position();
+            player_stop();
+            jf_report_live_tv_stopped(&g_cfg, &g_live, g_info_item.id,
+                                       (int64_t)(pos * 10000000.0), 0);
+            memset(&g_live, 0, sizeof(g_live));
+            g_live_playback = 0;
+            jf_log_line("live tv: stopped by user");
+            return PLAYER_FRAME_ENDED;
+        }
+        if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+            g_last_progress_report = loop_now;
+            report_live_progress_async(g_info_item.id, &g_live,
+                                       (int64_t)(play_position() * 10000000.0));
+        }
+        return PLAYER_FRAME_PLAYING;
+    }
+
     if (!player_running()) {
         /* mplayer exited on its own (end of title) — its uninit
          * already flipped back to page 0; this wakes Main up and
@@ -3859,16 +3954,30 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     int64_t start_ticks = (int64_t)(offset_secs * 10000000.0);
     jf_make_play_session_id(g_play_session_id, sizeof(g_play_session_id));
 
-    char url[700];
+    char url[JF_STREAM_URL_LEN];
     const JfStreamProfile profile = stream_profile();
-    jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
-                  g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
+    if (g_live_playback) {
+        if (!jf_open_live_tv_stream(&g_cfg, item_id, &profile, &g_live)) {
+            jf_log_line("live tv: failed to open stream");
+            return;
+        }
+        snprintf(g_play_session_id, sizeof(g_play_session_id), "%s",
+                 g_live.play_session_id);
+        snprintf(url, sizeof(url), "%s", g_live.stream_url);
+    } else {
+        jf_stream_url(&g_cfg, item_id, &profile, start_ticks, g_play_session_id,
+                      g_burned_in_sub_index, g_current_audio_index, url, sizeof(url));
+    }
     stream_via_curl_if_https(url, sizeof(url));
     /* Deliberately no item_id/title/url here — those identify what's in
      * someone's library, not how MiSTerFin behaved. */
-    jf_log_line("play: profile=%dx%d@%d fb_phys_h=%d line_double=%d resume=%.0fs",
-                profile.max_width, profile.max_height, profile.video_bitrate,
-                fb->phys_height, fb->line_double, offset_secs);
+    if (g_live_playback)
+        jf_log_line("live tv: opened stream fb_phys_h=%d line_double=%d",
+                    fb->phys_height, fb->line_double);
+    else
+        jf_log_line("play: profile=%dx%d@%d fb_phys_h=%d line_double=%d resume=%.0fs",
+                    profile.max_width, profile.max_height, profile.video_bitrate,
+                    fb->phys_height, fb->line_double, offset_secs);
 
     char delay_arg[16];
     snprintf(delay_arg, sizeof(delay_arg), "%.2f", AUDIO_DELAY_SEC);
@@ -3877,7 +3986,8 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_play_start_wall = now_sec();
     g_paused          = 0;
     g_last_progress_report = now_sec();
-    jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks, "Transcode");
+    if (!g_live_playback)
+        jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks, "Transcode");
 
     /* Picture zoom survives restarts of the SAME title (that's exactly how
      * the PICTURE tab applies it — see submenu_confirm) but never carries
@@ -4208,7 +4318,12 @@ vf_done:;
                          ? "/media/fat/misterfin/font2x/font.desc"
                          : "/media/fat/misterfin/font/font.desc";
         args[an++] = "-framedrop";
-        args[an++] = "-autosync"; args[an++] = "30";
+        /* Live broadcasts can carry continuously corrected timestamps. Let
+         * mplayer react to the ALSA delay measurement on each frame instead
+         * of smoothing it across 30 samples, which can leave live video
+         * chasing a moving audio clock. Recorded playback keeps the existing
+         * smoothing that has proven stable with the MiSTer's ALSA driver. */
+        args[an++] = "-autosync"; args[an++] = g_live_playback ? "1" : "30";
         args[an++] = "-cache";    args[an++] = "8192";
         args[an++] = "-cache-min"; args[an++] = "20";
         /* mplayer's own native MPEG-TS demuxer sometimes misses the
@@ -4324,6 +4439,11 @@ vf_done:;
 
     close(pfd[0]);
     g_cmd_fd = pfd[1];
+    /* Jellyfin Web reports Live TV only after the player has started. Keep
+     * the same ordering by waiting until the mplayer child is launched.
+     * Recorded playback retains its existing report timing. */
+    if (g_live_playback)
+        jf_report_live_tv_start(&g_cfg, &g_live, item_id);
 
     /* mplayer is connecting + filling its cache in the background at this
      * point and hasn't touched /dev/fb0 yet — safe window to show the
@@ -5639,12 +5759,14 @@ int main(int argc, char **argv)
                 switch (it->type) {
                 case JF_TYPE_FOLDER:
                 case JF_TYPE_ARTIST:
-                    /* The two home rows look like folders but have no parent
-                     * to list — they're their own kind of frame. */
+                    /* Synthetic cards look like folders but have no parent
+                     * to list — each routes to its own frame kind. */
                     if (view_is_resume(it))
                         push_frame(FRAME_RESUME, "Continue Watching", NULL, NULL, NULL, NULL);
                     else if (view_is_nextup(it))
                         push_frame(FRAME_NEXTUP, "Next Up", NULL, NULL, NULL, NULL);
+                    else if (view_is_live_tv(it))
+                        push_frame(FRAME_LIVE_TV, "Live TV", NULL, NULL, NULL, NULL);
                     else
                         push_frame(FRAME_ITEMS, it->name, it->id, NULL, NULL,
                                    it->collection_type[0] ? it->collection_type : f->collection_type);
@@ -5684,6 +5806,17 @@ int main(int argc, char **argv)
                     play_audio(&fb, g_sel);
                     state = STATE_PLAYING_AUDIO;
                     draw_now_playing(&fb, &g_items[g_sel], 0.0);
+                    input_drain();
+                    break;
+                case JF_TYPE_LIVE_CHANNEL:
+                    g_info_item = *it;
+                    g_live_playback = 1;
+                    playing = 1;
+                    state = STATE_PLAYING;
+                    g_current_sub_index = -1;
+                    g_burned_in_sub_index = -1;
+                    g_current_audio_index = -1;
+                    play(&fb, g_info_item.id, 0.0);
                     input_drain();
                     break;
                 default:
@@ -5932,8 +6065,10 @@ int main(int argc, char **argv)
     bgm_resume();
     /* Before jf_log_close(): the mixer thread logs on its way out. */
     sfx_shutdown();
-    jf_log_close();
     player_stop();
+    if (g_live_playback)
+        jf_close_live_tv_stream(&g_cfg, g_live.live_stream_id);
+    jf_log_close();
     info_assets_free();
     ddr_close();
     cursor_show();
