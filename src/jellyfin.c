@@ -285,11 +285,14 @@ static void parse_item_fields(const JsonDoc *doc, const JsonNode *item, JfItem *
     else if (!strcmp(type_buf, "Episode"))       it->type = JF_TYPE_EPISODE;
     else if (!strcmp(type_buf, "Movie"))         it->type = JF_TYPE_MOVIE;
     else if (!strcmp(type_buf, "MusicVideo"))    it->type = JF_TYPE_MUSIC_VIDEO;
+    else if (!strcmp(type_buf, "Video"))         it->type = JF_TYPE_VIDEO;
+    else if (!strcmp(type_buf, "Photo"))         it->type = JF_TYPE_PHOTO;
     else if (!strcmp(type_buf, "MusicArtist"))   it->type = JF_TYPE_ARTIST;
     else if (!strcmp(type_buf, "MusicAlbum"))    it->type = JF_TYPE_ALBUM;
     else if (!strcmp(type_buf, "Audio"))         it->type = JF_TYPE_TRACK;
     else if (!strcmp(type_buf, "CollectionFolder") ||
-             !strcmp(type_buf, "Folder"))        it->type = JF_TYPE_FOLDER;
+             !strcmp(type_buf, "Folder") ||
+             !strcmp(type_buf, "PhotoAlbum"))    it->type = JF_TYPE_FOLDER;
     else                                          it->type = JF_TYPE_OTHER;
 
     if (it->type == JF_TYPE_TRACK) {
@@ -1204,7 +1207,15 @@ int jf_list_views(const JfConfig *cfg, JfItem *out, int max)
     JfResponse r;
     if (!jf_fetch(cfg, path, &r)) return 0;
     int n = parse_item_list(&r.doc, out, max);
-    for (int i = 0; i < n; i++) out[i].type = JF_TYPE_FOLDER;
+    for (int i = 0; i < n; i++) {
+        out[i].type = JF_TYPE_FOLDER;
+        /* Jellyfin stores Mixed as the absence of a collection type, while
+         * every other configurable library has an explicit value. Preserve
+         * that distinction so its item request can use the lightweight
+         * folder query instead of the count-bearing fallback. */
+        if (!out[i].collection_type[0])
+            strcpy(out[i].collection_type, "mixed");
+    }
     jf_response_free(&r);
     return n;
 }
@@ -1293,6 +1304,36 @@ void jf_build_items_path(const JfConfig *cfg, const char *parent_id,
             "/Items?userId=%s&ParentId=%s&SortBy=SortName&SortOrder=Ascending"
             "&Fields=ProductionYear,RunTimeTicks,ChildCount"
             "&EnableUserData=true"
+            "&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop&StartIndex=%d&Limit=%d",
+            cfg->user_id, safe_parent, start_index, max);
+    /* Home Videos preserves the user's folder and photo-album hierarchy, so
+     * list one level at a time and retain only the item types MiSTerFin can
+     * open. Jellyfin can spend several seconds loading user data for folder
+     * rows in a large photo library. Browse without it here; the single-item
+     * details request still fetches user data before a video is played. */
+    else if (collection_type && !strcmp(collection_type, "homevideos"))
+        snprintf(path, path_size,
+            "/Items?userId=%s&ParentId=%s&IncludeItemTypes=Folder,PhotoAlbum,Video,Photo"
+            "&SortBy=SortName&SortOrder=Ascending"
+            "&Fields=ProductionYear,RunTimeTicks"
+            "&EnableUserData=false"
+            "&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop&StartIndex=%d&Limit=%d",
+            cfg->user_id, safe_parent, start_index, max);
+    /* Mixed libraries retain their folder hierarchy and heterogeneous item
+     * types. Include every content-bearing type that can reasonably appear
+     * there, even when MiSTerFin cannot open it, so unsupported content stays
+     * visible and can report that limitation when selected. System folders,
+     * Live TV objects, and browse facets such as Genre are not library files
+     * and are deliberately excluded. As with Home Videos, omit folder user
+     * data to keep large hierarchical libraries responsive. */
+    else if (collection_type && !strcmp(collection_type, "mixed"))
+        snprintf(path, path_size,
+            "/Items?userId=%s&ParentId=%s"
+            "&IncludeItemTypes=Folder,PhotoAlbum,Movie,Series,Season,Episode,Video,MusicVideo,"
+            "Audio,MusicAlbum,MusicArtist,Photo,Book,AudioBook,BoxSet,Playlist,Trailer,Recording"
+            "&SortBy=SortName&SortOrder=Ascending"
+            "&Fields=ProductionYear,RunTimeTicks"
+            "&EnableUserData=false"
             "&ImageTypeLimit=1&EnableImageTypes=Primary,Backdrop&StartIndex=%d&Limit=%d",
             cfg->user_id, safe_parent, start_index, max);
     /* TV and other collection types keep the standard direct-child query.
@@ -1511,15 +1552,24 @@ int jf_item_image_url(const JfConfig *cfg, const char *item_id, const char *imag
     return 1;
 }
 
-int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char *image_type,
-                            const char *tag, int max_width, const char *dest_path)
+int jf_photo_image_url(const JfConfig *cfg, const JfItem *item,
+                       int max_width, int max_height, char *out, int outlen)
 {
-    char url[512];
-    if (!jf_item_image_url(cfg, item_id, image_type, tag, max_width, url, sizeof(url))) return 0;
+    if (!item || !item->image_tag[0] || max_width <= 0 || max_height <= 0) return 0;
+    char safe_id[JF_ID_LEN], safe_tag[JF_ID_LEN];
+    jf_sanitize_id(item->id, safe_id, sizeof(safe_id));
+    jf_sanitize_id(item->image_tag, safe_tag, sizeof(safe_tag));
+    snprintf(out, outlen,
+             "%s/Items/%s/Images/Primary?tag=%s&maxWidth=%d&maxHeight=%d&quality=90&format=Jpg",
+             cfg->server, safe_id, safe_tag, max_width, max_height);
+    return 1;
+}
 
-    /* No shell — see jf_curl_run. The URL embeds an image tag that came
-     * from server JSON. -L follows redirects; TLS verification per config
-     * (see jf_add_tls_args). */
+static int jf_download_image_url(const JfConfig *cfg, const char *url,
+                                 const char *dest_path)
+{
+    /* No shell — see jf_curl_run. -L follows redirects; TLS verification per
+     * config (see jf_add_tls_args). */
     const char *argv[12];
     int n = 0;
     argv[n++] = "curl"; argv[n++] = "-sfL";
@@ -1530,6 +1580,23 @@ int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char 
     int ok = 0;
     jf_curl_run((char *const *)argv, 0, &ok);
     return ok;
+}
+
+int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char *image_type,
+                            const char *tag, int max_width, const char *dest_path)
+{
+    char url[512];
+    if (!jf_item_image_url(cfg, item_id, image_type, tag, max_width, url, sizeof(url))) return 0;
+
+    return jf_download_image_url(cfg, url, dest_path);
+}
+
+int jf_download_photo(const JfConfig *cfg, const JfItem *item,
+                      int max_width, int max_height, const char *dest_path)
+{
+    char url[512];
+    if (!jf_photo_image_url(cfg, item, max_width, max_height, url, sizeof(url))) return 0;
+    return jf_download_image_url(cfg, url, dest_path);
 }
 
 int jf_image_url(const JfConfig *cfg, const JfItem *item, char *out, int outlen)
@@ -1879,9 +1946,13 @@ int view_is_synthetic(const JfItem *v) { return v->synthetic != 0; }
 
 const char *collection_item_type(const char *collection_type)
 {
+    if (!collection_type) return NULL;
     if (!strcmp(collection_type, "movies"))      return "Movie";
     if (!strcmp(collection_type, "tvshows"))     return "Series";
     if (!strcmp(collection_type, "music"))       return "MusicAlbum";
     if (!strcmp(collection_type, "musicvideos")) return "MusicVideo";
+    if (!strcmp(collection_type, "homevideos"))  return "Video,Photo";
+    if (!strcmp(collection_type, "mixed"))
+        return "Movie,Series,Video,MusicVideo,Audio,Photo";
     return NULL;
 }

@@ -6,7 +6,9 @@ Serves just enough of the API for the client to browse, page, and
 authenticate against, backed by a synthetic library that is deliberately
 bigger than any fixed client-side buffer — 500 movies, so pagination has
 something real to page through, which a small personal library wouldn't
-exercise.
+exercise. It also includes a small Home Videos library with landscape and
+portrait photos for exercising the still-image viewer, plus a Mixed library
+with supported and unsupported item types.
 
 Stdlib only (http.server + zlib for the placeholder cover art). No
 dependencies, and nothing here talks to a real server or real credentials.
@@ -83,10 +85,24 @@ def _png(r, g, b, w=8, h=8):
 COVERS = [_png(200, 60, 60), _png(60, 160, 200), _png(200, 170, 60),
           _png(120, 90, 200), _png(70, 190, 120)]
 
+# The mock cannot transcode to the requested JPEG without an image library,
+# but serving PNG here still exercises download, decoding, and fit-to-screen
+# geometry. Distinct aspect ratios make accidental stretching easy to spot.
+PHOTO_IMAGES = {
+    "photo-landscape": _png(35, 125, 215, 16, 9),
+    "photo-portrait": _png(215, 95, 45, 9, 16),
+    "photo-album-item": _png(80, 185, 95, 4, 3),
+}
+
 VIEWS = [
     {"Id": "view-movies", "Name": "Movies",   "CollectionType": "movies"},
     {"Id": "view-tv",     "Name": "TV Shows", "CollectionType": "tvshows"},
     {"Id": "view-music",  "Name": "Music",    "CollectionType": "music"},
+    {"Id": "view-homevideos", "Name": "Home Videos",
+     "CollectionType": "homevideos"},
+    # Jellyfin represents a configured Mixed library by omitting
+    # CollectionType rather than returning the literal value "mixed".
+    {"Id": "view-mixed", "Name": "Mixed"},
 ]
 
 
@@ -213,6 +229,27 @@ def build_library():
             children[alid] = track_ids
         children[aid] = album_ids
     children["view-music"] = artist_ids
+
+    home_video = "home-video-1"
+    items[home_video] = base_item(
+        home_video, "Home Movie", "Video", ProductionYear=2025,
+        RunTimeTicks=8 * TICKS_PER_MIN)
+    items["photo-landscape"] = base_item(
+        "photo-landscape", "Landscape Photo", "Photo")
+    items["photo-portrait"] = base_item(
+        "photo-portrait", "Portrait Photo", "Photo")
+    items["photo-album"] = base_item(
+        "photo-album", "Photo Album", "PhotoAlbum", ChildCount=1)
+    items["photo-album-item"] = base_item(
+        "photo-album-item", "Album Photo", "Photo")
+    items["unsupported-book"] = base_item(
+        "unsupported-book", "Unsupported Book", "Book")
+    children["photo-album"] = ["photo-album-item"]
+    children["view-homevideos"] = [
+        home_video, "photo-landscape", "photo-album", "photo-portrait"]
+    children["view-mixed"] = [
+        movies[0], series_ids[0], home_video, "photo-landscape", artist_ids[0],
+        "unsupported-book"]
 
     return items, children
 
@@ -362,8 +399,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send([{"Id": USER_ID, "Name": USER_NAME}])
 
         if path == "/UserViews":
-            views = [base_item(v["Id"], v["Name"], "CollectionFolder",
-                               CollectionType=v["CollectionType"]) for v in VIEWS]
+            views = []
+            for view in VIEWS:
+                item = base_item(view["Id"], view["Name"], "CollectionFolder")
+                if "CollectionType" in view:
+                    item["CollectionType"] = view["CollectionType"]
+                views.append(item)
             return self._send({"Items": views, "TotalRecordCount": len(views)})
 
         if path == "/QuickConnect/Enabled":
@@ -383,7 +424,10 @@ class Handler(BaseHTTPRequestHandler):
 
         m = re.match(r"^/Items/([^/]+)/Images/([^/?]+)", path)
         if m:
-            return self._send(COVERS[hash(m.group(1)) % len(COVERS)], "image/png")
+            item_id = m.group(1)
+            image = PHOTO_IMAGES.get(item_id,
+                                     COVERS[hash(item_id) % len(COVERS)])
+            return self._send(image, "image/png")
 
         m = re.match(r"^/Shows/([^/]+)/Seasons$", path)
         if m:
@@ -478,5 +522,6 @@ if __name__ == "__main__":
         if arg.isdigit():
             port = int(arg)
     print(f"mock jellyfin on http://127.0.0.1:{port}  "
-          f"({N_MOVIES} movies, {N_SERIES} series, {N_ARTISTS} artists)")
+          f"({N_MOVIES} movies, {N_SERIES} series, {N_ARTISTS} artists, "
+          "2 top-level photos)")
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()

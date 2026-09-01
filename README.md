@@ -105,7 +105,9 @@ All captured in-app via the [SELECT+START screenshot combo](#controls), straight
 
 ## <a id="scope"></a>Scope (v1)
 
-- Movies, TV shows, Music, and Music Videos — no photo libraries
+- Movies, TV shows, Music, and Music Videos
+- Home Videos preserves folder navigation; videos play and photos open in a fit-to-screen viewer
+- Mixed libraries preserve folders and expose video, music, and photo content; selecting an unsupported item type explains the limitation
 - Server-side transcode for video (the MiSTer's ARM Cortex-A9 can't decode arbitrary HEVC/4K sources locally) to a CRT-sized stream, then letterboxed/pillarboxed client-side to exactly fill the PAL/NTSC frame
 - Audio plays back directly (`static=true`, no server transcode) — this mplayer build decodes FLAC/MP3 natively, and there's no letterboxing concern for audio the way there is for video
 

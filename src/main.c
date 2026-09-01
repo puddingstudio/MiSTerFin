@@ -52,6 +52,7 @@
  * GRID_POSTER_TMP) for its own main-thread downloads — same thread, so
  * sharing is deliberate and safe; keep the two in sync. */
 #define POSTER_TMP   "/tmp/misterfin_poster.img"
+#define PHOTO_TMP    "/tmp/misterfin_photo.img"
 /* Per-item browse-list cover art, cached to the SD card (same idea as the
  * home-screen grid cache above) so scrolling a list reads covers from the
  * card instead of re-downloading each one — no network round-trip on the
@@ -369,7 +370,7 @@ static void fmt_time(char *buf, size_t sz, double secs)
 
 typedef enum {
     STATE_CONFIG_ERROR, STATE_QUICK_CONNECT,
-    STATE_BROWSE, STATE_INFO, STATE_PLAYING, STATE_PLAYING_AUDIO
+    STATE_BROWSE, STATE_INFO, STATE_PHOTO, STATE_PLAYING, STATE_PLAYING_AUDIO
 } AppState;
 typedef enum {
     FRAME_VIEWS, FRAME_ITEMS, FRAME_SEASONS, FRAME_EPISODES,
@@ -489,6 +490,12 @@ static const char *now_playing_mode_name(int mode)
 static double g_np_title_shown_until = 0.0;
 
 static JfItem g_info_item;   /* item currently shown on the info screen */
+static JfItem g_photo_item;  /* item currently shown in the photo viewer */
+static uint8_t *g_photo_px = NULL;
+static int      g_photo_w = 0, g_photo_h = 0;
+static int      g_photo_abs_index = 0;
+static char     g_photo_notice[64] = "";
+static double   g_photo_notice_until = 0.0;
 
 /* ── info-screen hero assets (backdrop, logo, cast photos) ───────────────── */
 
@@ -1563,9 +1570,11 @@ static const char *browse_cover_wanted_id(void)
     JfItem *it = (g_item_count > 0) ? &g_items[g_sel] : NULL;
     int wants = it && it->image_tag[0] &&
         (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_MUSIC_VIDEO ||
+         it->type == JF_TYPE_VIDEO || it->type == JF_TYPE_PHOTO ||
          it->type == JF_TYPE_EPISODE ||
          it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON ||
-         it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM || it->type == JF_TYPE_TRACK);
+         it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM ||
+         it->type == JF_TYPE_TRACK);
     return wants ? it->id : "";
 }
 
@@ -1775,9 +1784,11 @@ static void start_cover_prefetch(void)
         JfItem *it = &g_items[i];
         int wants = it->image_tag[0] &&
             (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_MUSIC_VIDEO ||
+             it->type == JF_TYPE_VIDEO || it->type == JF_TYPE_PHOTO ||
              it->type == JF_TYPE_EPISODE ||
              it->type == JF_TYPE_SERIES || it->type == JF_TYPE_SEASON ||
-             it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM || it->type == JF_TYPE_TRACK);
+             it->type == JF_TYPE_ARTIST || it->type == JF_TYPE_ALBUM ||
+             it->type == JF_TYPE_TRACK);
         if (!wants) continue;
         snprintf(cp->items[cp->n].id,     JF_ID_LEN, "%s", it->id);
         snprintf(cp->items[cp->n].img_id, JF_ID_LEN, "%s", it->image_item_id);
@@ -2243,6 +2254,7 @@ static void draw_browse(FBDev *fb)
         char line1[280];
         if (it->year[0] &&
             (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_MUSIC_VIDEO ||
+             it->type == JF_TYPE_VIDEO ||
              it->type == JF_TYPE_SERIES))
             snprintf(line1, sizeof(line1), "%s%s (%s)", type_folder_icon(it->type), it->name, it->year);
         else
@@ -2286,6 +2298,7 @@ static void draw_browse(FBDev *fb)
                 snprintf(line2, sizeof(line2), "%d season%s",
                          it->child_count, it->child_count == 1 ? "" : "s");
         } else if (it->type == JF_TYPE_MOVIE || it->type == JF_TYPE_MUSIC_VIDEO ||
+                   it->type == JF_TYPE_VIDEO ||
                    it->type == JF_TYPE_EPISODE) {
             int minutes = (int)(it->runtime_ticks / 10000000LL / 60);
             if (it->played) {
@@ -2501,6 +2514,133 @@ static void draw_info(FBDev *fb)
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
+}
+
+/* ── still-photo viewer ────────────────────────────────────────────────────
+ * Photos use Jellyfin's image endpoint rather than the media stream path.
+ * The server bounds and converts the source before download, so a large HEIC
+ * or camera JPEG never reaches this small device at its original dimensions
+ * and stb_image only has to handle an ordinary JPEG. */
+static void photo_free(void)
+{
+    if (g_photo_px) { stbi_image_free(g_photo_px); g_photo_px = NULL; }
+    g_photo_w = g_photo_h = 0;
+    unlink(PHOTO_TMP);
+}
+
+static void photo_notice(const char *text)
+{
+    snprintf(g_photo_notice, sizeof(g_photo_notice), "%s", text);
+    g_photo_notice_until = now_sec() + 1.5;
+}
+
+/* Loads first and swaps second, so a failed next/previous request leaves the
+ * current photo intact instead of replacing it with a blank screen. */
+static int photo_load(FBDev *fb, const JfItem *item, int *spinner_frame)
+{
+    unlink(PHOTO_TMP);
+    draw_spinner_frame(fb, (*spinner_frame)++);
+    fb_flip(fb);
+    if (!jf_download_photo(&g_cfg, item, fb->width, fb->height, PHOTO_TMP)) {
+        unlink(PHOTO_TMP);
+        return 0;
+    }
+
+    int w = 0, h = 0;
+    uint8_t *px = load_image_tmp(PHOTO_TMP, &w, &h);
+    if (!px || w <= 0 || h <= 0) {
+        if (px) stbi_image_free(px);
+        return 0;
+    }
+
+    if (g_photo_px) stbi_image_free(g_photo_px);
+    g_photo_px = px;
+    g_photo_w = w;
+    g_photo_h = h;
+    g_photo_item = *item;
+    g_photo_abs_index = g_window_start + g_sel;
+    g_photo_notice[0] = '\0';
+    g_photo_notice_until = 0.0;
+    return 1;
+}
+
+static void draw_photo(FBDev *fb)
+{
+    fb_clear(fb);
+    if (g_photo_px)
+        blit_fit_centered(fb, g_photo_px, g_photo_w, g_photo_h,
+                          fb->width / 2, fb->height / 2,
+                          fb->width, fb->height, 255);
+
+    /* Keep controls legible over both dark and bright photos. The image still
+     * occupies the full frame; these are overlays, not reserved letterbox
+     * bands that would shrink it. */
+    int top_h = SAFE_Y + 12;
+    int bottom_y = fb->height - SAFE_Y_BOT - 12;
+    fb_fill_rect_alpha(fb, 0, 0, fb->width, top_h, 0, 0, 0, 175);
+    fb_fill_rect_alpha(fb, 0, bottom_y, fb->width, fb->height - bottom_y,
+                       0, 0, 0, 175);
+
+    char counter[32];
+    int64_t total = g_total_count > 0 ? g_total_count : g_item_count;
+    snprintf(counter, sizeof(counter), "%d/%lld",
+             g_photo_abs_index + 1, (long long)total);
+    int counter_w = text_width(fb, counter, 1);
+    char title[JF_NAME_LEN];
+    snprintf(title, sizeof(title), "%s", g_photo_item.name);
+    truncate_to_width(fb, title, 1, fb->width - 2 * SAFE_X - counter_w - 12);
+    draw_text(fb, SAFE_X, SAFE_Y, title, 1, COL_SEL_FG);
+    draw_text(fb, fb->width - SAFE_X - counter_w, SAFE_Y, counter, 1, COL_HINT);
+
+    const char *hint = "LEFT/RIGHT: browse photos   A:back";
+    draw_text(fb, (fb->width - text_width(fb, hint, 1)) / 2,
+              fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
+
+    if (g_photo_notice[0] && now_sec() < g_photo_notice_until) {
+        int tw = text_width(fb, g_photo_notice, 1);
+        int x = (fb->width - tw) / 2;
+        int y = fb->height / 2 - 4;
+        fb_fill_rect_alpha(fb, x - 8, y - 6, tw + 16, 20, 0, 0, 0, 210);
+        draw_text(fb, x, y, g_photo_notice, 1, COL_SEL_FG);
+    }
+
+    fb_flip(fb);
+}
+
+/* Finds the next Photo row in absolute list order. browse_move_sel already
+ * owns page-boundary fetching, clamping, and scroll positioning, so the
+ * viewer reuses it rather than maintaining a second pagination model. */
+static int photo_move(FBDev *fb, int direction, int *spinner_frame)
+{
+    int original_abs = g_window_start + g_sel;
+    int original_window = g_window_start;
+
+    while (browse_move_sel(fb, direction)) {
+        if (g_items[g_sel].type != JF_TYPE_PHOTO) continue;
+        if (photo_load(fb, &g_items[g_sel], spinner_frame)) {
+            if (g_window_start != original_window) {
+                g_cover_gen++;
+                start_cover_prefetch();
+            }
+            return 1;
+        }
+
+        browse_move_sel(fb, original_abs - (g_window_start + g_sel));
+        if (g_window_start != original_window) {
+            g_cover_gen++;
+            start_cover_prefetch();
+        }
+        photo_notice("Photo unavailable");
+        return 0;
+    }
+
+    browse_move_sel(fb, original_abs - (g_window_start + g_sel));
+    if (g_window_start != original_window) {
+        g_cover_gen++;
+        start_cover_prefetch();
+    }
+    photo_notice(direction > 0 ? "No later photos" : "No earlier photos");
+    return 0;
 }
 
 /* Simple dashed track + a small square marker at the current position,
@@ -4920,6 +5060,7 @@ static void redraw_current_screen(FBDev *fb, AppState state)
     switch (state) {
     case STATE_BROWSE:       draw_browse(fb); break;
     case STATE_INFO:         draw_info(fb); break;
+    case STATE_PHOTO:        draw_photo(fb); break;
     case STATE_PLAYING_AUDIO: draw_now_playing(fb, &g_items[g_audio_queue_pos], play_position()); break;
     default: break;
     }
@@ -5674,10 +5815,21 @@ int main(int argc, char **argv)
                 }
                 case JF_TYPE_MOVIE:
                 case JF_TYPE_MUSIC_VIDEO:
+                case JF_TYPE_VIDEO:
                 case JF_TYPE_EPISODE:
                     info_assets_load(&fb, it, &spinner_frame_ctr);
                     state = STATE_INFO;
                     draw_info(&fb);
+                    input_drain();
+                    break;
+                case JF_TYPE_PHOTO:
+                    if (photo_load(&fb, it, &spinner_frame_ctr)) {
+                        state = STATE_PHOTO;
+                        draw_photo(&fb);
+                    } else {
+                        banner_enqueue("Photo unavailable");
+                        draw_browse(&fb);
+                    }
                     input_drain();
                     break;
                 case JF_TYPE_TRACK:
@@ -5687,6 +5839,8 @@ int main(int argc, char **argv)
                     input_drain();
                     break;
                 default:
+                    banner_enqueue("Item type not supported");
+                    input_drain();
                     break;
                 }
             }
@@ -5746,6 +5900,22 @@ int main(int argc, char **argv)
                 g_current_audio_index = default_audio_index();
                 play(&fb, g_info_item.id, 0.0);
                 input_drain();
+            }
+            break;
+
+        case STATE_PHOTO:
+            if (inp & INP_B) {
+                photo_free();
+                g_sel_anim = -1.0;
+                state = STATE_BROWSE;
+                draw_browse(&fb);
+                input_drain();
+            } else {
+                if (inp & (INP_LEFT | INP_UP))
+                    photo_move(&fb, -1, &spinner_frame_ctr);
+                else if (inp & (INP_RIGHT | INP_DOWN))
+                    photo_move(&fb, 1, &spinner_frame_ctr);
+                draw_photo(&fb);
             }
             break;
 
@@ -5935,6 +6105,7 @@ int main(int argc, char **argv)
     jf_log_close();
     player_stop();
     info_assets_free();
+    photo_free();
     ddr_close();
     cursor_show();
     /* Blanking on the way out leaves the MiSTer showing an empty screen

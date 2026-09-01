@@ -42,6 +42,8 @@ typedef enum {
     JF_TYPE_EPISODE,
     JF_TYPE_MOVIE,
     JF_TYPE_MUSIC_VIDEO, /* MusicVideo — playable video leaf */
+    JF_TYPE_VIDEO,   /* generic Video — playable leaf in Home Videos */
+    JF_TYPE_PHOTO,   /* Photo — opens the still-image viewer */
     JF_TYPE_ARTIST,   /* MusicArtist — drills into albums, browsed like JF_TYPE_FOLDER */
     JF_TYPE_ALBUM,    /* MusicAlbum — drills into tracks, browsed like JF_TYPE_FOLDER */
     JF_TYPE_TRACK,    /* Audio — playable leaf, like JF_TYPE_MOVIE but audio-only */
@@ -415,13 +417,14 @@ int view_is_resume(const JfItem *v);
 int view_is_nextup(const JfItem *v);
 int view_is_synthetic(const JfItem *v);
 
-/* The BaseItemKind that actually represents "one unit" of a library, keyed
+/* The BaseItemKind values that represent the useful leaves of a library, keyed
  * off CollectionType — used both for the carousel's "N movies/series/
  * albums" count (jf_count_items) and its background cover grid
  * (jf_list_items_recursive): a plain direct-children listing of a by-artist
  * music library only finds MusicArtist folders, which often have no cover
  * art of their own, so both need to look past the top level at the real
- * leaf type. NULL (unrecognized collection type) means "don't filter". */
+ * leaf type. The result may be a comma-separated IncludeItemTypes value.
+ * NULL (unrecognized collection type) means "don't filter". */
 const char *collection_item_type(const char *collection_type);
 
 /* Partly-watched items across the whole library, most recently played first
@@ -462,6 +465,14 @@ int jf_item_image_url(const JfConfig *cfg, const char *item_id, const char *imag
                        const char *tag, int max_width, char *out, int outlen);
 int jf_download_item_image(const JfConfig *cfg, const char *item_id, const char *image_type,
                             const char *tag, int max_width, const char *dest_path);
+
+/* Photo viewer image. Both dimensions are capped server-side and JPEG is
+ * requested explicitly so the client never has to decode formats such as
+ * HEIC itself. */
+int jf_photo_image_url(const JfConfig *cfg, const JfItem *item,
+                       int max_width, int max_height, char *out, int outlen);
+int jf_download_photo(const JfConfig *cfg, const JfItem *item,
+                      int max_width, int max_height, const char *dest_path);
 
 typedef struct {
     int max_width;
