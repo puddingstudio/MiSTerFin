@@ -43,6 +43,7 @@
 #include "grid.h"
 #include "visualizers.h"
 #include "session.h"
+#include "pause_ui.h"
 
 #define MPLAYER      "/media/fat/misterfin/mplayer-arm"
 /* See stream_via_curl_if_https — only one stream (video or music, never
@@ -2535,9 +2536,43 @@ static void draw_timeline(FBDev *fb, int y, double pos, double duration)
 
 static JfStreamProfile stream_profile(void);   /* forward decl — defined with the playback code */
 
+static PauseUi  g_pause_ui;
+static uint8_t *g_pause_frame;
+static size_t   g_pause_frame_size;
+static int      g_pause_frame_current;
+
+/* Capture the undecorated paused video once, then compose every pause UI
+ * frame from that copy. fb_flip() writes overlays into the framebuffer, so
+ * syncing from the screen again after the first draw would permanently fold
+ * the overlay into its own background and leave nothing clean to restore. */
+static int pause_frame_capture(FBDev *fb)
+{
+    size_t size = (size_t)fb->stride * fb->height;
+    g_pause_frame_current = 0;
+    fb_sync_back(fb);
+    if (g_pause_frame_size != size) {
+        uint8_t *frame = realloc(g_pause_frame, size);
+        if (!frame) return 0;
+        g_pause_frame = frame;
+        g_pause_frame_size = size;
+    }
+    memcpy(g_pause_frame, fb->back, size);
+    g_pause_frame_current = 1;
+    return 1;
+}
+
+static int pause_frame_restore(FBDev *fb)
+{
+    size_t size = (size_t)fb->stride * fb->height;
+    if (!g_pause_frame_current || !g_pause_frame ||
+        g_pause_frame_size != size) return 0;
+    memcpy(fb->back, g_pause_frame, size);
+    return 1;
+}
+
 static void draw_paused(FBDev *fb, const char *name, double pos)
 {
-    fb_sync_back(fb);
+    if (!pause_frame_restore(fb)) fb_sync_back(fb);
 
     int cy = fb->height / 2 - 16;
     fb_fill_rect_alpha(fb, 0, cy - 6, fb->width, 50, 0, 0, 0, 200);
@@ -2591,6 +2626,27 @@ static void draw_paused(FBDev *fb, const char *name, double pos)
               fb->height - 8 - SAFE_Y_BOT, hint, 1, COL_HINT);
 
     fb_flip(fb);
+}
+
+/* Keep presenting the saved frame while paused even when the controls are
+ * hidden. This preserves the existing page-flip self-healing and lets the
+ * global message banner animate over an otherwise clean pause screen. */
+static void draw_clean_paused(FBDev *fb)
+{
+    if (!pause_frame_restore(fb)) fb_sync_back(fb);
+    fb_flip(fb);
+}
+
+static void pause_screen_begin(FBDev *fb)
+{
+    pause_ui_hide(&g_pause_ui);
+    (void)pause_frame_capture(fb);
+}
+
+static int pause_screen_reveal(FBDev *fb, double now)
+{
+    if (!g_pause_frame_current && !pause_frame_capture(fb)) return 0;
+    return pause_ui_reveal(&g_pause_ui, now);
 }
 
 /* ── playback (mplayer slave-mode) ───────────────────────────────────────── */
@@ -3789,9 +3845,16 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
         return PLAYER_FRAME_ENDED;
     } else if (g_paused) {
         if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
-        if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
-        if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
-        if (inp & INP_A) player_pause_toggle();
+        int woke_controls = 0;
+        if (inp & (INP_UP | INP_DOWN | INP_LEFT | INP_RIGHT))
+            woke_controls = pause_screen_reveal(fb, loop_now);
+        if (!woke_controls && (inp & INP_LEFT))  seek_accumulate(-SEEK_STEP, loop_now);
+        if (!woke_controls && (inp & INP_RIGHT)) seek_accumulate(+SEEK_STEP, loop_now);
+        if (inp & INP_A) {
+            if (g_pause_ui.visible) draw_clean_paused(fb);
+            pause_ui_hide(&g_pause_ui);
+            player_pause_toggle();
+        }
         if (!g_pageflip_mode) {
             if (inp & INP_L) {
                 int vf = open(VSYNC_FLAG, O_WRONLY|O_CREAT|O_TRUNC, 0644);
@@ -3803,14 +3866,25 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
                 osd_flash("VSync: OFF", 1);
             }
         }
-        /* seek_pending_target() reflects any not-yet-fired
-         * accumulated seek too, so this timeline moves live as the
-         * user taps LEFT/RIGHT instead of waiting for the debounce
-         * to actually fire the restart. */
-        draw_paused(fb, g_info_item.name, seek_pending_target());
+        if (g_paused) {
+            if (pause_ui_expire(&g_pause_ui, loop_now)) {
+                draw_clean_paused(fb);
+            } else if (g_pause_ui.visible) {
+                /* seek_pending_target() reflects any not-yet-fired
+                 * accumulated seek too, so this timeline moves live as the
+                 * user taps LEFT/RIGHT instead of waiting for the debounce
+                 * to actually fire the restart. */
+                draw_paused(fb, g_info_item.name, seek_pending_target());
+            } else {
+                draw_clean_paused(fb);
+            }
+        }
     } else {
         if (inp & INP_SELECT) { submenu_open(fb); draw_submenu(fb); input_drain(); return PLAYER_FRAME_HANDLED; }
-        if (inp & INP_A) player_pause_toggle();
+        if (inp & INP_A) {
+            player_pause_toggle();
+            if (g_paused) pause_screen_begin(fb);
+        }
         if (inp & INP_LEFT)  seek_accumulate(-SEEK_STEP, loop_now);
         if (inp & INP_RIGHT) seek_accumulate(+SEEK_STEP, loop_now);
         if (!g_pageflip_mode) {
@@ -3825,7 +3899,12 @@ static int player_handle_input(FBDev *fb, int inp, double loop_now)
             }
         }
 
-        if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
+        if (g_paused) {
+            if (g_pause_ui.visible)
+                draw_paused(fb, g_info_item.name, seek_pending_target());
+            else
+                draw_clean_paused(fb);
+        } else if (loop_now - g_last_progress_report >= PROGRESS_REPORT_INTERVAL) {
             g_last_progress_report = loop_now;
             report_progress_async(g_info_item.id, g_play_session_id,
                                   (int64_t)(play_position() * 10000000.0), 0);
@@ -3876,6 +3955,8 @@ static void play(FBDev *fb, const char *item_id, double offset_secs)
     g_play_offset     = offset_secs > 0.0 ? offset_secs : 0.0;
     g_play_start_wall = now_sec();
     g_paused          = 0;
+    pause_ui_hide(&g_pause_ui);
+    g_pause_frame_current = 0;
     g_last_progress_report = now_sec();
     jf_report_start(&g_cfg, item_id, g_play_session_id, start_ticks, "Transcode");
 
@@ -5934,6 +6015,7 @@ int main(int argc, char **argv)
     sfx_shutdown();
     jf_log_close();
     player_stop();
+    free(g_pause_frame);
     info_assets_free();
     ddr_close();
     cursor_show();

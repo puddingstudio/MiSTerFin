@@ -1,4 +1,4 @@
-SRCS = src/main.c src/fb.c src/ddr.c src/grid.c src/visualizers.c src/jellyfin.c src/json.c src/session.c src/subtitles.c src/update.c src/input.c src/util.c src/draw.c src/screenshot.c src/sfx.c
+SRCS = src/main.c src/fb.c src/ddr.c src/grid.c src/visualizers.c src/jellyfin.c src/json.c src/session.c src/subtitles.c src/update.c src/input.c src/util.c src/draw.c src/screenshot.c src/sfx.c src/pause_ui.c
 
 TARGET     = misterfin
 TARGET_ARM = misterfin-arm
@@ -45,6 +45,8 @@ test:
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_jellyfin_queries \
 		tests/test_jellyfin_queries.c src/jellyfin.c src/json.c
 	@/tmp/misterfin_test_jellyfin_queries
+	$(CC) $(CFLAGS) -o /tmp/misterfin_test_pause_ui tests/test_pause_ui.c src/pause_ui.c
+	@/tmp/misterfin_test_pause_ui
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_sfx tests/test_sfx.c -lpthread
 	@/tmp/misterfin_test_sfx
 	$(CC) $(CFLAGS) -o /tmp/misterfin_test_hero tests/test_hero.c src/draw.c
