@@ -603,10 +603,10 @@ int input_poll(void)
                  *  - "MiSTer grabs wired USB pads exclusively, so the echo is
                  *    the only path." There is no EVIOCGRAB. A plain reader
                  *    gets both key and axis events off the pad's own node
-                 *    while the MiSTer process holds it open — an fd in
-                 *    /proc/PID/fd means the
-                 *    device is OPEN, not grabbed. Both paths are live at once,
-                 *    which is exactly why trusting both double-fires.
+                 *    while the MiSTer process holds it open — an fd listed in
+                 *    /proc/PID/fd means the device is OPEN, not grabbed. Both
+                 *    paths are live at once, which is exactly why trusting
+                 *    both double-fires.
                  *  - "PageUp/PageDown aren't in MiSTer's OSD table and are an
                  *    arbitrary, colliding echo." They are deliberate: the echo
                  *    carries L as KEY_PAGEUP and R as KEY_PAGEDOWN, the same
