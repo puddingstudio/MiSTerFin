@@ -265,6 +265,8 @@ There is no on-screen keyboard for the server URL — edit the file over SSH (us
 
 Button labels below follow Xbox-style naming (bottom face button = A, right face button = B) — this matches most controllers, including generic/8BitDo pads in Xbox mode. Nintendo/SNES-style controllers are the notable exception: their A/B (and X/Y) positions are swapped relative to Xbox, so on those pads the button positions are reversed from the labels here.
 
+**Your controller uses the mapping you already set in MiSTer.** If you've run **Define buttons** in the MiSTer OSD for a pad, MiSTerFin reads that mapping (`/media/fat/config/inputs/input_<vid>_<pid>_v3.map`) and uses it directly, so the buttons land where they do in every core — including bindings a fixed table can't express, like a shoulder button that reports as an analog trigger or a D-pad that reports on the stick axes. Confirm/back come from the map's `menuok`/`menuesc` entries where present, and fall back to its A/B otherwise. A pad you've never mapped still works on a built-in default table; if a button does nothing, mapping the pad once in MiSTer's OSD is the fix. `MISTERFIN_INPUT_DEBUG=1` prints the loaded map at startup.
+
 **SELECT+START** (held together, from any screen — browser, About, video, or music): captures a screenshot to `/media/fat/screenshots/MiSTerFin/` as a BMP at the real on-screen aspect ratio, with a brief "Screenshot saved" confirmation. Since MiSTer's own screenshot hotkey doesn't reach Script apps, this is MiSTerFin's own — see the [Screenshots](#screenshots) section above for examples.
 
 ### <a id="browser"></a>Browser

@@ -13,6 +13,7 @@
 #include <linux/input.h>
 
 #include "input.h"
+#include "padmap.h"
 #include "util.h"
 
 /* ── input (evdev gamepad) ────────────────────────────────────────────────── */
@@ -46,6 +47,35 @@ static int  input_count = 0;
  * touch the framebuffer UI. */
 static int  input_debug = 0;
 
+/* ── MiSTer's own per-device map (see padmap.h) ──────────────────────────────
+ * Where MiSTer has a mapping for a pad, it is authoritative and the fixed
+ * BTN_* table below is not consulted for that device at all. That table can
+ * only describe a pad whose buttons are buttons and whose D-pad is a hat;
+ * measured on an 8BitDo M30 in X-input mode, neither holds — its D-pad
+ * reports on ABS_X/ABS_Y and its R shoulder is an ABS_Z trigger edge, so two
+ * of its inputs were unreachable no matter what codes the table listed. */
+#define PADMAP_DIR "/media/fat/config/inputs"
+
+typedef struct { int min, max, pressed; } AxisState;
+
+static PadMap    input_map[MAX_INPUT_FDS];
+static int       input_has_map[MAX_INPUT_FDS];
+static AxisState input_axis[MAX_INPUT_FDS][PADV_COUNT];
+
+/* Set once any real device has a map. That's the signal to stop trusting
+ * MiSTer's virtual echo device: with no exclusive grab in play (there isn't
+ * one — a plain reader sees the pad's raw events while MiSTer holds it open)
+ * a single press arrives on BOTH the pad and the echo, and any button mapped
+ * on both paths fires twice whenever the two land in different poll cycles.
+ * One path per device is the fix; a wider allowlist would only add collisions. */
+static int       input_mapped_any = 0;
+
+/* PADV_* order -> INP_* bits. */
+static const int padv_to_inp[PADV_COUNT] = {
+    INP_UP, INP_DOWN, INP_LEFT, INP_RIGHT,
+    INP_A,  INP_B,    INP_L,    INP_R,     INP_SELECT, INP_START
+};
+
 
 /* Some 8BitDo SNES-style pads (confirmed on the SFC30 via raw evdev capture)
  * report their printed A/B buttons as BTN_SOUTH/BTN_EAST swapped relative to
@@ -58,16 +88,20 @@ static int device_needs_ab_swap(const char *name)
     return strstr(name, "SFC30") != NULL;
 }
 
-/* MiSTer's own OSD layer echoes every physical joystick press as a
- * synthetic keyboard event on a separate virtual device (confirmed via raw
- * evdev capture: pressing a gamepad button also fires an unrelated KEY_*
- * code on this device, per whatever key MiSTer's own default joystick-to-
- * OSD table happens to assign it). Turns out the SFC30's D-pad specifically
- * only ever arrives THROUGH this echo (as KEY_UP/DOWN/LEFT/RIGHT — it has
- * no EV_ABS capability of its own, confirmed via /proc/bus/input/devices),
- * so it can't just be closed outright. Instead only arrow-key codes from it
- * are trusted (see input_poll) — action keys (Enter/Esc/Space/...) are
- * dropped since those collide with keys we bind for real keyboards/pads. */
+/* MiSTer's own OSD layer echoes physical joystick presses as synthetic
+ * keyboard events on a separate virtual device — its uinput device, named
+ * here, created in Main_MiSTer's input.cpp. Raw evdev capture on hardware
+ * (2026-09-09) shows it carrying the four arrows, Enter/Esc, and L/R as
+ * KEY_PAGEUP/KEY_PAGEDOWN, but NOT Select or Start.
+ *
+ * It can't simply be closed. Some pads have no usable path of their own —
+ * the SFC30's D-pad arrives only through this echo, having no EV_ABS
+ * capability at all (confirmed via /proc/bus/input/devices) — so for a
+ * device MiSTer has no map for, the echo is still the fallback.
+ *
+ * Where a pad DOES have a map, this device is ignored entirely instead:
+ * both paths are live simultaneously (there is no grab), so trusting both
+ * makes every press that exists on both fire twice. See input_mapped_any. */
 static int device_is_mister_virtual(const char *name)
 {
     return strcmp(name, "MiSTer virtual input") == 0;
@@ -94,6 +128,73 @@ static void stdin_input_open(void);   /* forward decls — desktop backends, def
 static void script_open(void);
 static void stdin_input_restore(void);
 static void stdin_input_drain(void);
+
+/* Loads MiSTer's map for whatever pad is on this fd, if it has one. Returns 1
+ * when a map was found and parsed. A device with no map (never run through
+ * "Define buttons", or a keyboard) keeps the legacy table — that fallback is
+ * what makes this safe to ship without demanding setup from anyone. */
+static int load_device_map(int slot, int fd)
+{
+    struct input_id id;
+    if (ioctl(fd, EVIOCGID, &id) < 0) return 0;
+
+    char fname[64], path[128];
+    if (!padmap_filename(id.vendor, id.product, fname, sizeof(fname))) return 0;
+    snprintf(path, sizeof(path), "%s/%s", PADMAP_DIR, fname);
+
+    int mfd = open(path, O_RDONLY | O_CLOEXEC);
+    if (mfd < 0) {
+        if (input_debug) fprintf(stderr, "[input]   no map at %s\n", path);
+        return 0;
+    }
+    unsigned char buf[PADMAP_FILE_SIZE];
+    ssize_t got = read(mfd, buf, sizeof(buf));
+    close(mfd);
+
+    if (got != (ssize_t)sizeof(buf) ||
+        !padmap_parse(buf, (int)got, &input_map[slot])) {
+        if (input_debug)
+            fprintf(stderr, "[input]   %s is not a v3 map (%d bytes), ignoring\n",
+                    path, (int)got);
+        return 0;
+    }
+
+    /* Cache each axis binding's range now. An axis edge can only be turned
+     * into a press with the range in hand, and asking once per press would
+     * mean an ioctl inside the event loop. Seeding `pressed` from the current
+     * value stops a trigger that is already held at startup from reading as a
+     * fresh press on the first poll. */
+    for (int v = 0; v < PADV_COUNT; v++) {
+        AxisState *st = &input_axis[slot][v];
+        st->min = st->max = st->pressed = 0;
+        if (input_map[slot].v[v].kind != PADBIND_AXIS) continue;
+
+        struct input_absinfo abs;
+        if (ioctl(fd, EVIOCGABS(input_map[slot].v[v].code), &abs) < 0) continue;
+        st->min = abs.minimum;
+        st->max = abs.maximum;
+        st->pressed = padmap_axis_pressed(abs.value, st->min, st->max,
+                                          input_map[slot].v[v].at_max);
+    }
+
+    if (input_debug) {
+        static const char *vn[PADV_COUNT] = { "UP","DOWN","LEFT","RIGHT","A",
+                                              "B","L","R","SELECT","START" };
+        fprintf(stderr, "[input]   map %s:\n", fname);
+        for (int v = 0; v < PADV_COUNT; v++) {
+            PadBind *b = &input_map[slot].v[v];
+            if (b->kind == PADBIND_KEY)
+                fprintf(stderr, "[input]     %-6s <- code %d\n", vn[v], b->code);
+            else if (b->kind == PADBIND_AXIS)
+                fprintf(stderr, "[input]     %-6s <- axis %d %s (range %d..%d)\n",
+                        vn[v], b->code, b->at_max ? "max" : "min",
+                        input_axis[slot][v].min, input_axis[slot][v].max);
+            else
+                fprintf(stderr, "[input]     %-6s <- unmapped\n", vn[v]);
+        }
+    }
+    return 1;
+}
 
 void input_open(void)
 {
@@ -135,16 +236,27 @@ void input_open(void)
 
         char name[128] = "";
         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
-        input_swap_ab[input_count]    = device_needs_ab_swap(name);
-        input_is_virtual[input_count] = device_is_mister_virtual(name);
-        strncpy(input_names[input_count], e->d_name, sizeof(input_names[0]) - 1);
-        strncpy(input_display_names[input_count], name, sizeof(input_display_names[0]) - 1);
-        input_fds[input_count++] = fd;
+        int slot = input_count;
+        input_swap_ab[slot]    = device_needs_ab_swap(name);
+        input_is_virtual[slot] = device_is_mister_virtual(name);
+        strncpy(input_names[slot], e->d_name, sizeof(input_names[0]) - 1);
+        strncpy(input_display_names[slot], name, sizeof(input_display_names[0]) - 1);
+        input_fds[slot] = fd;
+        input_count++;
+
         if (input_debug)
             fprintf(stderr, "[input] opened %s \"%s\"%s (%d tracked)\n",
                     e->d_name, name,
-                    device_is_mister_virtual(name) ? " [MiSTer virtual]" : "",
+                    input_is_virtual[slot] ? " [MiSTer virtual]" : "",
                     input_count);
+
+        /* The virtual echo is MiSTer's re-emission of a pad it already
+         * mapped, so it has no map of its own to look up. */
+        input_has_map[slot] = 0;
+        if (!input_is_virtual[slot] && load_device_map(slot, fd)) {
+            input_has_map[slot] = 1;
+            input_mapped_any = 1;
+        }
     }
     closedir(d);
 }
@@ -168,10 +280,20 @@ static void input_drop_slot(int i)
         input_fds[j]        = input_fds[j + 1];
         input_swap_ab[j]    = input_swap_ab[j + 1];
         input_is_virtual[j] = input_is_virtual[j + 1];
+        input_has_map[j]    = input_has_map[j + 1];
+        input_map[j]        = input_map[j + 1];
+        memcpy(input_axis[j], input_axis[j + 1], sizeof(input_axis[0]));
         memcpy(input_names[j], input_names[j + 1], sizeof(input_names[0]));
         memcpy(input_display_names[j], input_display_names[j + 1], sizeof(input_display_names[0]));
     }
     input_count--;
+
+    /* Recomputed rather than left latched: unplugging the last mapped pad has
+     * to hand the virtual echo back, or a user who pulls their controller is
+     * left with an app that ignores every remaining input path. */
+    input_mapped_any = 0;
+    for (int j = 0; j < input_count; j++)
+        if (input_has_map[j]) { input_mapped_any = 1; break; }
 }
 
 void input_drain(void)
@@ -407,6 +529,32 @@ static int script_poll(void)
     return k->mask;
 }
 
+/* Translates one event through a device's MiSTer map.
+ *
+ * Axis bindings need the edge computed here rather than read off the event:
+ * an analog trigger streams a run of intermediate values on the way down, so
+ * "value crossed the threshold this time when it hadn't last time" is what
+ * makes one pull into one press. Buttons are the plain value==1 edge. */
+static int mapped_event_bits(int i, const struct input_event *ev)
+{
+    int bits = 0;
+    for (int v = 0; v < PADV_COUNT; v++) {
+        const PadBind *b = &input_map[i].v[v];
+
+        if (b->kind == PADBIND_KEY) {
+            if (ev->type == EV_KEY && ev->value == 1 && ev->code == b->code)
+                bits |= padv_to_inp[v];
+        } else if (b->kind == PADBIND_AXIS) {
+            if (ev->type != EV_ABS || ev->code != b->code) continue;
+            AxisState *st = &input_axis[i][v];
+            int now = padmap_axis_pressed(ev->value, st->min, st->max, b->at_max);
+            if (now && !st->pressed) bits |= padv_to_inp[v];
+            st->pressed = now;
+        }
+    }
+    return bits;
+}
+
 int input_poll(void)
 {
     struct input_event ev;
@@ -418,6 +566,20 @@ int input_poll(void)
          * again by the next rescan. */
         ssize_t got;
         while ((got = read(input_fds[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
+            /* Still drained, just not acted on — see input_mapped_any. Left
+             * unread the queue would only fill up and deliver these later. */
+            if (input_is_virtual[i] && input_mapped_any) continue;
+
+            if (input_has_map[i]) {
+                int bits = mapped_event_bits(i, &ev);
+                if (input_debug && bits)
+                    fprintf(stderr, "[input] %s %s code=%d val=%d -> %s (mapped)\n",
+                            input_names[i], ev.type == EV_ABS ? "EV_ABS" : "EV_KEY",
+                            ev.code, ev.value, inp_bit_name(bits & -bits));
+                mask |= bits;
+                continue;
+            }
+
             /* Press edges only. Releases don't need tracking here: auto-repeat
              * reads the device's real current state instead of reconstructing
              * it from edges (see input_repeat). The kernel's own key repeat
@@ -430,17 +592,30 @@ int input_poll(void)
                     if      (code == BTN_SOUTH) code = BTN_EAST;
                     else if (code == BTN_EAST)  code = BTN_SOUTH;
                 }
-                /* MiSTer's own core process exclusively grabs directly-wired
-                 * USB joysticks for FPGA/OSD routing (confirmed via
-                 * /proc/PID/fd: the "MiSTer" process holds the wired
-                 * SFC30's event node open, and no other reader ever sees
-                 * its raw events) so the virtual echo device is the ONLY
-                 * input path for a wired pad, meaning its confirm/cancel/
-                 * nav keys must stay trusted here. Action keys we bind
-                 * ourselves for a real keyboard (Space/Tab/PageUp/PageDown)
-                 * are still dropped from it — those aren't part of MiSTer's
-                 * own OSD table and only ever showed up as an arbitrary,
-                 * colliding echo. */
+                /* Only reached for a device with no MiSTer map of its own —
+                 * once one exists, input_mapped_any takes this whole device
+                 * out of play (see input_poll's loop).
+                 *
+                 * This filter used to be justified by two claims that raw
+                 * evdev capture on hardware (2026-09-09) disproved, so don't
+                 * restore them:
+                 *
+                 *  - "MiSTer grabs wired USB pads exclusively, so the echo is
+                 *    the only path." There is no EVIOCGRAB. A plain reader
+                 *    gets both key and axis events off the pad's own node
+                 *    while the MiSTer process holds it open — an fd in
+                 *    /proc/PID/fd means the
+                 *    device is OPEN, not grabbed. Both paths are live at once,
+                 *    which is exactly why trusting both double-fires.
+                 *  - "PageUp/PageDown aren't in MiSTer's OSD table and are an
+                 *    arbitrary, colliding echo." They are deliberate: the echo
+                 *    carries L as KEY_PAGEUP and R as KEY_PAGEDOWN, the same
+                 *    pairing used below.
+                 *
+                 * What the echo genuinely does NOT carry is SELECT and START
+                 * (MiSTer keeps that chord for its own OSD), which is why an
+                 * echo-only input path can't work for this app and the pad's
+                 * own node has to be primary. */
                 if (input_is_virtual[i] &&
                     code != KEY_UP && code != KEY_DOWN &&
                     code != KEY_LEFT && code != KEY_RIGHT &&
@@ -553,10 +728,40 @@ static void input_repeat_reset(void)
  * control. Reading the state directly makes all of those unrepresentable:
  * there is no accumulated state to go wrong, and a device that has gone away
  * simply fails the ioctl and contributes nothing. */
+/* Is this mapped device holding `verb` right now? Same
+ * ask-the-device-directly principle as the legacy path below, extended to
+ * cover axis bindings — which matters because on a pad whose D-pad is an axis
+ * the legacy EVIOCGABS(ABS_HAT0*) probe reads a real, existing, permanently
+ * zero hat and concludes nothing is held. */
+static int mapped_verb_held(int i, int verb)
+{
+    const PadBind *b = &input_map[i].v[verb];
+
+    if (b->kind == PADBIND_KEY) {
+        unsigned long keys[INPUT_NLONGS(KEY_MAX + 1)];
+        memset(keys, 0, sizeof(keys));
+        if (ioctl(input_fds[i], EVIOCGKEY(sizeof(keys)), keys) < 0) return 0;
+        return INPUT_TEST_BIT(keys, b->code) ? 1 : 0;
+    }
+    if (b->kind == PADBIND_AXIS) {
+        struct input_absinfo abs;
+        if (ioctl(input_fds[i], EVIOCGABS(b->code), &abs) < 0) return 0;
+        return padmap_axis_pressed(abs.value, input_axis[i][verb].min,
+                                   input_axis[i][verb].max, b->at_max);
+    }
+    return 0;
+}
+
 int input_select_start_held(void)
 {
     int select_down = 0, start_down = 0;
     for (int i = 0; i < input_count; i++) {
+        if (input_is_virtual[i] && input_mapped_any) continue;
+        if (input_has_map[i]) {
+            if (mapped_verb_held(i, PADV_SELECT)) select_down = 1;
+            if (mapped_verb_held(i, PADV_START))  start_down  = 1;
+            continue;
+        }
         unsigned long keys[INPUT_NLONGS(KEY_MAX + 1)];
         memset(keys, 0, sizeof(keys));
         if (ioctl(input_fds[i], EVIOCGKEY(sizeof(keys)), keys) < 0) continue;
@@ -582,6 +787,13 @@ static int input_nav_held(void)
 {
     int mask = 0;
     for (int i = 0; i < input_count; i++) {
+        if (input_is_virtual[i] && input_mapped_any) continue;
+        if (input_has_map[i]) {
+            static const int nav[] = { PADV_UP, PADV_DOWN, PADV_LEFT, PADV_RIGHT };
+            for (size_t k = 0; k < sizeof(nav) / sizeof(nav[0]); k++)
+                if (mapped_verb_held(i, nav[k])) mask |= padv_to_inp[nav[k]];
+            continue;
+        }
         unsigned long keys[INPUT_NLONGS(KEY_MAX + 1)];
         memset(keys, 0, sizeof(keys));
         if (ioctl(input_fds[i], EVIOCGKEY(sizeof(keys)), keys) >= 0) {
@@ -590,9 +802,16 @@ static int input_nav_held(void)
             if (INPUT_TEST_BIT(keys, KEY_LEFT))  mask |= INP_LEFT;
             if (INPUT_TEST_BIT(keys, KEY_RIGHT)) mask |= INP_RIGHT;
         }
-        /* D-pads arrive as a hat axis rather than as keys. A device without
-         * these axes just fails the ioctl or reports 0, both of which mean
-         * "nothing held" — no need to probe capabilities first. */
+        /* Some D-pads arrive as a hat axis rather than as keys.
+         *
+         * The absent-axis case is safe (the ioctl fails, or reports 0, and
+         * either means "nothing held"). What this CANNOT see is a pad that
+         * declares ABS_HAT0X/Y and reports its D-pad somewhere else: the
+         * 8BitDo M30 in X-input mode has both hat axes, pinned at 0, while
+         * the D-pad drives ABS_X/ABS_Y — so this probe reads "nothing held"
+         * throughout a real press and auto-repeat never starts. That pad is
+         * handled by the mapped branch above; this is only the fallback for
+         * a device MiSTer has no map for. */
         struct input_absinfo abs;
         if (ioctl(input_fds[i], EVIOCGABS(ABS_HAT0Y), &abs) >= 0) {
             if (abs.value < 0) mask |= INP_UP;
